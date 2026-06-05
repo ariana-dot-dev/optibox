@@ -234,7 +234,8 @@ let H=[]; let PRICING=null; let selectedHarness='', selectedProvider='', selecte
 let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
-function stripHidden(s){return String(s).replace(/<consumer-context>[\s\S]*?<\/consumer-context>/g,'').trim();}
+const hiddenContextPattern=new RegExp('<consumer-context>[\\s\\S]*?</consumer-context>','g');
+function stripHidden(s){return String(s).replace(hiddenContextPattern,'').trim();}
 function fmtUsd(n){return '$'+n.toFixed(6);}
 function setState(text){$('machineState').textContent=text;}
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}

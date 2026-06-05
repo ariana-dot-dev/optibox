@@ -1,4 +1,3 @@
-import { streamSharedAnswer } from "../src/providerClient.js";
 import type { HarnessAdapter, ModelOption, SharedContext, UserBoxCapabilities, UserBoxContext } from "../src/index.js";
 
 /** Resolve the LLM API key for a provider from the host environment. */
@@ -20,23 +19,12 @@ export function providerEnvForBox(): Record<string, string> {
   return env;
 }
 
-const SHARED_NORMAL_SYSTEM =
-  "You are the always-on shared front-desk agent for a consumer AI product. You can handle lightweight conversation instantly. Keep replies short and natural. Do not mention Boxes, sandboxes, machines, tools, booting, provisioning, or handoff.";
-
-const SHARED_BRIDGE_SYSTEM =
-  "You are the always-on shared front-desk agent for a consumer AI product. You run on a shared, always-warm machine while the user's private tool environment is becoming available in the background.\n\n" +
-  "You are given a hidden <consumer-context> block with the full prior conversation and a <machine-state> tag. USE IT only to write a coherent holding reply.\n\n" +
-  "ABSOLUTE RULE — do not give a final answer, do not claim you already used tools, do not ask follow-up questions, and do not mention Boxes, sandboxes, machines, booting, provisioning, handoff, or hotswap to the user.\n\n" +
-  "Your only job is a short, warm holding reply (one sentence) that acknowledges the latest request and says you are looking into it.";
-
-function fallbackSharedBridge(ctx: SharedContext): string {
+export function sharedPlaceholder(ctx: SharedContext): string {
   const normalized = ctx.message.trim().toLowerCase();
-  if (!ctx.toolIntent) {
-    if (/^(hi|hey|hello|yo|sup)[!. ]*$/.test(normalized))
-      return "Hey — what can I do for you?";
-    return "Got it — how can I help?";
-  }
-  return "Let me look into it...";
+  if (ctx.toolIntent) return "Looking for it...";
+  if (/^(hi|hey|hello|yo|sup)[!. ]*$/.test(normalized))
+    return "Hey — what can I do for you?";
+  return "Got it — one sec.";
 }
 
 export interface RealCliHarnessSpec {
@@ -60,19 +48,20 @@ function buildPrompt(ctx: UserBoxContext): string {
     "",
     `Machine state: you are now INSIDE the user's private Box — location=user-box tools=true boxId=${ctx.boxId}. Full tools are available.`,
     ctx.partialShared
-      ? `The shared prewarm agent already told the user this (carry it forward, continue from it, do NOT repeat it verbatim):\n"""${ctx.partialShared}"""`
+      ? `The visible shared reply was only a temporary placeholder. Do not repeat it; continue from it silently:\n"""${ctx.partialShared}"""`
       : "",
     "",
     `User's latest request: ${ctx.latestUserMessage}`,
     "",
-    "Complete the request now using real tools: create/edit files and run commands as needed, then briefly report what you did.",
-    "If the request needs a command (for example checking IP), first tell the user you are running the command, then run it, then provide the result. Do not repeat any shared holding reply.",
+    "The latest user request is authoritative. Do not answer earlier small-talk, do not greet, and do not ask what to do if the latest request is actionable.",
+    "Complete the latest request now using real tools: create/edit files and run commands as needed, then briefly report what you did.",
+    "If the latest request asks for an IP address, run a real IP command such as `curl -s ifconfig.me || curl -s https://api.ipify.org` and answer with the result. Do not repeat any shared holding reply.",
   ].filter(Boolean).join("\n");
 }
 
 /**
  * Build a HarnessAdapter that:
- *  - shared(): produces a real, restricted, text-only LLM answer (no Box access);
+ *  - shared(): produces a deterministic, restricted, text-only placeholder (no Box access);
  *  - userBox(): runs the developer's REAL CLI harness inside the user Box.
  * This is the contract every example below uses — the framework never touches
  * Box's built-in agent.
@@ -84,24 +73,7 @@ export function realCliHarness(spec: RealCliHarnessSpec): HarnessAdapter {
     requiredEnv: spec.requiredEnv ?? [...new Set(spec.models.map((m) => (m.provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY_SCOPED")))],
     models: spec.models,
     async *shared(ctx: SharedContext) {
-      const key = providerKey(ctx.selection.provider);
-      if (!key) {
-        yield fallbackSharedBridge(ctx);
-        return;
-      }
-      try {
-        const user = `${ctx.hiddenContext}\n\nCurrent user message: ${ctx.message}`;
-        yield* streamSharedAnswer({
-          provider: ctx.selection.provider,
-          model: ctx.selection.model,
-          system: ctx.toolIntent ? SHARED_BRIDGE_SYSTEM : SHARED_NORMAL_SYSTEM,
-          user,
-          apiKey: key,
-          maxTokens: ctx.toolIntent ? 80 : 120,
-        });
-      } catch (e) {
-        yield fallbackSharedBridge(ctx);
-      }
+      yield sharedPlaceholder(ctx);
     },
     async *userBox(ctx: UserBoxContext) {
       const { capabilities, selection } = ctx;

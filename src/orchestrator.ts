@@ -1,8 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
-  createRestrictedSharedCapabilities,
-  createUserBoxCapabilities,
-} from "./capabilities.js";
+import { createUserBoxCapabilities } from "./capabilities.js";
 import {
   BOX_PRICE_USD_PER_SECOND,
   BOX_PRICING,
@@ -49,13 +46,6 @@ export type ConsumerTurnEventBody =
       boxId: string;
       elapsedSeconds: number;
       costUsd: number;
-      note: string;
-    }
-  | {
-      type: "handoff.swap";
-      fromHarness: string;
-      boxId: string;
-      partialShared: string;
       note: string;
     }
   | {
@@ -160,6 +150,15 @@ export class ConsumerBoxAgentOrchestrator {
       release();
       if (map.get(key) === tail) map.delete(key);
     };
+  }
+
+
+  private sharedPlaceholder(message: string, toolIntent: boolean): string {
+    const normalized = message.trim().toLowerCase();
+    if (toolIntent) return "Looking for it...";
+    if (/^(hi|hey|hello|yo|sup)[!. ]*$/.test(normalized))
+      return "Hey — what can I do for you?";
+    return "Got it — one sec.";
   }
 
   private harness(name: string): HarnessAdapter {
@@ -345,7 +344,7 @@ export class ConsumerBoxAgentOrchestrator {
     // Pure chat while no private Box is ready is answered immediately by the
     // shared front desk, while a single private Box boots in the background.
     // The shared message is final for that chatty turn, so there is no stale
-    // "hey" hot-swap and no duplicate user-box answer later.
+    // "hey" handoff and no duplicate user-box answer later.
     if (!toolIntent && status.kind !== "ready") {
       for await (const ev of this.runSharedOnlyTurn(input, key, status))
         yield { ...ev, turnId };
@@ -385,7 +384,7 @@ export class ConsumerBoxAgentOrchestrator {
     this.transcripts.set(key, transcript);
 
     const harness = this.harness(input.selection.harness);
-    await this.ensureSharedBox();
+    void this.ensureSharedBox().catch(() => undefined);
 
     // Fire-and-forget one private Box startup/resume. ensureUserBox internally
     // dedupes by conversation, so the next tool turn will await this same boot
@@ -415,22 +414,8 @@ export class ConsumerBoxAgentOrchestrator {
       hidden: sharedHidden,
     };
 
-    let sharedText = "";
-    for await (const text of harness.shared({
-      userId: input.userId,
-      conversationId: input.conversationId,
-      message: input.message,
-      transcript,
-      selection: input.selection,
-      capabilities: createRestrictedSharedCapabilities(),
-      hiddenContext: sharedHidden,
-      machine: sharedMachine,
-      toolIntent: false,
-    })) {
-      const chunk = String(text ?? "");
-      sharedText += chunk;
-      yield { type: "shared.delta", text: chunk, harness: harness.name };
-    }
+    const sharedText = this.sharedPlaceholder(input.message, false);
+    yield { type: "shared.delta", text: sharedText, harness: harness.name };
     if (sharedText)
       transcript.push({
         role: "assistant",
@@ -468,7 +453,7 @@ export class ConsumerBoxAgentOrchestrator {
     // never a blanket shared-first fallback.
     //   ready                -> DIRECT to the private box (no shared, no swap)
     //   none/archived/        \
-    //   archiving/provisioning -> shared BRIDGE while we provision/resume, then hot-swap
+    //   archiving/provisioning -> shared BRIDGE while we provision/resume, then handoff
     //   error                -> shared bridge while we provision a fresh box
     if (status.kind === "ready") {
       // FAST PATH: the private box already exists and is warm. Route the message
@@ -500,21 +485,15 @@ export class ConsumerBoxAgentOrchestrator {
       return;
     }
 
-    // BRIDGE PATH: the private box is not ready yet. Start provisioning/resuming
-    // and let the shared front-desk agent give a short, accurate "coming online"
-    // bridge — it must NEVER claim inability, because the box WILL do the work.
+    // BRIDGE PATH: the private box is not ready yet. The user-visible shared
+    // placeholder is emitted BEFORE any shared-box/user-box wait. It is a
+    // deterministic front-desk acknowledgement, not a second autonomous agent
+    // answer, so it cannot leak Box/resume internals or race the real answer.
     const resuming = status.kind === "archived" || status.kind === "archiving";
     const bridgeStatus: NonNullable<MachineState["status"]> = resuming
       ? "resuming"
       : "provisioning";
-    await this.ensureSharedBox();
-    const recoveryEvents: ConsumerTurnEventBody[] = [];
-    const userBoxPromise = this.ensureUserBoxWithRecovery(
-      input.userId,
-      input.conversationId,
-      status,
-      (event) => recoveryEvents.push(event),
-    );
+    void this.ensureSharedBox().catch(() => undefined);
 
     const sharedMachine: MachineState = {
       location: "shared-box",
@@ -536,38 +515,12 @@ export class ConsumerBoxAgentOrchestrator {
       harness: harness.name,
       toolIntent,
       note: resuming
-        ? "private box is resuming from its disk snapshot — bridging warmly, then handing the work back to it"
-        : "private box is provisioning for the first time — bridging warmly, then hot-swapping the real work onto it",
+        ? "private environment is resuming in the background; the shared reply is only a temporary acknowledgement"
+        : "private environment is starting in the background; the shared reply is only a temporary acknowledgement",
     };
 
-    const shared = harness.shared({
-      userId: input.userId,
-      conversationId: input.conversationId,
-      message: input.message,
-      transcript,
-      selection: input.selection,
-      capabilities: createRestrictedSharedCapabilities(),
-      hiddenContext: sharedHidden,
-      machine: sharedMachine,
-      toolIntent,
-    });
-    let sharedText = "";
-    let sharedDone = false;
-    const it = shared[Symbol.asyncIterator]();
-    while (!sharedDone) {
-      const next = await Promise.race([
-        userBoxPromise.then(() => ({ kind: "box" as const })),
-        it.next().then((n) => ({ kind: "shared" as const, n })),
-      ]);
-      if (next.kind === "box") break;
-      if (next.n.done) {
-        sharedDone = true;
-        break;
-      }
-      const text = String(next.n.value ?? "");
-      sharedText += text;
-      yield { type: "shared.delta", text, harness: harness.name };
-    }
+    const sharedText = this.sharedPlaceholder(input.message, toolIntent);
+    yield { type: "shared.delta", text: sharedText, harness: harness.name };
     if (sharedText)
       transcript.push({
         role: "assistant",
@@ -577,9 +530,13 @@ export class ConsumerBoxAgentOrchestrator {
         at: new Date().toISOString(),
       });
 
-    // The user's box is ready -> billing starts and we HOT SWAP the partial
-    // bridge reply + full transcript into the private box.
-    const box = await userBoxPromise;
+    const recoveryEvents: ConsumerTurnEventBody[] = [];
+    const box = await this.ensureUserBoxWithRecovery(
+      input.userId,
+      input.conversationId,
+      status,
+      (event) => recoveryEvents.push(event),
+    );
     while (recoveryEvents.length) yield recoveryEvents.shift()!;
     const { since } = this.startBilling(box.id);
     yield {
@@ -597,14 +554,6 @@ export class ConsumerBoxAgentOrchestrator {
         ? "private box resumed from snapshot — no cold start"
         : "private box provisioned and ready",
     };
-    yield {
-      type: "handoff.swap",
-      fromHarness: harness.name,
-      boxId: box.id,
-      partialShared: sharedText,
-      note: "shared agent stopped; partial reply + full transcript carried into the private Box",
-    };
-
     const recap = await this.recapper.recap(transcript);
     yield {
       type: "handoff.started",
@@ -658,7 +607,7 @@ export class ConsumerBoxAgentOrchestrator {
   /**
    * Phase 3: run the developer's REAL harness inside the ready private box, with
    * the hidden context (tools=true + any carried partial bridge reply). Shared
-   * by both the fast (direct) path and the bridge (hot-swap) path so routing
+   * by both the fast (direct) path and the bridge path so routing
    * stays consistent however we got here.
    */
   private async *continueInUserBox(

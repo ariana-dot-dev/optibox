@@ -54,11 +54,11 @@ sequenceDiagram
   new machine restores the whole conversation; the host UI strips the envelope so
   the user never sees it. The agent always knows whether it has tools
   (`machine.tools`) or is still on the no-tools shared box.
-- **LARP then hot-swap.** If a user asks for tool work while still on the shared
-  box, the shared agent doesn't fail — it LARPs a brief holding reply for a few
-  seconds. The moment the user Box is ready the orchestrator stops the shared
-  agent, emits `handoff.swap` carrying the partial reply forward, and resumes the
-  real tool work inside the Box.
+- **Immediate bridge, then private answer.** If a user asks for tool work while the
+  private environment is still starting, the host emits a deterministic shared
+  placeholder immediately (for example, “Looking for it...”), never exposes
+  Box/resume lifecycle internals, bills the private Box only once ready, and then
+  continues the latest request inside the Box with full transcript/recap/tools.
 - **Billing visibility.** Box bills $20 / 2,000,000 VM-sec = **$0.00001/VM-sec**,
   per second, and **pauses on stop**. `billing.start`/`billing.stop` events expose
   the rate, live cumulative cost, and the exact moment billing hits $0. The shared
@@ -91,7 +91,7 @@ for await (const ev of orchestrator.runTurn({
   selection: { harness: "my-harness", provider: "anthropic", model: "claude-sonnet-4-6" },
 })) {
   // ev: shared.delta | shared.larp | context.injected | billing.start | lifecycle
-  //   | handoff.swap | handoff.started | exec | user-box.delta | turn.done
+  //   | handoff.started | exec | user-box.delta | turn.done
 }
 
 // Stop streams the lifecycle and the moment billing pauses:

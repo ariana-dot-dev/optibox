@@ -69,15 +69,15 @@ const second = await runTurn("turn2", turns[1]!);
 const secondBoxId = second.find((e) => e.type === "handoff.started")?.boxId;
 log("user_box.resume_check", { firstBoxId, secondBoxId, sameBox: firstBoxId === secondBoxId, harnessSwitched: turns[0]!.harness !== turns[1]!.harness });
 
-// New proof points: billing started, bridge placeholder stayed hidden from the
+// New proof points: billing started, bridge restricted reply stayed hidden from the
 // user-box prompt, and the hidden context envelope was injected with tools=true.
 const billing = second.find((e) => e.type === "billing.start");
-const bridgePlaceholder = second.filter((e) => e.type === "shared.delta").map((e) => (e as any).text).join("");
+const bridgeRestrictedReply = second.filter((e) => e.type === "shared.delta").map((e) => (e as any).text).join("");
 const ctxInjected = second.find((e) => e.type === "context.injected" && (e as any).scope === "user-box");
 log("proof.new_events", {
   billingStarted: Boolean(billing),
   ratePerSecond: billing ? (billing as any).ratePerSecond : null,
-  bridgePlaceholder: Boolean(bridgePlaceholder),
+  bridgeRestrictedReply: Boolean(bridgeRestrictedReply),
   hiddenContextToolsTrue: ctxInjected ? (ctxInjected as any).machine?.tools === true : false,
 });
 
@@ -109,6 +109,6 @@ for await (const e of orchestrator.stopUserBox("real-user-1", "real-conversation
 
 const jsonlPath = join(evidenceDir, "real-e2e-transcript.jsonl");
 writeFileSync(jsonlPath, transcript.map((e) => JSON.stringify(e)).join("\n") + "\n");
-const md = `# Consumer Box Agents real E2E evidence\n\nRun id: ${runId}\n\n- Shared always-on Box: ${shared.id} (archiveAfter=${shared.archiveAfter ?? "null"})\n- Turn 1 harness: ${turns[0]!.harness} / ${turns[0]!.model} -> Box ${firstBoxId}\n- Turn 2 harness: ${turns[1]!.harness} / ${turns[1]!.model} -> Box ${secondBoxId}\n- Same Box reused across harness switch: ${firstBoxId === secondBoxId}\n- Bridge placeholder emitted: ${Boolean(bridgePlaceholder)}\n- Billing rate: $${billing ? (billing as any).ratePerSecond : "?"} /VM-sec; billing paused on stop: ${Boolean(billStop)} (this run cost $${billStop ? ((billStop as any).costUsd as number).toFixed(6) : "?"})\n- Stop lifecycle: ${lifecycleStates.join(" -> ")}\n- Context survived stop (turn 3 recalled prior file contents from hidden context): ${/HARNESS_ONE_OK/.test(thirdShared) || /HARNESS_TWO_OK/.test(thirdShared) || /HARNESS_ONE_OK/.test(thirdBox) || /HARNESS_TWO_OK/.test(thirdBox)}\n- Box built-in agent: forbidden via assertNoBoxAgent\n`;
+const md = `# Consumer Box Agents real E2E evidence\n\nRun id: ${runId}\n\n- Shared always-on Box: ${shared.id} (archiveAfter=${shared.archiveAfter ?? "null"})\n- Turn 1 harness: ${turns[0]!.harness} / ${turns[0]!.model} -> Box ${firstBoxId}\n- Turn 2 harness: ${turns[1]!.harness} / ${turns[1]!.model} -> Box ${secondBoxId}\n- Same Box reused across harness switch: ${firstBoxId === secondBoxId}\n- Bridge restricted reply emitted: ${Boolean(bridgeRestrictedReply)}\n- Billing rate: $${billing ? (billing as any).ratePerSecond : "?"} /VM-sec; billing paused on stop: ${Boolean(billStop)} (this run cost $${billStop ? ((billStop as any).costUsd as number).toFixed(6) : "?"})\n- Stop lifecycle: ${lifecycleStates.join(" -> ")}\n- Context survived stop (turn 3 recalled prior file contents from hidden context): ${/HARNESS_ONE_OK/.test(thirdShared) || /HARNESS_TWO_OK/.test(thirdShared) || /HARNESS_ONE_OK/.test(thirdBox) || /HARNESS_TWO_OK/.test(thirdBox)}\n- Box built-in agent: forbidden via assertNoBoxAgent\n`;
 writeFileSync(join(evidenceDir, "REAL_E2E_PROOF.md"), md);
 log("evidence.files", { evidenceDir });

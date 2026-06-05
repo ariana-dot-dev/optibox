@@ -55,8 +55,8 @@ sequenceDiagram
   the user never sees it. The agent always knows whether it has tools
   (`machine.tools`) or is still on the no-tools shared box.
 - **Immediate bridge, then private answer.** If a user asks for tool work while the
-  private environment is still starting, the host emits a deterministic shared
-  placeholder immediately (for example, “Looking for it...”), never exposes
+  private environment is still starting, the host emits a real restricted shared
+  model reply immediately under hidden/system guidance, never exposes
   Box/resume lifecycle internals, bills the private Box only once ready, and then
   continues the latest request inside the Box with full transcript/recap/tools.
 - **Billing visibility.** Box bills $20 / 2,000,000 VM-sec = **$0.00001/VM-sec**,

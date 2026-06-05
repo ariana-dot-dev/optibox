@@ -16,6 +16,7 @@ export interface SharedLlmInput {
 export async function* streamSharedAnswer(input: SharedLlmInput): AsyncIterable<string> {
   if (input.provider === "anthropic") return yield* streamAnthropic(input);
   if (input.provider === "openai") return yield* streamOpenAI(input);
+  if (input.provider === "openrouter") return yield* streamOpenRouter(input);
   throw new Error(`No shared-answer client for provider '${input.provider}'`);
 }
 
@@ -58,6 +59,36 @@ async function* streamOpenAI(input: SharedLlmInput): AsyncIterable<string> {
     }),
   });
   if (!res.ok || !res.body) throw new Error(`OpenAI shared answer failed: ${res.status} ${await res.text()}`);
+  for await (const data of sse(res.body)) {
+    if (data === "[DONE]") return;
+    try {
+      const j = JSON.parse(data);
+      const delta = j.choices?.[0]?.delta?.content;
+      if (delta) yield delta as string;
+    } catch { /* ignore */ }
+  }
+}
+
+async function* streamOpenRouter(input: SharedLlmInput): AsyncIterable<string> {
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${input.apiKey}`,
+      "http-referer": "https://github.com/ariana-dot-dev/optibox",
+      "x-title": "Optibox restricted shared answer",
+    },
+    body: JSON.stringify({
+      model: input.model,
+      stream: true,
+      max_tokens: input.maxTokens ?? 400,
+      messages: [
+        { role: "system", content: input.system },
+        { role: "user", content: input.user },
+      ],
+    }),
+  });
+  if (!res.ok || !res.body) throw new Error(`OpenRouter shared answer failed: ${res.status} ${await res.text()}`);
   for await (const data of sse(res.body)) {
     if (data === "[DONE]") return;
     try {

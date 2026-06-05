@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { createUserBoxCapabilities } from "./capabilities.js";
+import {
+  createRestrictedSharedCapabilities,
+  createUserBoxCapabilities,
+} from "./capabilities.js";
 import {
   BOX_PRICE_USD_PER_SECOND,
   BOX_PRICING,
@@ -150,15 +153,6 @@ export class ConsumerBoxAgentOrchestrator {
       release();
       if (map.get(key) === tail) map.delete(key);
     };
-  }
-
-
-  private sharedPlaceholder(message: string, toolIntent: boolean): string {
-    const normalized = message.trim().toLowerCase();
-    if (toolIntent) return "Looking for it...";
-    if (/^(hi|hey|hello|yo|sup)[!. ]*$/.test(normalized))
-      return "Hey — what can I do for you?";
-    return "Got it — one sec.";
   }
 
   private harness(name: string): HarnessAdapter {
@@ -414,8 +408,22 @@ export class ConsumerBoxAgentOrchestrator {
       hidden: sharedHidden,
     };
 
-    const sharedText = this.sharedPlaceholder(input.message, false);
-    yield { type: "shared.delta", text: sharedText, harness: harness.name };
+    let sharedText = "";
+    for await (const text of harness.shared({
+      userId: input.userId,
+      conversationId: input.conversationId,
+      message: input.message,
+      transcript,
+      selection: input.selection,
+      capabilities: createRestrictedSharedCapabilities(),
+      hiddenContext: sharedHidden,
+      machine: sharedMachine,
+      toolIntent: false,
+    })) {
+      const chunk = String(text ?? "");
+      sharedText += chunk;
+      yield { type: "shared.delta", text: chunk, harness: harness.name };
+    }
     if (sharedText)
       transcript.push({
         role: "assistant",
@@ -485,10 +493,10 @@ export class ConsumerBoxAgentOrchestrator {
       return;
     }
 
-    // BRIDGE PATH: the private box is not ready yet. The user-visible shared
-    // placeholder is emitted BEFORE any shared-box/user-box wait. It is a
-    // deterministic front-desk acknowledgement, not a second autonomous agent
-    // answer, so it cannot leak Box/resume internals or race the real answer.
+    // BRIDGE PATH: the private box is not ready yet. Start the real restricted
+    // shared LLM immediately with hidden/system guidance, then wait for the
+    // private environment and continue the latest request there. No scripted
+    // response or user-visible lifecycle event is emitted.
     const resuming = status.kind === "archived" || status.kind === "archiving";
     const bridgeStatus: NonNullable<MachineState["status"]> = resuming
       ? "resuming"
@@ -515,12 +523,34 @@ export class ConsumerBoxAgentOrchestrator {
       harness: harness.name,
       toolIntent,
       note: resuming
-        ? "private environment is resuming in the background; the shared reply is only a temporary acknowledgement"
-        : "private environment is starting in the background; the shared reply is only a temporary acknowledgement",
+        ? "private environment is resuming; restricted shared model is guided by hidden instructions"
+        : "private environment is starting; restricted shared model is guided by hidden instructions",
     };
 
-    const sharedText = this.sharedPlaceholder(input.message, toolIntent);
-    yield { type: "shared.delta", text: sharedText, harness: harness.name };
+    const recoveryEvents: ConsumerTurnEventBody[] = [];
+    const userBoxPromise = this.ensureUserBoxWithRecovery(
+      input.userId,
+      input.conversationId,
+      status,
+      (event) => recoveryEvents.push(event),
+    );
+
+    let sharedText = "";
+    for await (const text of harness.shared({
+      userId: input.userId,
+      conversationId: input.conversationId,
+      message: input.message,
+      transcript,
+      selection: input.selection,
+      capabilities: createRestrictedSharedCapabilities(),
+      hiddenContext: sharedHidden,
+      machine: sharedMachine,
+      toolIntent,
+    })) {
+      const chunk = String(text ?? "");
+      sharedText += chunk;
+      yield { type: "shared.delta", text: chunk, harness: harness.name };
+    }
     if (sharedText)
       transcript.push({
         role: "assistant",
@@ -530,13 +560,7 @@ export class ConsumerBoxAgentOrchestrator {
         at: new Date().toISOString(),
       });
 
-    const recoveryEvents: ConsumerTurnEventBody[] = [];
-    const box = await this.ensureUserBoxWithRecovery(
-      input.userId,
-      input.conversationId,
-      status,
-      (event) => recoveryEvents.push(event),
-    );
+    const box = await userBoxPromise;
     while (recoveryEvents.length) yield recoveryEvents.shift()!;
     const { since } = this.startBilling(box.id);
     yield {

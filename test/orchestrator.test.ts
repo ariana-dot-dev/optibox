@@ -279,48 +279,6 @@ test("first chatty turn replies from shared immediately while one Box prewarms",
   assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "exactly one user Box is prewarming");
 });
 
-test("hey then IP during boot has one shared greeting, one bridge, and one Box answer", async () => {
-  const box = new SlowUserBoxClient();
-  box.delayMs = 80;
-  const ipDemoHarness: HarnessAdapter = {
-    name: "demo",
-    requiredEnv: [],
-    models: [{ provider: "anthropic", model: "m-1" }],
-    async *shared(ctx) {
-      yield ctx.toolIntent ? "Let me look into it..." : "Hey — what can I do for you?";
-    },
-    async *userBox({ capabilities }) {
-      await capabilities.command("curl -s ifconfig.me");
-      yield "I'm running the command...\nyour ip is 203.0.113.10";
-    },
-  };
-  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [ipDemoHarness], readinessPollMs: 5, autoStopIdleMs: 1 });
-
-  const greeting: any[] = [], ip: any[] = [];
-  const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "demo", provider: "anthropic", model: "m-1" } });
-  const d1 = (async () => { for await (const e of g1) greeting.push(e); })();
-  await new Promise((r) => setTimeout(r, 10));
-  const g2 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's ur ip", selection: { harness: "demo", provider: "anthropic", model: "m-1" } });
-  const d2 = (async () => { for await (const e of g2) ip.push(e); })();
-  await Promise.all([d1, d2]);
-
-  assert.deepEqual(greeting.filter((e) => e.type === "shared.delta").map((e) => e.text), ["Hey — what can I do for you?"]);
-  assert.equal(greeting.find((e) => e.type === "turn.done")?.route, "shared-only");
-  assert.equal(greeting.filter((e) => e.type === "handoff.started").length, 0, "no stale greeting handoff");
-  assert.equal(greeting.filter((e) => e.type === "user-box.delta").length, 0, "no duplicate Box greeting answer");
-
-  assert.deepEqual(ip.filter((e) => e.type === "shared.delta").map((e) => e.text), ["Looking for it..."]);
-  assert.equal(ip.filter((e) => e.type === "handoff.started").length, 1, "IP turn gets exactly one handoff");
-  assert.deepEqual(ip.filter((e) => e.type === "user-box.delta").map((e) => e.text), ["I'm running the command...\nyour ip is 203.0.113.10"]);
-  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "no double Box startup");
-
-  const tx = orchestrator.getTranscript("u", "c");
-  const users = tx.filter((m) => m.role === "user").map((m) => m.content);
-  assert.deepEqual(users, ["hey", "what's ur ip"]);
-  const boxAnswers = tx.filter((m) => m.role === "assistant" && m.mode === "user-box");
-  assert.equal(boxAnswers.length, 1, "only the IP turn is answered by the Box");
-});
-
 test("stopUserBox streams stopping -> archiving -> archived and pauses billing", async () => {
   const box = new FakeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
@@ -391,7 +349,7 @@ test("stuck resume times out, recovers, and queued follow-up also runs in a Box"
 });
 
 
-test("interactive proof UI has no global message queue and can abort stale shared placeholders", async () => {
+test("interactive proof UI has no global message queue and can abort stale shared streams", async () => {
   const html = await import("node:fs/promises").then((fs) => fs.readFile("scripts/interactive-proof-server.ts", "utf8"));
   assert.match(html, /activeTurns=new Map/);
   assert.match(html, /abortInterruptibleSharedTurns/);

@@ -1,13 +1,13 @@
 import { realCliHarness } from "../shared.js";
 
-// Verified-real: OpenCode (`opencode`, package opencode-ai) is multi-provider.
-// Installed on demand in the Box; reads ANTHROPIC_API_KEY / OPENAI_API_KEY.
+// OpenCode documents project rules via AGENTS.md. The adapter writes a per-turn
+// AGENTS.md in the run root and runs opencode from that root.
 export const harness = realCliHarness({
   name: "opencode",
   description: "OpenCode multi-provider agent running inside the user Box.",
   bin: "opencode",
   installCmd: "npm i -g opencode-ai@latest >/tmp/opencode-install.log 2>&1",
-  // Prefer OpenAI when available so the demo does not default to an Anthropic-only path.
+  instructionDelivery: "workspace-agents-md",
   models: [
     { provider: "openai", model: "gpt-4.1-mini", label: "OpenCode · GPT-4.1 mini" },
     { provider: "openai", model: "gpt-4.1", label: "OpenCode · GPT-4.1" },

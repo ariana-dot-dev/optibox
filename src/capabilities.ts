@@ -60,15 +60,17 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
   async function* runHarness(spec: HarnessRunSpec): AsyncIterable<string> {
     options.onExec?.({ kind: "harness", argv: spec.argv });
     const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    // Box files API requires paths relative to the Box work directory.
-    const dir = `${spec.cwd ?? "cba-work"}/${runId}`;
+    const workdir = spec.cwd ?? "cba-work";
+    const dir = `${workdir}/.cba-runs/${runId}`;
     const log = `${dir}/out.log`;
     const env = { ...providerEnv, ...(spec.env ?? {}) };
     const envPrefix = Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}; `).join("");
     const argvStr = spec.argv.map(shq).join(" ");
     const timeoutMs = spec.timeoutMs ?? 240_000;
     // Launch detached, tee to a log so we can poll for incremental output.
-    const launch = `mkdir -p ${shq(dir)} && cd ${shq(dir)} && ${envPrefix}nohup bash -c ${shq(`${argvStr} > out.log 2>&1; echo "__CBA_EXIT__:$?" >> out.log`)} >/dev/null 2>&1 & echo $!`;
+    // The harness process runs in spec.cwd so AGENTS.md / other native rule
+    // files written there are in the harness' real discovery path.
+    const launch = `mkdir -p ${shq(dir)} && cd ${shq(workdir)} && ${envPrefix}nohup bash -c ${shq(`${argvStr} > ${shq(log)} 2>&1; echo "__CBA_EXIT__:$?" >> ${shq(log)}`)} >/dev/null 2>&1 & echo $!`;
     const launched = await box.command(boxId, { command: launch, timeoutMs: 30_000 });
     const pid = launched.stdout.trim().split(/\s+/).pop() ?? "";
 

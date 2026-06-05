@@ -1,0 +1,19 @@
+{
+  "name": "@ascii-prototypes/consumer-box-agents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Prototype orchestration library for consumer agents on top of Box: shared prewarm, restricted safe mode, per-user Box handoff, and lifecycle control.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/orchestrator.test.js",
+    "test:real-box": "npm run build && node dist/test/real-box-smoke.js",
+    "demo:real-e2e": "npm run build && node dist/scripts/real-e2e-demo.js",
+    "proof:interactive": "npm run build && node dist/scripts/interactive-proof-server.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "typescript": "^5.8.3"
+  }
+}

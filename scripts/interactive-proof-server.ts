@@ -209,13 +209,16 @@ function html() {
 <style>
 :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f5f1;color:#141414;line-height:1.4}
 *{box-sizing:border-box}html,body{height:100%;margin:0}body{min-height:100dvh;background:linear-gradient(180deg,#faf9f5 0%,#f1efe8 100%)}
-.app{height:100dvh;max-width:720px;margin:0 auto;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e2ded3;border-right:1px solid #e2ded3;box-shadow:0 24px 80px rgba(25,20,10,.08)}
+.shell{height:100dvh;max-width:1120px;margin:0 auto;display:grid;grid-template-columns:minmax(360px,520px) 320px;gap:18px;align-items:stretch;padding:0 18px}.app{height:100dvh;min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e2ded3;border-right:1px solid #e2ded3;box-shadow:0 24px 80px rgba(25,20,10,.08)}
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e6e1d6;padding:calc(12px + env(safe-area-inset-top)) 14px 12px;display:grid;gap:10px}
 .counters{display:grid;grid-template-columns:1fr 1fr;gap:8px}.counter{border:1px solid #ded8ca;background:#fbfaf7;border-radius:18px;padding:11px 12px;min-width:0}.label{display:block;color:#736b5c;text-transform:uppercase;letter-spacing:.08em;font-size:10px;font-weight:800}.value{display:block;margin-top:3px;font:800 21px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:1px solid #171717;background:#171717;color:#fff;border-radius:999px;padding:10px 13px;font-size:13px;font-weight:750;text-align:center;box-shadow:0 10px 24px rgba(0,0,0,.12)}
 .chat{flex:1;overflow:auto;padding:16px 14px 18px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#7c7468;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;border-radius:20px;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 1px 0 rgba(0,0,0,.04)}.msg.user{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:6px}.msg.assistant{align-self:flex-start;background:#f1efe8;color:#161616;border:1px solid #e2ded3;border-bottom-left-radius:6px}.tag{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 .composer{display:flex;gap:9px;align-items:flex-end;padding:10px 14px calc(12px + env(safe-area-inset-bottom));border-top:1px solid #e6e1d6;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}textarea{flex:1;min-height:46px;max-height:130px;resize:none;border:1px solid #d8d2c5;border-radius:18px;background:#fbfaf7;color:#111;padding:12px 13px;font:inherit;outline:none}textarea:focus{border-color:#111}button{min-height:46px;border:0;border-radius:18px;background:#111;color:#fff;padding:0 16px;font-weight:850;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}
+.schematic{align-self:center;border:1px solid #e1dbcf;background:rgba(255,255,255,.76);backdrop-filter:blur(14px);border-radius:28px;padding:18px;box-shadow:0 24px 80px rgba(25,20,10,.08);color:#191714}.schematic h2{font-size:13px;margin:0 0 14px;text-transform:uppercase;letter-spacing:.1em;color:#6e6659}.route{display:grid;gap:12px}.node{border:1px solid #ddd6c8;background:#fbfaf7;border-radius:20px;padding:13px;transition:.18s ease}.node strong{display:block;font-size:15px}.node span{display:block;margin-top:3px;color:#746c5f;font-size:12px}.node .dot{width:8px;height:8px;border-radius:999px;background:#c8c0b2;display:inline-block;margin-right:7px}.path{height:34px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;color:#8c8374;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.path:before,.path:after{content:"";height:1px;background:#ded7ca}.path span{border:1px solid #ded7ca;background:#fff;border-radius:999px;padding:5px 8px}.hint{margin:14px 0 0;color:#6f675b;font-size:12px;line-height:1.45}.schematic[data-route="shared"] .shared-node,.schematic[data-route="private"] .private-node{border-color:#111;background:#111;color:#fff;box-shadow:0 12px 28px rgba(0,0,0,.14)}.schematic[data-route="shared"] .shared-node span,.schematic[data-route="private"] .private-node span{color:#e9e4dc}.schematic[data-route="shared"] .shared-node .dot,.schematic[data-route="private"] .private-node .dot{background:#70e000;box-shadow:0 0 0 5px rgba(112,224,0,.16)}.schematic[data-route="private"] .to-private span,.schematic[data-route="shared"] .to-shared span{border-color:#111;color:#111;font-weight:850}.schematic[data-route="idle"] .shared-node{border-color:#bdb4a5}.routeStatus{margin-top:12px;border:1px solid #ded7ca;border-radius:16px;padding:10px 12px;background:#fff;font-size:12px;font-weight:800;color:#26231f}
+@media(max-width:900px){.shell{display:block;height:100dvh;padding:0}.schematic{display:none}.app{max-width:720px;margin:0 auto}}
 @media(max-width:520px){.app{max-width:none;border:0}.top{padding-left:10px;padding-right:10px}.chat{padding-left:10px;padding-right:10px}.composer{padding-left:10px;padding-right:10px}.counter{border-radius:15px;padding:10px}.value{font-size:18px}.state{font-size:12px;line-height:1.25;border-radius:16px}.msg{max-width:90%;font-size:14px}.label{font-size:9px}button{padding:0 14px}}
-</style></head><body><main class="app">
+</style></head><body><div class="shell">
+<main class="app">
   <header class="top" aria-label="machine summary">
     <section class="counters" aria-label="totals">
       <div class="counter"><span class="label">total spent</span><span class="value" id="totalCost">$0.000000</span></div>
@@ -229,6 +232,19 @@ function html() {
     <button id="send" type="submit">Send</button>
   </form>
 </main>
+<aside class="schematic" id="schematic" data-route="idle" aria-label="message route schematic">
+  <h2>Message route</h2>
+  <div class="route">
+    <div class="node user-node"><strong><span class="dot"></span>You</strong><span>Message enters the demo</span></div>
+    <div class="path to-shared"><span>fast path</span></div>
+    <div class="node shared-node"><strong><span class="dot"></span>Shared infra</strong><span>Cheap shared chat + intent check</span></div>
+    <div class="path to-private"><span>handoff</span></div>
+    <div class="node private-node"><strong><span class="dot"></span>User machine</strong><span>Private Box with tools + billing</span></div>
+  </div>
+  <div class="routeStatus" id="routeStatus">Ready: shared infra is listening.</div>
+  <p class="hint">On wide screens this shows the under-the-hood route. On mobile it stays hidden so the demo remains just chat and counters.</p>
+</aside>
+</div>
 <script>
 let H=[]; let PRICING=null; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser='user-a';
 let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
@@ -237,7 +253,9 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>
 const hiddenContextPattern=new RegExp('<consumer-context>[\\s\\S]*?</consumer-context>','g');
 function stripHidden(s){return String(s).replace(hiddenContextPattern,'').trim();}
 function fmtUsd(n){return '$'+n.toFixed(6);}
-function setState(text){$('machineState').textContent=text;}
+function routeForState(text){if(/Error/i.test(text))return 'error';if(/Private machine (running|starting|stopping|archiving)|tools active|assistant has tools|preparing tools|Resume timed out/i.test(text))return 'private';if(/Shared chat (thinking|replying|ready)/i.test(text))return 'shared';return 'idle';}
+function setRoute(route,text){const s=$('schematic');const r=$('routeStatus');if(!s||!r)return;s.dataset.route=route;r.textContent=route==='private'?'Route: handed off to the user machine.':route==='shared'?'Route: handled by shared infra.':route==='error'?'Route error: check machine state.':'Ready: shared infra is listening.';}
+function setState(text){$('machineState').textContent=text;setRoute(routeForState(text),text);}
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}
 function renderTotals(){const seconds=activeSeconds();$('totalSeconds').textContent=seconds.toFixed(1)+'s';$('totalCost').textContent=fmtUsd(seconds*billRate);}
 async function load(){const r=await fetch('/api/harnesses');const j=await r.json();H=j.harnesses;PRICING=j.pricing;billRate=PRICING.ratePerSecond;chooseDefaultModel();renderTotals();}

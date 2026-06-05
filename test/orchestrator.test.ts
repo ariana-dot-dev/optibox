@@ -98,31 +98,31 @@ test("live harness switching keeps same Box + preserves context", async () => {
   // switch harness AND model mid-conversation. The box is now warm, so this
   // turn routes DIRECTLY to the user box (no shared agent, no hot-swap).
   const second: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "two", selection: { harness: "beta", provider: "openai", model: "m-2" } })) second.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection: { harness: "beta", provider: "openai", model: "m-2" } })) second.push(e);
   const secondBoxId = second.find((e) => e.type === "turn.done")?.boxId;
   assert.equal(secondBoxId, boxId, "same Box reused across harness switch");
   // context is still preserved across the switch (hidden envelope carries "one")
   assert.ok(second.some((e) => e.type === "user-box.delta" && e.harness === "beta" && /hiddenHas\(true\)/.test(e.text)));
 });
 
-test("every turn resumes the Box and auto-stops after answering", async () => {
+test("tool turns resume the Box and auto-stop after answering", async () => {
   const box = new FakeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
 
   const first: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hello", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
   const boxId = first.find((e) => e.type === "turn.done")?.boxId;
   assert.ok(boxId);
-  assert.ok(first.some((e) => e.type === "handoff.swap"), "first conversational turn still hot-swaps into the Box");
-  assert.ok(first.some((e) => e.type === "user-box.delta"), "first conversational turn is answered by the Box");
+  assert.ok(first.some((e) => e.type === "handoff.swap"), "first tool turn hot-swaps into the Box");
+  assert.ok(first.some((e) => e.type === "user-box.delta"), "first tool turn is answered by the Box");
   assert.ok(first.some((e) => e.type === "billing.stop"), "first turn auto-stops billing");
   assert.equal((await box.get(boxId)).state, "archived", "Box is archived after the turn finishes");
 
   const second: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "ok thanks", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
-  assert.equal(second.find((e) => e.type === "turn.done")?.boxId, boxId, "same Box is resumed for chatty follow-up");
-  assert.ok(second.some((e) => e.type === "shared.larp" && /resuming/.test(e.note)), "chatty follow-up resumes instead of staying shared");
-  assert.ok(second.some((e) => e.type === "user-box.delta"), "chatty follow-up is answered by the Box");
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  assert.equal(second.find((e) => e.type === "turn.done")?.boxId, boxId, "same Box is resumed for tool follow-up");
+  assert.ok(second.some((e) => e.type === "shared.larp" && /resuming/.test(e.note)), "tool follow-up bridges during resume");
+  assert.ok(second.some((e) => e.type === "user-box.delta"), "tool follow-up is answered by the Box");
   assert.ok(second.some((e) => e.type === "billing.stop"), "follow-up auto-stops billing");
   assert.equal((await box.get(boxId)).state, "archived", "Box is archived again after follow-up");
 });
@@ -132,14 +132,14 @@ test("new turn inside idle window cancels pending auto-stop and reuses warm Box"
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 30 });
 
   const first: any[] = [];
-  const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hello", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
+  const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
   const d1 = (async () => { for await (const e of g1) first.push(e); })();
   await waitFor(() => first.some((e) => e.type === "turn.done"));
   const boxId = first.find((e) => e.type === "turn.done")?.boxId;
   assert.equal((await box.get(boxId)).state, "idle", "Box remains warm during idle window");
 
   const second: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "follow up", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run follow up", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
   await d1;
 
   assert.ok(!first.some((e) => e.type === "billing.stop"), "first pending stop was cancelled by the newer turn");
@@ -231,6 +231,7 @@ test("hidden context envelope carries transcript + machine state, strips cleanly
 test("detectToolIntent flags tool work but not pure chit-chat", () => {
   assert.equal(detectToolIntent("create a file foo.txt"), true);
   assert.equal(detectToolIntent("run the build and fix the test"), true);
+  assert.equal(detectToolIntent("what's ur ip"), true);
   assert.equal(detectToolIntent("hello, how are you today?"), false);
 });
 
@@ -262,7 +263,7 @@ class SlowUserBoxClient extends FakeBoxClient {
 }
 
 
-test("first chatty turn waits for and runs in the Box, then stops", async () => {
+test("first chatty turn replies from shared immediately while one Box prewarms", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 60;
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 1 });
@@ -270,40 +271,54 @@ test("first chatty turn waits for and runs in the Box, then stops", async () => 
   const first: any[] = [];
   const started = Date.now();
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hello", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
-  assert.equal(first.find((e) => e.type === "turn.done")?.route, "bridge");
-  assert.ok(Date.now() - started >= box.delayMs, "chatty answer waits for private Box readiness");
-  assert.ok(first.some((e) => e.type === "handoff.swap"), "chatty first turn hot-swaps into the Box");
-  assert.ok(first.some((e) => e.type === "user-box.delta"), "chatty first turn is answered by the Box");
-  assert.ok(first.some((e) => e.type === "billing.stop"), "chatty first turn auto-stops");
-  const boxId = first.find((e) => e.type === "turn.done")?.boxId;
-  assert.equal((await box.get(boxId)).state, "archived");
+  assert.equal(first.find((e) => e.type === "turn.done")?.route, "shared-only");
+  assert.ok(Date.now() - started < box.delayMs, "chatty answer does not wait for private Box readiness");
+  assert.ok(first.some((e) => e.type === "shared.delta"), "chatty first turn is answered by shared");
+  assert.ok(!first.some((e) => e.type === "handoff.swap"), "chatty first turn does not hot-swap stale hello into Box");
+  assert.ok(!first.some((e) => e.type === "user-box.delta"), "chatty first turn has no duplicate Box answer");
+  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "exactly one user Box is prewarming");
 });
 
-test("conversational follow-up during provisioning queues for the Box instead of staying shared", async () => {
+test("hey then IP during boot has one shared greeting, one bridge, and one Box answer", async () => {
   const box = new SlowUserBoxClient();
-  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 1 });
+  box.delayMs = 80;
+  const ipDemoHarness: HarnessAdapter = {
+    name: "demo",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared(ctx) {
+      yield ctx.toolIntent ? "Let me look into it..." : "Hey — what can I do for you?";
+    },
+    async *userBox({ capabilities }) {
+      await capabilities.command("curl -s ifconfig.me");
+      yield "I'm running the command...\nyour ip is 203.0.113.10";
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [ipDemoHarness], readinessPollMs: 5, autoStopIdleMs: 1 });
 
-  const a: any[] = [], b: any[] = [];
-  const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what is my ip address", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
-  const da = (async () => { for await (const e of g1) a.push(e); })();
-  await new Promise((r) => setTimeout(r, 15));
-  const g2 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "ok thanks", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
-  const db = (async () => { for await (const e of g2) b.push(e); })();
-  await Promise.all([da, db]);
+  const greeting: any[] = [], ip: any[] = [];
+  const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "demo", provider: "anthropic", model: "m-1" } });
+  const d1 = (async () => { for await (const e of g1) greeting.push(e); })();
+  await new Promise((r) => setTimeout(r, 10));
+  const g2 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's ur ip", selection: { harness: "demo", provider: "anthropic", model: "m-1" } });
+  const d2 = (async () => { for await (const e of g2) ip.push(e); })();
+  await Promise.all([d1, d2]);
 
-  assert.ok(a.some((e) => e.type === "handoff.swap"), "first turn hot-swaps to the Box");
-  assert.ok(a.some((e) => e.type === "user-box.delta"), "first turn runs in the Box");
-  assert.ok(!b.some((e) => e.type === "shared.delta"), "follow-up does not terminate on shared");
-  assert.ok(b.some((e) => e.type === "user-box.delta"), "follow-up also runs in the Box");
-  assert.ok(b.some((e) => e.type === "billing.start"), "follow-up starts billing for resumed Box");
-  assert.ok(b.some((e) => e.type === "billing.stop"), "follow-up stops billing when done");
-  assert.notEqual(a[0].turnId, b[0].turnId, "concurrent turns have distinct ids");
+  assert.deepEqual(greeting.filter((e) => e.type === "shared.delta").map((e) => e.text), ["Hey — what can I do for you?"]);
+  assert.equal(greeting.find((e) => e.type === "turn.done")?.route, "shared-only");
+  assert.equal(greeting.filter((e) => e.type === "handoff.swap").length, 0, "no stale greeting hotswap");
+  assert.equal(greeting.filter((e) => e.type === "user-box.delta").length, 0, "no duplicate Box greeting answer");
+
+  assert.deepEqual(ip.filter((e) => e.type === "shared.delta").map((e) => e.text), ["Let me look into it..."]);
+  assert.equal(ip.filter((e) => e.type === "handoff.swap").length, 1, "IP turn gets exactly one handoff");
+  assert.deepEqual(ip.filter((e) => e.type === "user-box.delta").map((e) => e.text), ["I'm running the command...\nyour ip is 203.0.113.10"]);
+  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "no double Box startup");
 
   const tx = orchestrator.getTranscript("u", "c");
   const users = tx.filter((m) => m.role === "user").map((m) => m.content);
-  assert.deepEqual(users, ["what is my ip address", "ok thanks"]);
+  assert.deepEqual(users, ["hey", "what's ur ip"]);
   const boxAnswers = tx.filter((m) => m.role === "assistant" && m.mode === "user-box");
-  assert.equal(boxAnswers.length, 2, "both turns are answered by the Box");
+  assert.equal(boxAnswers.length, 1, "only the IP turn is answered by the Box");
 });
 
 test("stopUserBox streams stopping -> archiving -> archived and pauses billing", async () => {
@@ -362,7 +377,7 @@ test("stuck resume times out, recovers, and queued follow-up also runs in a Box"
   const gt = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's ur ip", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
   const dt = (async () => { for await (const e of gt) tool.push(e); })();
   await new Promise((r) => setTimeout(r, 5));
-  const gc = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "ok", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
+  const gc = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "pwd", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
   const dc = (async () => { for await (const e of gc) chat.push(e); })();
   await Promise.all([dt, dc]);
 
@@ -380,6 +395,7 @@ test("interactive proof UI has no global message queue and can abort stale share
   const html = await import("node:fs/promises").then((fs) => fs.readFile("scripts/interactive-proof-server.ts", "utf8"));
   assert.match(html, /activeTurns=new Map/);
   assert.match(html, /abortInterruptibleSharedTurns/);
+  assert.doesNotMatch(html, /Hot swap:/);
   assert.doesNotMatch(html, /queued #/);
   assert.doesNotMatch(html, /const queue=\[\]/);
 });

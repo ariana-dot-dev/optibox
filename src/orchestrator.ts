@@ -7,6 +7,7 @@ import {
   BOX_PRICE_USD_PER_SECOND,
   BOX_PRICING,
   buildHiddenContext,
+  detectToolIntent,
   type MachineState,
 } from "./context.js";
 import { ExtractiveRecapper } from "./recap.js";
@@ -83,7 +84,7 @@ export type ConsumerTurnEventBody =
       boxId: string;
       harness: string;
       model: string;
-      route?: "direct" | "bridge";
+      route?: "shared-only" | "direct" | "bridge";
     };
 
 /**
@@ -338,14 +339,25 @@ export class ConsumerBoxAgentOrchestrator {
     const key = `${input.userId}:${input.conversationId}`;
     const turnId = randomUUID();
     const turnSequence = this.bumpTurnSequence(key);
+    const toolIntent = detectToolIntent(input.message);
+    const status = await this.userBoxStatus(input.userId, input.conversationId);
 
-    // Always route through the private Box. The shared machine may stream a
-    // temporary bridge while the Box provisions/resumes, but it is never the
-    // terminal answer path. This avoids the bad old path where a stopped Box
-    // was not resumed for chatty turns.
+    // Pure chat while no private Box is ready is answered immediately by the
+    // shared front desk, while a single private Box boots in the background.
+    // The shared message is final for that chatty turn, so there is no stale
+    // "hey" hot-swap and no duplicate user-box answer later.
+    if (!toolIntent && status.kind !== "ready") {
+      for await (const ev of this.runSharedOnlyTurn(input, key, status))
+        yield { ...ev, turnId };
+      return;
+    }
+
+    // Tool work, or any message once the Box is warm, is serialized into the
+    // private Box. While the Box provisions/resumes the shared machine can emit
+    // a short holding reply, then exactly one handoff continues the latest turn.
     const release = await this.acquireLock(this.boxLocks, key);
     try {
-      for await (const ev of this.runBoxTurn(input, key))
+      for await (const ev of this.runBoxTurn(input, key, status, toolIntent))
         yield { ...ev, turnId };
     } finally {
       release();
@@ -358,9 +370,10 @@ export class ConsumerBoxAgentOrchestrator {
       yield { ...ev, turnId };
   }
 
-  private async *runBoxTurn(
+  private async *runSharedOnlyTurn(
     input: ConsumerTurnInput,
     key: string,
+    status: UserBoxStatus,
   ): AsyncIterable<ConsumerTurnEvent> {
     const transcript = this.transcripts.get(key) ?? [];
     transcript.push({
@@ -372,16 +385,91 @@ export class ConsumerBoxAgentOrchestrator {
     this.transcripts.set(key, transcript);
 
     const harness = this.harness(input.selection.harness);
-    const toolIntent = true;
+    await this.ensureSharedBox();
 
+    // Fire-and-forget one private Box startup/resume. ensureUserBox internally
+    // dedupes by conversation, so the next tool turn will await this same boot
+    // instead of launching a second Box or producing a second handoff.
+    void this.ensureUserBoxWithRecovery(
+      input.userId,
+      input.conversationId,
+      status,
+      () => {
+        /* background prewarm: lifecycle becomes visible when a tool turn awaits it */
+      },
+    ).catch(() => undefined);
+
+    const sharedMachine: MachineState = {
+      location: "shared-box",
+      tools: false,
+      status: "prewarming",
+    };
+    const sharedHidden = buildHiddenContext({
+      transcript,
+      machine: sharedMachine,
+    });
+    yield {
+      type: "context.injected",
+      scope: "shared",
+      machine: sharedMachine,
+      hidden: sharedHidden,
+    };
+
+    let sharedText = "";
+    for await (const text of harness.shared({
+      userId: input.userId,
+      conversationId: input.conversationId,
+      message: input.message,
+      transcript,
+      selection: input.selection,
+      capabilities: createRestrictedSharedCapabilities(),
+      hiddenContext: sharedHidden,
+      machine: sharedMachine,
+      toolIntent: false,
+    })) {
+      const chunk = String(text ?? "");
+      sharedText += chunk;
+      yield { type: "shared.delta", text: chunk, harness: harness.name };
+    }
+    if (sharedText)
+      transcript.push({
+        role: "assistant",
+        content: sharedText,
+        mode: "shared",
+        harness: harness.name,
+        at: new Date().toISOString(),
+      });
+    yield {
+      type: "turn.done",
+      boxId: status.kind === "none" ? "" : status.boxId,
+      harness: harness.name,
+      model: input.selection.model,
+      route: "shared-only",
+    };
+  }
+
+  private async *runBoxTurn(
+    input: ConsumerTurnInput,
+    key: string,
+    status: UserBoxStatus,
+    toolIntent: boolean,
+  ): AsyncIterable<ConsumerTurnEvent> {
+    const transcript = this.transcripts.get(key) ?? [];
+    transcript.push({
+      role: "user",
+      content: input.message,
+      mode: "shared",
+      at: new Date().toISOString(),
+    });
+    this.transcripts.set(key, transcript);
+
+    const harness = this.harness(input.selection.harness);
     // STATE-AWARE ROUTING. Decide the path from the box's PRECISE current state,
     // never a blanket shared-first fallback.
     //   ready                -> DIRECT to the private box (no shared, no swap)
     //   none/archived/        \
     //   archiving/provisioning -> shared BRIDGE while we provision/resume, then hot-swap
     //   error                -> shared bridge while we provision a fresh box
-    const status = await this.userBoxStatus(input.userId, input.conversationId);
-
     if (status.kind === "ready") {
       // FAST PATH: the private box already exists and is warm. Route the message
       // straight to the user-box agent. No shared agent runs, so there is NO

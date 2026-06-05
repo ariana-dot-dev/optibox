@@ -20,16 +20,23 @@ export function providerEnvForBox(): Record<string, string> {
   return env;
 }
 
-const SHARED_SYSTEM =
-  "You are the always-on shared front-desk agent for a consumer AI product. You run on a shared, always-warm machine. The user has a private sandbox ('Box') that is coming online RIGHT NOW — provisioning for the first time, or resuming from its snapshot — and within seconds it will take over THIS conversation and do the real work with full tools.\n\n" +
-  "You are given a hidden <consumer-context> block with the full prior conversation and a <machine-state> tag whose status is 'provisioning' or 'resuming'. USE IT only to write a coherent bridge.\n\n" +
-  "ABSOLUTE RULE — every user message must be handed to the private Box. Do not decide that a message is lightweight enough to answer on the shared machine. Do not give a final answer, do not ask follow-up questions, and do not say the Box is optional.\n\n" +
-  "Your only job is a short, warm BRIDGE (1 sentence): acknowledge the latest user message and say their private Box is coming online/resuming now to answer it. Do NOT claim you already did it. Do NOT refuse. The real agent continues seamlessly inside the Box in a moment.";
+const SHARED_NORMAL_SYSTEM =
+  "You are the always-on shared front-desk agent for a consumer AI product. You can handle lightweight conversation instantly. Keep replies short and natural. Do not mention Boxes, sandboxes, machines, tools, booting, provisioning, or handoff.";
+
+const SHARED_BRIDGE_SYSTEM =
+  "You are the always-on shared front-desk agent for a consumer AI product. You run on a shared, always-warm machine while the user's private tool environment is becoming available in the background.\n\n" +
+  "You are given a hidden <consumer-context> block with the full prior conversation and a <machine-state> tag. USE IT only to write a coherent holding reply.\n\n" +
+  "ABSOLUTE RULE — do not give a final answer, do not claim you already used tools, do not ask follow-up questions, and do not mention Boxes, sandboxes, machines, booting, provisioning, handoff, or hotswap to the user.\n\n" +
+  "Your only job is a short, warm holding reply (one sentence) that acknowledges the latest request and says you are looking into it.";
 
 function fallbackSharedBridge(ctx: SharedContext): string {
-  const loading = ctx.machine.status === "resuming" ? "resuming" : "coming online";
-  if (!ctx.toolIntent) return "Got it — I’m here, and your private Box is warming up in the background.";
-  return `Got it — your private Box is ${loading} now so it can handle that with the right tools.`;
+  const normalized = ctx.message.trim().toLowerCase();
+  if (!ctx.toolIntent) {
+    if (/^(hi|hey|hello|yo|sup)[!. ]*$/.test(normalized))
+      return "Hey — what can I do for you?";
+    return "Got it — how can I help?";
+  }
+  return "Let me look into it...";
 }
 
 export interface RealCliHarnessSpec {
@@ -59,6 +66,7 @@ function buildPrompt(ctx: UserBoxContext): string {
     `User's latest request: ${ctx.latestUserMessage}`,
     "",
     "Complete the request now using real tools: create/edit files and run commands as needed, then briefly report what you did.",
+    "If the request needs a command (for example checking IP), first tell the user you are running the command, then run it, then provide the result. Do not repeat any shared holding reply.",
   ].filter(Boolean).join("\n");
 }
 
@@ -83,9 +91,16 @@ export function realCliHarness(spec: RealCliHarnessSpec): HarnessAdapter {
       }
       try {
         const user = `${ctx.hiddenContext}\n\nCurrent user message: ${ctx.message}`;
-        yield* streamSharedAnswer({ provider: ctx.selection.provider, model: ctx.selection.model, system: SHARED_SYSTEM, user, apiKey: key, maxTokens: 300 });
+        yield* streamSharedAnswer({
+          provider: ctx.selection.provider,
+          model: ctx.selection.model,
+          system: ctx.toolIntent ? SHARED_BRIDGE_SYSTEM : SHARED_NORMAL_SYSTEM,
+          user,
+          apiKey: key,
+          maxTokens: ctx.toolIntent ? 80 : 120,
+        });
       } catch (e) {
-        yield `[${spec.name} · shared restricted] (prewarm error: ${e instanceof Error ? e.message : String(e)})`;
+        yield fallbackSharedBridge(ctx);
       }
     },
     async *userBox(ctx: UserBoxContext) {

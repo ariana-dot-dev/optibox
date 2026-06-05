@@ -298,7 +298,7 @@ $('harness').onchange=()=>{fillModels();log('warn','switch','harness -> '+$('har
 $('model').onchange=()=>log('warn','switch','model -> '+$('model').value);
 const bubbles=new Map();
 function addMsg(cls,tag,text,key){const c=$('chat');key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML='<div class="tag">'+esc(tag)+'</div><div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}el.querySelector('.body').textContent=stripHidden(el.querySelector('.body').textContent+text);c.scrollTop=c.scrollHeight;return el;}
-function addSwap(text){const c=$('chat');const el=document.createElement('div');el.className='msg swap';el.textContent='Hot swap: '+text;c.appendChild(el);c.scrollTop=c.scrollHeight;}
+function addSwap(text){log('ok','handoff',text);}
 function tick(){const sec=billFrozen+(billing?(Date.now()-billSince)/1000:0);lastSec=sec;$('elapsed').textContent=sec.toFixed(1)+'s';const cost=sec*billRate;$('cost').textContent=fmtUsd(cost);$('proj').textContent='$'+(cost*30).toFixed(2);}
 function startBilling(sinceMs){billing=true;billSince=sinceMs||Date.now();$('billstate').textContent='running · billing';setStatus('billing');setStep('running');if(!timer)timer=setInterval(tick,100);tick();}
 function stopBilling(elapsed,cost){billing=false;if(timer){clearInterval(timer);timer=null;}billFrozen=0;$('billstate').textContent='stopped · $0';const sec=(elapsed!=null&&elapsed>0)?elapsed:lastSec;const c=(elapsed!=null&&elapsed>0)?cost:lastSec*billRate;$('elapsed').textContent=sec.toFixed(1)+'s final';$('cost').textContent=fmtUsd(c);setStatus('stopped');}
@@ -315,7 +315,7 @@ function handle(ev,localId){const t=activeTurns.get(localId);if(t&&ev.type==='sh
   else if(ev.type==='shared.larp'){log('acc','shared',ev.note);setStatus(ev.toolIntent?'starting box':'shared reply');}
   else if(ev.type==='context.injected'){setLoc(ev.machine.location,ev.machine.tools);log('acc','context',ev.machine.location+' tools='+ev.machine.tools);if(ev.scope==='shared')setStep('ready');}
   else if(ev.type==='billing.start'){setStep('ready');startBilling(ev.sinceEpochMs);log('ok','billing','started on Box '+ev.boxId);}
-  else if(ev.type==='handoff.swap'){addSwap('context moved into Box '+ev.boxId);log('ok','hotswap',ev.note);setStatus('hot swap');}
+  else if(ev.type==='handoff.swap'){addSwap('Box ready '+ev.boxId);log('ok','handoff',ev.note);setStatus('box ready');}
   else if(ev.type==='lifecycle'){if(ev.boxId)$('boxid').textContent=ev.boxId;if(['stopping','archiving','archived','resume-timeout'].includes(ev.state))setStep(ev.state);log(ev.state==='resume-timeout'?'warn':'ok','box',(ev.note||ev.state)+' '+ev.boxId+' ['+ev.state+']');setStatus(ev.state);}
   else if(ev.type==='handoff.started'){log('ok','handoff','Box '+ev.boxId+' · '+ev.harness+'/'+ev.model);addMsg('box',ev.harness+' · '+ev.model+' · Box '+ev.boxId,'',keyFor(ev,localId,'box'));setStatus('running in box');}
   else if(ev.type==='exec'){log('acc','exec',ev.kind+': '+esc((ev.argv?ev.argv.join(' '):ev.command||'').slice(0,200)));}

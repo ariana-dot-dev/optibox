@@ -35,7 +35,7 @@ export interface MachineState {
    * Used by the shared bridge agent to phrase an accurate "coming online" reply
    * and by the UI to show precise state instead of a coarse "busy".
    */
-  status?: "provisioning" | "resuming" | "live";
+  status?: "prewarming" | "provisioning" | "resuming" | "live";
 }
 
 export const HIDDEN_CONTEXT_TAG = "consumer-context";
@@ -87,7 +87,7 @@ function escapeXml(s: string): string {
 
 /** Heuristic: does this user message ask for real tool work (files/commands)? */
 export function detectToolIntent(message: string): boolean {
-  return /\b(create|make|write|edit|append|modify|update|delete|remove|run|execute|install|build|compile|test|fix|refactor|file|folder|directory|script|command|cat|ls|grep|npm|git|code|implement|add)\b/i.test(
+  return /\b(create|make|write|edit|append|modify|update|delete|remove|run|execute|install|build|compile|test|fix|refactor|file|folder|directory|script|command|cat|ls|grep|npm|git|code|implement|add|ip|ifconfig|hostname|whoami|pwd|curl|wget)\b/i.test(
     message,
   );
 }

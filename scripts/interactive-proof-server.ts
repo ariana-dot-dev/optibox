@@ -248,9 +248,26 @@ function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>
 const activeTurns=new Map();
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 async function runTurn(msg){abortInterruptibleSharedTurns();const localId=(crypto.randomUUID?crypto.randomUUID():String(Date.now()+Math.random()));const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared chat thinking · private machine stopped');try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:'conv-1',message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
-$('composer').addEventListener('submit',e=>{e.preventDefault();const msg=$('msg').value.trim();if(!msg)return;$('msg').value='';runTurn(msg);});
-$('msg').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit();}});
-async function drain(res,localId){const reader=res.body.getReader();const dec=new TextDecoder();let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split('\n\n');buf=parts.pop();for(const p of parts){const line=p.split('\n').find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
+const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
+let lastSubmitAt=0;
+function submitComposer(){
+  const text=msgEl.value.trim();
+  if(!text)return false;
+  const now=Date.now();
+  if(now-lastSubmitAt<150)return false;
+  lastSubmitAt=now;
+  msgEl.value='';
+  msgEl.focus();
+  runTurn(text);
+  return true;
+}
+composer.addEventListener('submit',e=>{e.preventDefault();submitComposer();});
+sendBtn.addEventListener('click',e=>{e.preventDefault();submitComposer();});
+sendBtn.addEventListener('pointerup',e=>{e.preventDefault();submitComposer();});
+sendBtn.addEventListener('touchend',e=>{e.preventDefault();submitComposer();},{passive:false});
+msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer();}});
+msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer();}});
+async function drain(res,localId){const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls;}
 function handle(ev,localId){const t=activeTurns.get(localId);if(t&&ev.type==='shared.larp'&&ev.toolIntent===false)t.interruptible=true;if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
   if(ev.type==='shared.delta'){addMsg('assistant','assistant',ev.text,keyFor(ev,localId,'shared'));}

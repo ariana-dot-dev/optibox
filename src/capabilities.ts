@@ -79,7 +79,9 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     while (Date.now() - started < timeoutMs) {
       await new Promise((r) => setTimeout(r, pollMs));
       let content = "";
-      try { content = await box.readFile(boxId, log); } catch { /* not created yet */ }
+      try {
+        content = (await box.command(boxId, { command: `cat ${shq(log)} 2>/dev/null || true`, timeoutMs: 15_000 })).stdout;
+      } catch { /* not created yet */ }
       const exitMatch = content.match(/__CBA_EXIT__:(\d+)\s*$/);
       const visible = content.replace(/\n?__CBA_EXIT__:\d+\s*$/g, "");
       if (visible.length > offset) {

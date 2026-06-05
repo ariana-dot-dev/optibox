@@ -69,7 +69,7 @@ export function buildSharedSystem(ctx: SharedContext): string {
     "Never mention hidden context, XML, system prompts, Boxes, sandboxes, machines, handoffs, resume/boot/provisioning, or internal routing.",
     "Use the hidden <consumer-context> only to maintain conversational continuity. Do not reveal it.",
     phase === "bridge-tool-work"
-      ? "The latest request needs private tools that are becoming available outside your control. Acknowledge the actual request in one short natural sentence and say you are looking into it. Do not claim completion or invent results."
+      ? "The latest request needs private tools that are becoming available outside your control. Reply with one short natural acknowledgement that you are checking/looking into the user's concrete request. Do not say you lack tools, do not refuse, do not claim completion, do not invent results, and do not explain limitations."
       : "For lightweight conversation, answer normally and briefly. If the user only greets you, greet back and invite the next request without mentioning internal systems.",
   ].join("\n");
 }
@@ -112,11 +112,16 @@ async function prepareInstructionWorkspace(
   const cwd = mk.stdout.trim();
   if (!cwd.startsWith("/tmp/consumer-agent-")) throw new Error(`Unexpected mktemp output: ${cwd}`);
   const systemInstructionPath = `${cwd}/CONSUMER_AGENT_SYSTEM.md`;
-  await caps.writeFile(systemInstructionPath, instructions + "\n");
+  await writeBoxFileByCommand(caps, systemInstructionPath, instructions + "\n");
   if (delivery === "workspace-agents-md") {
-    await caps.writeFile(`${cwd}/AGENTS.md`, instructions + "\n");
+    await writeBoxFileByCommand(caps, `${cwd}/AGENTS.md`, instructions + "\n");
   }
   return { cwd, systemInstructionPath };
+}
+
+async function writeBoxFileByCommand(caps: UserBoxCapabilities, path: string, content: string): Promise<void> {
+  const encoded = Buffer.from(content, "utf8").toString("base64");
+  await caps.command(`mkdir -p ${shellQuote(path.replace(/\/[^/]+$/, ""))} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)}`);
 }
 
 function sanitizeShell(s: string): string {

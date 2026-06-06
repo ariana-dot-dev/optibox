@@ -224,7 +224,7 @@ test("tool turn adopts an existing named warm user Box before creating another",
   } as any);
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
   const events: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's ur ip", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) events.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey what's ur cpu count", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) events.push(e);
   assert.equal(events.find((e) => e.type === "turn.done")?.boxId, "box-existing");
   assert.equal([...box.boxes.values()].filter((b) => b.name === "consumer-agent-user-u").length, 1, "no duplicate user box created");
 });
@@ -263,6 +263,10 @@ test("detectToolIntent flags tool work but not pure chit-chat", () => {
   assert.equal(detectToolIntent("create a file foo.txt"), true);
   assert.equal(detectToolIntent("run the build and fix the test"), true);
   assert.equal(detectToolIntent("what's ur ip"), true);
+  assert.equal(detectToolIntent("hey what's ur cpu count"), true);
+  assert.equal(detectToolIntent("how many cores do you have?"), true);
+  assert.equal(detectToolIntent("what operating system is this?"), true);
+  assert.equal(detectToolIntent("what's your RAM?"), true);
   assert.equal(detectToolIntent("nice and ipv4"), true);
   assert.equal(detectToolIntent("and v4?"), true);
   assert.equal(detectToolIntent("hello, how are you today?"), false);

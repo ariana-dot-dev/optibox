@@ -87,6 +87,7 @@ export function buildUserBoxInstructions(ctx: UserBoxContext): string {
       : "No visible shared acknowledgement needs to be carried forward.",
     "Use real tools when the request requires them. For shell facts like IP/hostname/current directory, run the appropriate command and report the observed result. Do not guess.",
     "For public IP requests: if the user asks for IPv4/v4, run an IPv4-specific lookup such as `curl -4 -s https://api.ipify.org`; if the user asks for IPv6/v6, use an IPv6-specific lookup; if ambiguous, say which address family you observed.",
+    "For CPU/core-count requests, run a real command such as `nproc` or `lscpu` in the private environment and report the observed count.",
     "When done, answer the latest user request directly and concisely. If you changed files or ran commands, summarize the concrete result.",
   ].filter(Boolean).join("\n");
 }

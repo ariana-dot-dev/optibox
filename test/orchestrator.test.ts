@@ -110,8 +110,8 @@ test("live harness switching keeps same Box + preserves context", async () => {
   assert.ok(boxId);
   assert.ok(first.some((e) => e.type === "user-box.delta" && e.harness === "alpha"));
 
-  // switch harness AND model mid-conversation. The box is now warm, so this
-  // turn routes DIRECTLY to the user box (no shared agent, no bridge).
+  // switch harness AND model mid-conversation. The box is now warm, so the
+  // turn still emits a shared bridge first, then hot-swaps to the same Box.
   const second: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection: { harness: "beta", provider: "openai", model: "m-2" } })) second.push(e);
   const secondBoxId = second.find((e) => e.type === "turn.done")?.boxId;
@@ -130,7 +130,7 @@ test("tool turns resume the Box and auto-stop after answering", async () => {
   assert.ok(boxId);
   assert.ok(first.some((e) => e.type === "handoff.started"), "first tool turn bridges into the Box");
   assert.ok(first.some((e) => e.type === "user-box.delta"), "first tool turn is answered by the Box");
-  assert.ok(!first.some((e) => e.type === "shared.delta"), "tool turn has no shared-model answer");
+  assert.ok(first.some((e) => e.type === "shared.delta"), "every turn gets a shared bridge acknowledgement");
   assert.ok(first.some((e) => e.type === "billing.stop"), "first turn auto-stops billing");
   assert.equal((await box.get(boxId)).state, "archived", "Box is archived after the turn finishes");
 
@@ -259,17 +259,10 @@ test("hidden context envelope carries transcript + machine state, strips cleanly
   assert.equal(stripHiddenContext(`before ${hidden} after`), "before  after".trim());
 });
 
-test("detectToolIntent flags tool work but not pure chit-chat", () => {
+test("legacy detectToolIntent no longer gates routing", () => {
   assert.equal(detectToolIntent("create a file foo.txt"), true);
-  assert.equal(detectToolIntent("run the build and fix the test"), true);
-  assert.equal(detectToolIntent("what's ur ip"), true);
-  assert.equal(detectToolIntent("hey what's ur cpu count"), true);
-  assert.equal(detectToolIntent("how many cores do you have?"), true);
-  assert.equal(detectToolIntent("what operating system is this?"), true);
-  assert.equal(detectToolIntent("what's your RAM?"), true);
-  assert.equal(detectToolIntent("nice and ipv4"), true);
-  assert.equal(detectToolIntent("and v4?"), true);
-  assert.equal(detectToolIntent("hello, how are you today?"), false);
+  assert.equal(detectToolIntent("hello, how are you today?"), true);
+  assert.equal(detectToolIntent("surprise me with a color"), true);
 });
 
 test("runHarness extracts real Claude stream-json text deltas without duplicating final result", async () => {
@@ -330,20 +323,20 @@ class SlowUserBoxClient extends FakeBoxClient {
 }
 
 
-test("first chatty turn replies from shared immediately while one Box prewarms", async () => {
+test("arbitrary chatty turn bridges first, then continues in the Box without classification", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 60;
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 1 });
 
   const first: any[] = [];
-  const started = Date.now();
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hello", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
-  assert.equal(first.find((e) => e.type === "turn.done")?.route, "shared-only");
-  assert.ok(Date.now() - started < box.delayMs, "chatty answer does not wait for private Box readiness");
-  assert.ok(first.some((e) => e.type === "shared.delta"), "chatty first turn is answered by shared");
-  assert.ok(!first.some((e) => e.type === "handoff.started"), "chatty first turn does not bridge stale hello into Box");
-  assert.ok(!first.some((e) => e.type === "user-box.delta"), "chatty first turn has no duplicate Box answer");
-  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "exactly one user Box is prewarming");
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "surprise me with a color", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  assert.equal(first.find((e) => e.type === "turn.done")?.route, "bridge");
+  const sharedIdx = first.findIndex((e) => e.type === "shared.delta");
+  const boxIdx = first.findIndex((e) => e.type === "user-box.delta");
+  assert.ok(sharedIdx >= 0, "shared bridge acknowledgement is emitted");
+  assert.ok(boxIdx > sharedIdx, "private Box answer follows the shared bridge");
+  assert.ok(first.some((e) => e.type === "handoff.started"), "same turn hot-swaps into the Box");
+  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "exactly one user Box is used");
 });
 
 test("stopUserBox streams stopping -> archiving -> archived and pauses billing", async () => {

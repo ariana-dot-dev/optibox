@@ -243,7 +243,7 @@ function html() {
       <div class="counter"><span class="label">total spent</span><span class="value" id="totalCost">$0.000000</span></div>
       <div class="counter"><span class="label">machine time</span><span class="value" id="totalSeconds">0.0s</span></div>
     </section>
-    <div class="state" id="machineState">Shared chat ready · private machine stopped</div>
+    <div class="state" id="machineState">Shared bridge ready · private machine stopped</div>
   </header>
   <section class="chat" id="chat" aria-live="polite"><div class="empty" id="empty">Send a message to start the demo.</div></section>
   <form class="composer" id="composer">
@@ -256,7 +256,7 @@ function html() {
   <div class="route">
     <div class="node user-node"><strong><span class="dot"></span>You</strong><span>Message enters the demo</span></div>
     <div class="path to-shared"><span>fast path</span></div>
-    <div class="node shared-node"><strong><span class="dot"></span>Shared infra</strong><span>Cheap shared chat + intent check</span></div>
+    <div class="node shared-node"><strong><span class="dot"></span>Shared infra</strong><span>Open bridge ack only</span></div>
     <div class="path to-private"><span>handoff</span></div>
     <div class="node private-node"><strong><span class="dot"></span>User machine</strong><span>Private Box with tools + billing</span></div>
   </div>
@@ -286,7 +286,7 @@ function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>
 const activeTurns=new Map();
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg){abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared chat thinking · private machine stopped');try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:'conv-1',message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
+async function runTurn(msg){abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private machine preparing');try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:'conv-1',message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 let lastSubmitAt=0;
 function submitComposer(){
@@ -308,10 +308,10 @@ msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.ke
 msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer();}});
 async function drain(res,localId){const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls;}
-function handle(ev,localId){const t=activeTurns.get(localId);if(t&&ev.type==='shared.larp'&&ev.toolIntent===false)t.interruptible=true;if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
+function handle(ev,localId){const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
   if(ev.type==='shared.delta'){addMsg('assistant','assistant · shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
-  else if(ev.type==='shared.larp'){setState(ev.toolIntent?'Private machine starting · preparing tools':'Shared chat replying · private machine stopped');}
-  else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared chat ready · private machine stopped');}
+  else if(ev.type==='shared.larp'){setState('Shared bridge active · private machine starting/resuming');}
+  else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private machine preparing');}
   else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}
@@ -319,7 +319,7 @@ function handle(ev,localId){const t=activeTurns.get(localId);if(t&&ev.type==='sh
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');const detail=ev.phase==='tool_use'?((ev.toolName||'tool')+(ev.command?': '+ev.command:'')):(ev.isError?'tool result error':'tool result')+(ev.stdout?': '+ev.stdout.trim():'');addMsg('trace','tool event · user machine',detail+'\\n',keyFor(ev,localId,'tool')+':'+ev.phase+':'+(ev.command||ev.stdout||Math.random()));}
   else if(ev.type==='user-box.delta'){addMsg('assistant','assistant · user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);}
-  else if(ev.type==='turn.done'){setState(ev.route==='shared-only'?'Shared chat ready · private machine stopped':'Turn complete · private machine may keep warm briefly');}
+  else if(ev.type==='turn.done'){setState('Turn complete · private machine may keep warm briefly');}
   else if(ev.type==='error'){addMsg('assistant','assistant','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 load();
 </script></body></html>`;

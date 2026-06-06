@@ -10,6 +10,7 @@ export interface BoxHttpClientOptions {
   apiKey: string;
   baseUrl?: string;
   fetchImpl?: typeof fetch;
+  requestTimeoutMs?: number;
 }
 
 /** Shell-quote a value for safe inline `KEY='value'` env prefixes. */
@@ -27,19 +28,39 @@ export class BoxHttpClient implements BoxClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly apiKey: string;
+  private readonly requestTimeoutMs: number;
 
   constructor(options: BoxHttpClientOptions) {
     if (!options.apiKey) throw new Error("BoxHttpClient requires a Box API key");
     this.baseUrl = (options.baseUrl ?? "https://ascii.dev/api/box/v1").replace(/\/$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.apiKey = options.apiKey;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${this.apiKey}`);
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-    const response = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers });
+    const controller = new AbortController();
+    const upstreamSignal = init.signal;
+    const abortFromUpstream = () => controller.abort(upstreamSignal?.reason);
+    if (upstreamSignal?.aborted) abortFromUpstream();
+    else upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+    const timer = setTimeout(() => controller.abort(new Error(`Box API request timed out after ${this.requestTimeoutMs}ms: ${path}`)), this.requestTimeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        const reason = controller.signal.reason;
+        throw reason instanceof Error ? reason : new Error(`Box API request aborted: ${path}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+    }
     const text = await response.text();
     const json = text ? JSON.parse(text) : {};
     if (!response.ok || json?.ok === false) {

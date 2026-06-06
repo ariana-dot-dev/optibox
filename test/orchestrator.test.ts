@@ -42,6 +42,29 @@ class FakeBoxClient implements BoxClient {
   async writeFile(_boxId: string, path: string, content: string): Promise<void> { this.writes.push(`${path}:${content}`); }
 }
 
+
+
+class FirstCreateStuckBoxClient extends FakeBoxClient {
+  firstCreate = true;
+  override async create(input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
+    const box = await super.create(input);
+    if (this.firstCreate && input.name?.startsWith("consumer-agent-user-")) {
+      this.firstCreate = false;
+      box.state = "provisioning";
+      this.boxes.set(box.id, box);
+    }
+    return box;
+  }
+}
+
+class SlowStatusBoxClient extends FakeBoxClient {
+  slowGets = false;
+  override async get(boxId: string): Promise<BoxInfo> {
+    if (this.slowGets) await new Promise((r) => setTimeout(r, 80));
+    return super.get(boxId);
+  }
+}
+
 class StreamingLogBoxClient extends FakeBoxClient {
   catReads = 0;
   constructor(private snapshots: string[]) { super(); }
@@ -73,7 +96,11 @@ function probeHarness(name: string): HarnessAdapter {
     models: [{ provider: "anthropic", model: "m-1" }, { provider: "openai", model: "m-2" }],
     async *shared({ capabilities, message }) {
       await assert.rejects(capabilities.bash("whoami"));
-      yield `shared:${name}:${message}`;
+      if (/^(hello|hi)\b|capab|surprise/i.test(message)) {
+        yield `shared:${name}:I can answer simple chat here and use the private runtime for tool work.\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+      } else {
+        yield `shared:${name}:I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+      }
     },
     async *userBox({ capabilities, recap, hiddenContext, machine, partialShared }) {
       const r = await capabilities.command(`echo ${name}`);
@@ -110,8 +137,8 @@ test("live harness switching keeps same Box + preserves context", async () => {
   assert.ok(boxId);
   assert.ok(first.some((e) => e.type === "user-box.delta" && e.harness === "alpha"));
 
-  // switch harness AND model mid-conversation. The box is now warm, so this
-  // turn routes DIRECTLY to the user box (no shared agent, no bridge).
+  // switch harness AND model mid-conversation. The box is now warm, so the
+  // turn still emits a shared bridge first, then hot-swaps to the same Box.
   const second: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection: { harness: "beta", provider: "openai", model: "m-2" } })) second.push(e);
   const secondBoxId = second.find((e) => e.type === "turn.done")?.boxId;
@@ -130,7 +157,7 @@ test("tool turns resume the Box and auto-stop after answering", async () => {
   assert.ok(boxId);
   assert.ok(first.some((e) => e.type === "handoff.started"), "first tool turn bridges into the Box");
   assert.ok(first.some((e) => e.type === "user-box.delta"), "first tool turn is answered by the Box");
-  assert.ok(!first.some((e) => e.type === "shared.delta"), "tool turn has no shared-model answer");
+  assert.ok(first.some((e) => e.type === "shared.delta"), "every turn gets a shared bridge acknowledgement");
   assert.ok(first.some((e) => e.type === "billing.stop"), "first turn auto-stops billing");
   assert.equal((await box.get(boxId)).state, "archived", "Box is archived after the turn finishes");
 
@@ -259,17 +286,10 @@ test("hidden context envelope carries transcript + machine state, strips cleanly
   assert.equal(stripHiddenContext(`before ${hidden} after`), "before  after".trim());
 });
 
-test("detectToolIntent flags tool work but not pure chit-chat", () => {
+test("legacy detectToolIntent is only a cheap UI hint", () => {
   assert.equal(detectToolIntent("create a file foo.txt"), true);
-  assert.equal(detectToolIntent("run the build and fix the test"), true);
-  assert.equal(detectToolIntent("what's ur ip"), true);
-  assert.equal(detectToolIntent("hey what's ur cpu count"), true);
-  assert.equal(detectToolIntent("how many cores do you have?"), true);
-  assert.equal(detectToolIntent("what operating system is this?"), true);
-  assert.equal(detectToolIntent("what's your RAM?"), true);
-  assert.equal(detectToolIntent("nice and ipv4"), true);
-  assert.equal(detectToolIntent("and v4?"), true);
   assert.equal(detectToolIntent("hello, how are you today?"), false);
+  assert.equal(detectToolIntent("surprise me with a color"), false);
 });
 
 test("runHarness extracts real Claude stream-json text deltas without duplicating final result", async () => {
@@ -330,20 +350,20 @@ class SlowUserBoxClient extends FakeBoxClient {
 }
 
 
-test("first chatty turn replies from shared immediately while one Box prewarms", async () => {
+test("social chat is answered by shared assistant without private duplicate", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 60;
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 1 });
 
   const first: any[] = [];
-  const started = Date.now();
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hello", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
-  assert.equal(first.find((e) => e.type === "turn.done")?.route, "shared-only");
-  assert.ok(Date.now() - started < box.delayMs, "chatty answer does not wait for private Box readiness");
-  assert.ok(first.some((e) => e.type === "shared.delta"), "chatty first turn is answered by shared");
-  assert.ok(!first.some((e) => e.type === "handoff.started"), "chatty first turn does not bridge stale hello into Box");
-  assert.ok(!first.some((e) => e.type === "user-box.delta"), "chatty first turn has no duplicate Box answer");
-  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "exactly one user Box is prewarming");
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "surprise me with a color", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  assert.equal(first.find((e) => e.type === "turn.done")?.route, "shared");
+  const sharedIdx = first.findIndex((e) => e.type === "shared.delta");
+  const boxIdx = first.findIndex((e) => e.type === "user-box.delta");
+  assert.ok(sharedIdx >= 0, "shared answer is emitted");
+  assert.equal(boxIdx, -1, "private Box does not duplicate the shared answer");
+  assert.ok(!first.some((e) => e.type === "handoff.started"), "no handoff for social chat");
+  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 0, "no user Box is created");
 });
 
 test("stopUserBox streams stopping -> archiving -> archived and pauses billing", async () => {
@@ -416,12 +436,114 @@ test("stuck resume times out, recovers, and queued follow-up also runs in a Box"
 });
 
 
+
+
+test("stuck first Box create does not poison second message session", async () => {
+  const box = new FirstCreateStuckBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, handoffTimeoutMs: 8, autoStopIdleMs: 1 });
+  const first: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create first proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  assert.ok(first.some((e) => e.type === "turn.blocked"), "first turn reports an explicit retryable blocker instead of a network error");
+
+  const second: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create second proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  assert.ok(second.some((e) => e.type === "runtime.proof"), "second turn reaches authoritative runtime after stale create is cleared");
+  assert.ok(second.some((e) => e.type === "user-box.delta"), "second turn streams private runtime chunks");
+  assert.equal(second.filter((e) => e.type === "turn.done").length, 1, "second turn completes once");
+});
+
+test("two successful messages reuse one Box conversation without duplicate answers", async () => {
+  const box = new FakeBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const first: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create first proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  const firstBoxId = first.find((e) => e.type === "turn.done")?.boxId;
+  assert.ok(firstBoxId);
+
+  const second: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create second proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  assert.equal(second.find((e) => e.type === "turn.done")?.boxId, firstBoxId, "same ready Box/session is reused");
+  assert.equal(second.filter((e) => e.type === "shared.delta").length, 1, "one shared bridge ack during resume");
+  assert.equal(second.filter((e) => e.type === "user-box.delta").length, 1, "one private runtime answer");
+  assert.equal(second.filter((e) => e.type === "runtime.proof").length, 1, "one authoritative runtime owner");
+});
+
+test("send emits immediate trace and bridge before slow Box status resolves", async () => {
+  const box = new SlowStatusBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  for await (const _ of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create first proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) void _;
+
+  box.slowGets = true;
+  const iterator = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create second proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })[Symbol.asyncIterator]();
+  const first = await Promise.race([
+    iterator.next(),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no immediate first event")), 25)),
+  ]);
+  assert.equal(first.value.type, "trace");
+  assert.equal(first.value.stage, "turn.submit.accepted");
+  const second = await Promise.race([
+    iterator.next(),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no immediate bridge event")), 25)),
+  ]);
+  assert.equal(second.value.type, "trace");
+  assert.equal(second.value.stage, "shared.reasoning.start");
+  for await (const _ of { [Symbol.asyncIterator]: () => iterator } as AsyncIterable<any>) void _;
+});
+
 test("interactive proof UI has no global message queue and can abort stale shared streams", async () => {
   const html = await import("node:fs/promises").then((fs) => fs.readFile("scripts/interactive-proof-server.ts", "utf8"));
   assert.match(html, /activeTurns=new Map/);
   assert.match(html, /abortInterruptibleSharedTurns/);
+  assert.match(html, /submit event fired/);
+  assert.match(html, /backend.request.received/);
+  assert.match(html, /shared.delta/);
+  assert.match(html, /turn.blocked/);
+  assert.match(html, /Private runtime is not ready yet/);
   assert.doesNotMatch(html, new RegExp("Hot " + "swap:"));
   assert.doesNotMatch(html, /handoff\.swap/);
   assert.doesNotMatch(html, /queued #/);
+  const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+  assert.ok(script, "interactive proof page contains inline script");
+  assert.doesNotThrow(() => new Function(script));
   assert.doesNotMatch(html, /const queue=\[\]/);
+});
+
+test("runtime proof event states continuation is in-box harness, not Box prompt/API or host agent", async () => {
+  const box = new FakeBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("opencode")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run pwd", selection: { harness: "opencode", provider: "anthropic", model: "m-1" } })) events.push(e);
+  const proof = events.find((e) => e.type === "runtime.proof");
+  assert.ok(proof, "runtime proof is emitted before in-Box deltas");
+  assert.equal(proof.boxPromptApiUsed, false);
+  assert.equal(proof.boxBuiltInAgentUsed, false);
+  assert.equal(proof.hostAsciiAgentUsed, false);
+  assert.equal(proof.continuation, "in-box-runtime-harness");
+  assert.equal(proof.streaming, "native-json-events");
+  assert.ok(events.some((e) => e.type === "exec" && e.kind === "command"), "continuation uses Box command substrate");
+  assert.ok(!box.commands.some((cmd) => /\/prompt\b|ascii agent|ascii task|claude-code.*host/i.test(cmd)), "no Box prompt endpoint or host agent command is used");
+});
+
+test("runtime feasibility matrix covers required harnesses", async () => {
+  const { RUNTIME_FEASIBILITY } = await import("../src/runtimeMatrix.js");
+  for (const harness of ["claude-agent-sdk", "codebase-daemon", "pi", "hermes", "opencode"]) {
+    const row = RUNTIME_FEASIBILITY.find((r) => r.harnessName === harness);
+    assert.ok(row, `${harness} is in the feasibility matrix`);
+    assert.equal(row.supported, true);
+    assert.ok(row.proofPath);
+  }
+});
+
+test("OpenCode JSON parser streams documented text events and tool events", async () => {
+  const snapshots = [
+    `${JSON.stringify({ type: "text", text: "Hel" })}\n`,
+    `${JSON.stringify({ type: "text", text: "Hel" })}\n${JSON.stringify({ type: "tool_use", part: { tool: "bash", state: { title: "Run nproc", input: { command: "nproc" }, output: "4" } } })}\n${JSON.stringify({ type: "text", text: "lo" })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const toolEvents: any[] = [];
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (event) => toolEvents.push(event) });
+  const chunks: string[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["opencode", "run", "--format", "json", "hi"], outputMode: "opencode-json", pollMs: 1 })) chunks.push(chunk);
+  assert.deepEqual(chunks, ["Hel", "lo"]);
+  assert.ok(toolEvents.some((e) => e.toolName === "bash" && e.command === "nproc"));
 });

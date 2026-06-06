@@ -7,10 +7,10 @@ import {
   BOX_PRICE_USD_PER_SECOND,
   BOX_PRICING,
   buildHiddenContext,
-  detectToolIntent,
   type MachineState,
 } from "./context.js";
 import { ExtractiveRecapper } from "./recap.js";
+import { RUNTIME_FEASIBILITY } from "./runtimeMatrix.js";
 import { InMemorySessionStore } from "./store.js";
 import type {
   BoxInfo,
@@ -28,7 +28,9 @@ export interface ConsumerTurnInput {
 }
 
 export type ConsumerTurnEventBody =
-  | { type: "shared.delta"; text: string; harness: string }
+  | { type: "trace"; stage: string; message: string; harness?: string; model?: string; boxId?: string }
+  | { type: "turn.blocked"; stage: string; message: string; retryable: boolean; harness?: string; model?: string; boxId?: string }
+  | { type: "shared.delta"; text: string; harness: string; final?: boolean }
   | { type: "shared.larp"; harness: string; toolIntent: boolean; note: string }
   | {
       type: "context.injected";
@@ -59,6 +61,19 @@ export type ConsumerTurnEventBody =
       model: string;
     }
   | {
+      type: "runtime.proof";
+      boxId: string;
+      harness: string;
+      model: string;
+      boxPromptApiUsed: false;
+      boxBuiltInAgentUsed: false;
+      hostAsciiAgentUsed: false;
+      continuation: "in-box-runtime-harness";
+      proofPath?: string;
+      streaming?: string;
+      blocker?: string | null;
+    }
+  | {
       type: "exec";
       kind: "command" | "harness";
       argv?: string[];
@@ -85,10 +100,10 @@ export type ConsumerTurnEventBody =
     }
   | {
       type: "turn.done";
-      boxId: string;
+      boxId?: string;
       harness: string;
       model: string;
-      route?: "shared-only" | "direct" | "bridge";
+      route?: "shared" | "direct" | "bridge";
     };
 
 /**
@@ -119,11 +134,7 @@ export class ConsumerBoxAgentOrchestrator {
   private sharedBoxPromise?: Promise<BoxInfo>;
   /** Per-conversation in-flight private-box startup/resume, used to dedupe foreground handoffs. */
   private readonly userBoxStarts = new Map<string, Promise<BoxInfo>>();
-  /**
-   * Per-conversation FIFO mutex for private Box work. Every user turn goes
-   * through this lock and into the Box; there is deliberately no message
-   * content heuristic that can keep a turn on the shared machine.
-   */
+  /** Per-conversation FIFO mutex for private Box work. */
   private readonly boxLocks = new Map<string, Promise<void>>();
   /** Monotonic per-conversation counter. Delayed auto-stop only fires if no newer user turn bumped this value. */
   private readonly turnSequences = new Map<string, number>();
@@ -225,7 +236,11 @@ export class ConsumerBoxAgentOrchestrator {
     const started = this.ensureUserBoxUncached(userId, conversationId);
     this.userBoxStarts.set(key, started);
     try {
-      return await started;
+      return await this.withTimeout(
+        started,
+        this.options.handoffTimeoutMs ?? 120_000,
+        `Timed out waiting for private Box boot/handoff for ${key}`,
+      );
     } finally {
       if (this.userBoxStarts.get(key) === started)
         this.userBoxStarts.delete(key);
@@ -266,8 +281,15 @@ export class ConsumerBoxAgentOrchestrator {
           }
         }
         if (isReady(box.state)) return box;
-        if (box.state !== "error")
-          return this.waitUntilReady(existing.boxId, "existing");
+        if (box.state !== "error") {
+          try {
+            return await this.waitUntilReady(existing.boxId, "existing");
+          } catch {
+            await this.clearSession(userId, conversationId);
+            return this.createFreshUserBox(userId, conversationId);
+          }
+        }
+        await this.clearSession(userId, conversationId);
         // error state -> fall through and provision a fresh box
       }
     }
@@ -285,8 +307,17 @@ export class ConsumerBoxAgentOrchestrator {
       this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`;
     const boxes = await this.options.box.list().catch(() => []);
     const reusable = boxes
-      .filter((box) => box.name === expectedName && isReady(box.state))
+      .filter((box) => box.name === expectedName && (isReady(box.state) || box.state === "archived"))
       .sort((a, b) => {
+        // Prefer a warm ready Box. Otherwise prefer the newest archived snapshot
+        // over creating a fresh Box; this preserves the same user conversation
+        // and avoids poisoning second turns with long-lived provisioning rows.
+        const ar = isReady(a.state) ? 1 : 0;
+        const br = isReady(b.state) ? 1 : 0;
+        if (ar !== br) return br - ar;
+        const as = (a as any).snapshotAvailable ? 1 : 0;
+        const bs = (b as any).snapshotAvailable ? 1 : 0;
+        if (as !== bs) return bs - as;
         const au = Date.parse(String((a as any).updatedAt ?? ""));
         const bu = Date.parse(String((b as any).updatedAt ?? ""));
         return (Number.isFinite(bu) ? bu : 0) - (Number.isFinite(au) ? au : 0);
@@ -298,7 +329,18 @@ export class ConsumerBoxAgentOrchestrator {
       boxId: reusable.id,
       lastSeenAt: Date.now(),
     });
-    const box = await this.waitUntilReady(reusable.id, "adopt-existing");
+    let box = reusable;
+    if (box.state === "archived") {
+      try {
+        await this.options.box.resume(box.id);
+        box = await this.waitUntilReady(box.id, "adopt-archived", this.options.resumeTimeoutMs);
+      } catch {
+        await this.clearSession(userId, conversationId);
+        return undefined;
+      }
+    } else {
+      box = await this.waitUntilReady(reusable.id, "adopt-existing");
+    }
     return this.options.userBoxTtlSeconds === null
       ? box
       : this.options.box.update(box.id, {
@@ -315,13 +357,18 @@ export class ConsumerBoxAgentOrchestrator {
         this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`,
       ttlSeconds: this.options.userBoxTtlSeconds ?? 3600,
     });
+    const ready = await this.waitUntilReady(created.id, "create");
     await this.sessions.put({
       userId,
       conversationId,
-      boxId: created.id,
+      boxId: ready.id,
       lastSeenAt: Date.now(),
     });
-    return this.waitUntilReady(created.id, "create");
+    return ready;
+  }
+
+  private async clearSession(userId: string, conversationId: string): Promise<void> {
+    if (this.sessions.delete) await this.sessions.delete(userId, conversationId);
   }
 
   private async ensureUserBoxWithRecovery(
@@ -375,41 +422,47 @@ export class ConsumerBoxAgentOrchestrator {
     const key = `${input.userId}:${input.conversationId}`;
     const turnId = randomUUID();
     const turnSequence = this.bumpTurnSequence(key);
-    const toolIntent = detectToolIntent(input.message);
-    const status = await this.userBoxStatus(input.userId, input.conversationId);
+    // Do not await the remote Box status before emitting. A slow Box API check
+    // made the preview look like Send did nothing because no SSE bytes were
+    // flushed until userBoxStatus resolved. Status still runs, but the bridge
+    // and trace events start immediately.
+    const statusPromise = this.userBoxStatus(input.userId, input.conversationId);
 
-    // Pure chat while no private Box is ready is answered immediately by the
-    // shared front desk, while a single private Box boots in the background.
-    // The shared message is final for that chatty turn, so there is no stale
-    // "hey" handoff and no duplicate user-box answer later.
-    if (!toolIntent && status.kind !== "ready") {
-      for await (const ev of this.runSharedOnlyTurn(input, key, status))
-        yield { ...ev, turnId };
-      return;
-    }
+    yield {
+      type: "trace",
+      stage: "turn.submit.accepted",
+      message: "submit event reached backend turn loop; starting shared bridge before Box status check finishes",
+      harness: input.selection.harness,
+      model: input.selection.model,
+      turnId,
+    };
 
-    // Tool work, or any message once the Box is warm, is serialized into the
-    // private Box. While the Box provisions/resumes the shared machine can emit
-    // a short holding reply, then exactly one handoff continues the latest turn.
     const release = await this.acquireLock(this.boxLocks, key);
+    let usedPrivateBox = false;
     try {
-      for await (const ev of this.runBoxTurn(input, key, status, toolIntent))
+      for await (const ev of this.runAdaptiveTurn(input, key, statusPromise)) {
+        if (ev.type === "handoff.started" || ev.type === "user-box.delta")
+          usedPrivateBox = true;
         yield { ...ev, turnId };
+      }
     } finally {
       release();
     }
 
     // Keep the Box warm briefly after the answer. If another user turn arrives
     // during this window, it bumps turnSequences[key], this stop is skipped,
-    // and the next turn can reuse the warm Box immediately.
-    for await (const ev of this.stopAfterIdle(input, key, turnSequence))
-      yield { ...ev, turnId };
+    // and the next turn can reuse the warm Box immediately while still emitting
+    // a shared bridge acknowledgement first.
+    if (usedPrivateBox) {
+      for await (const ev of this.stopAfterIdle(input, key, turnSequence))
+        yield { ...ev, turnId };
+    }
   }
 
-  private async *runSharedOnlyTurn(
+  private async *runAdaptiveTurn(
     input: ConsumerTurnInput,
     key: string,
-    status: UserBoxStatus,
+    statusPromise: Promise<UserBoxStatus>,
   ): AsyncIterable<ConsumerTurnEvent> {
     const transcript = this.transcripts.get(key) ?? [];
     transcript.push({
@@ -423,27 +476,22 @@ export class ConsumerBoxAgentOrchestrator {
     const harness = this.harness(input.selection.harness);
     void this.ensureSharedBox().catch(() => undefined);
 
-    // Fire-and-forget one private Box startup/resume. ensureUserBox internally
-    // dedupes by conversation, so the next tool turn will await this same boot
-    // instead of launching a second Box or producing a second handoff.
-    void this.ensureUserBoxWithRecovery(
-      input.userId,
-      input.conversationId,
-      status,
-      () => {
-        /* background prewarm: lifecycle becomes visible when a tool turn awaits it */
-      },
-    ).catch(() => undefined);
-
     const sharedMachine: MachineState = {
       location: "shared-box",
       tools: false,
-      status: "prewarming",
+      status: "provisioning",
     };
     const sharedHidden = buildHiddenContext({
       transcript,
       machine: sharedMachine,
     });
+    yield {
+      type: "trace",
+      stage: "shared.reasoning.start",
+      message: "shared assistant is deciding whether it can answer or should hand off to the private runtime",
+      harness: harness.name,
+      model: input.selection.model,
+    };
     yield {
       type: "context.injected",
       scope: "shared",
@@ -451,7 +499,10 @@ export class ConsumerBoxAgentOrchestrator {
       hidden: sharedHidden,
     };
 
-    let sharedText = "";
+    const recoveryEvents: ConsumerTurnEventBody[] = [];
+    let resolvedStatus: UserBoxStatus | undefined;
+
+    let rawSharedText = "";
     for await (const text of harness.shared({
       userId: input.userId,
       conversationId: input.conversationId,
@@ -463,147 +514,55 @@ export class ConsumerBoxAgentOrchestrator {
       machine: sharedMachine,
       toolIntent: false,
     })) {
-      const chunk = String(text ?? "");
-      sharedText += chunk;
-      yield { type: "shared.delta", text: chunk, harness: harness.name };
+      rawSharedText += String(text ?? "");
     }
-    if (sharedText)
-      transcript.push({
-        role: "assistant",
-        content: sharedText,
-        mode: "shared",
-        harness: harness.name,
-        at: new Date().toISOString(),
-      });
+    const sharedDecision = parseSharedDecision(rawSharedText, input.message);
+    let sharedText = sharedDecision.text;
+
+    resolvedStatus = await statusPromise;
     yield {
-      type: "turn.done",
-      boxId: status.kind === "none" ? "" : status.boxId,
+      type: "trace",
+      stage: "box.status.resolved",
+      message: `private Box status resolved as ${resolvedStatus.kind}`,
       harness: harness.name,
       model: input.selection.model,
-      route: "shared-only",
+      ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
     };
-  }
 
-  private async *runBoxTurn(
-    input: ConsumerTurnInput,
-    key: string,
-    status: UserBoxStatus,
-    toolIntent: boolean,
-  ): AsyncIterable<ConsumerTurnEvent> {
-    const transcript = this.transcripts.get(key) ?? [];
-    transcript.push({
-      role: "user",
-      content: input.message,
-      mode: "shared",
-      at: new Date().toISOString(),
-    });
-    this.transcripts.set(key, transcript);
-
-    const harness = this.harness(input.selection.harness);
-    // STATE-AWARE ROUTING. Decide the path from the box's PRECISE current state,
-    // never a blanket shared-first fallback.
-    //   ready                -> DIRECT to the private box (no shared, no swap)
-    //   none/archived/        \
-    //   archiving/provisioning -> shared BRIDGE while we provision/resume, then handoff
-    //   error                -> shared bridge while we provision a fresh box
-    if (status.kind === "ready") {
-      // FAST PATH: the private box already exists and is warm. Route the message
-      // straight to the user-box agent. No shared agent runs, so there is NO
-      // misleading "I can't access…" reply and NO bounce back to shared.
-      const box = status.box;
-      const { since } = this.startBilling(box.id);
+    if (!sharedDecision.needsPrivate) {
+      if (sharedText) {
+        yield { type: "shared.delta", text: sharedText, harness: harness.name, final: true };
+        transcript.push({
+          role: "assistant",
+          content: sharedText,
+          mode: "shared",
+          harness: harness.name,
+          model: input.selection.model,
+          at: new Date().toISOString(),
+        });
+      }
       yield {
-        type: "billing.start",
-        boxId: box.id,
-        ratePerSecond: BOX_PRICE_USD_PER_SECOND,
-        sinceEpochMs: since,
-        pricing: BOX_PRICING,
+        type: "turn.done",
+        harness: harness.name,
+        model: input.selection.model,
+        route: "shared",
       };
-      yield {
-        type: "lifecycle",
-        boxId: box.id,
-        state: box.state,
-        note: "private box already warm — routing your message straight to it (no shared agent)",
-      };
-      yield* this.continueInUserBox(
-        input,
-        harness,
-        box,
-        transcript,
-        "",
-        "direct",
-      );
       return;
     }
 
-    // BRIDGE PATH: the private box is not ready yet. Start the real restricted
-    // shared LLM immediately with hidden/system guidance, then wait for the
-    // private environment and continue the latest request there. No scripted
-    // response or user-visible lifecycle event is emitted.
-    const resuming = status.kind === "archived" || status.kind === "archiving";
-    const bridgeStatus: NonNullable<MachineState["status"]> = resuming
-      ? "resuming"
-      : "provisioning";
-    void this.ensureSharedBox().catch(() => undefined);
-
-    const sharedMachine: MachineState = {
-      location: "shared-box",
-      tools: false,
-      status: bridgeStatus,
-    };
-    const sharedHidden = buildHiddenContext({
-      transcript,
-      machine: sharedMachine,
-    });
-    yield {
-      type: "context.injected",
-      scope: "shared",
-      machine: sharedMachine,
-      hidden: sharedHidden,
-    };
-    yield {
-      type: "shared.larp",
-      harness: harness.name,
-      toolIntent,
-      note: resuming
-        ? "private environment is resuming; restricted shared model is guided by hidden instructions"
-        : "private environment is starting; restricted shared model is guided by hidden instructions",
-    };
-
-    const recoveryEvents: ConsumerTurnEventBody[] = [];
-    const userBoxPromise = this.ensureUserBoxWithRecovery(
-      input.userId,
-      input.conversationId,
-      status,
-      (event) => recoveryEvents.push(event),
-    ).then(
-      (box) => ({ box, error: undefined as unknown }),
-      (error) => ({ box: undefined as unknown as BoxInfo, error }),
-    );
-
-    let sharedText = "";
-    // Tool turns must not be answered by the restricted shared model. It has no
-    // machine access and even a well-prompted "holding" LLM can drift into
-    // answering from transcript/context. For tool work, emit only lifecycle
-    // state and wait for the real user-box harness.
-    if (!toolIntent) {
-      for await (const text of harness.shared({
-        userId: input.userId,
-        conversationId: input.conversationId,
-        message: input.message,
-        transcript,
-        selection: input.selection,
-        capabilities: createRestrictedSharedCapabilities(),
-        hiddenContext: sharedHidden,
-        machine: sharedMachine,
-        toolIntent,
-      })) {
-        const chunk = String(text ?? "");
-        sharedText += chunk;
-        yield { type: "shared.delta", text: chunk, harness: harness.name };
-      }
-    }
-    if (sharedText)
+    const bridgeNeeded = resolvedStatus.kind !== "ready";
+    if (bridgeNeeded) {
+      sharedText = sanitizeSharedBridgeText(sharedText);
+      yield {
+        type: "shared.larp",
+        harness: harness.name,
+        toolIntent: true,
+        note:
+          resolvedStatus.kind === "archived" || resolvedStatus.kind === "archiving"
+            ? "private environment is resuming; shared assistant is covering latency"
+            : "private environment is starting; shared assistant is covering latency",
+      };
+      if (sharedText) yield { type: "shared.delta", text: sharedText, harness: harness.name, final: false };
       transcript.push({
         role: "assistant",
         content: sharedText,
@@ -611,11 +570,61 @@ export class ConsumerBoxAgentOrchestrator {
         harness: harness.name,
         at: new Date().toISOString(),
       });
+    } else {
+      // Warm private runtime: do not emit a latency bridge just because the
+      // shared model produced one. This prevents the "shared says something,
+      // Box repeats it" double-answer when handoff is immediate.
+      sharedText = "";
+      yield {
+        type: "shared.larp",
+        harness: harness.name,
+        toolIntent: true,
+        note: "private environment already warm; skipping shared bridge and continuing directly",
+      };
+    }
 
-    const boxResult = await userBoxPromise;
-    if (boxResult.error) throw boxResult.error;
-    const box = boxResult.box;
-    while (recoveryEvents.length) yield recoveryEvents.shift()!;
+    let box: BoxInfo;
+    if (resolvedStatus.kind === "ready") {
+      box = resolvedStatus.box;
+    } else {
+      yield {
+        type: "trace",
+        stage: "box.boot.start",
+        message: "private Box boot/resume/recovery started",
+        harness: harness.name,
+        model: input.selection.model,
+        ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+      };
+      try {
+        box = await this.ensureUserBoxWithRecovery(
+          input.userId,
+          input.conversationId,
+          resolvedStatus,
+          (event) => recoveryEvents.push(event),
+        );
+      } catch (error) {
+        while (recoveryEvents.length) yield recoveryEvents.shift()!;
+        yield {
+          type: "turn.blocked",
+          stage: "box.runtime.unavailable",
+          message: error instanceof Error ? (error.stack ?? error.message) : String(error),
+          retryable: true,
+          harness: harness.name,
+          model: input.selection.model,
+          ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+        };
+        return;
+      }
+      while (recoveryEvents.length) yield recoveryEvents.shift()!;
+    }
+    yield {
+      type: "trace",
+      stage: "runtime.owner.selected",
+      message: `selected runtime ${harness.name} owns this turn; no Box prompt/API or host agent responder`,
+      harness: harness.name,
+      model: input.selection.model,
+      boxId: box.id,
+    };
     const { since } = this.startBilling(box.id);
     yield {
       type: "billing.start",
@@ -628,9 +637,12 @@ export class ConsumerBoxAgentOrchestrator {
       type: "lifecycle",
       boxId: box.id,
       state: box.state,
-      note: resuming
-        ? "private box resumed from snapshot — no cold start"
-        : "private box provisioned and ready",
+      note:
+        resolvedStatus?.kind === "ready"
+          ? "private box already warm — hot-swap continuing there after shared bridge"
+          : resolvedStatus?.kind === "archived" || resolvedStatus?.kind === "archiving"
+            ? "private box resumed from snapshot — no cold start"
+            : "private box provisioned and ready",
     };
     const recap = await this.recapper.recap(transcript);
     yield {
@@ -639,6 +651,20 @@ export class ConsumerBoxAgentOrchestrator {
       recap,
       harness: harness.name,
       model: input.selection.model,
+    };
+    const runtimeProof = RUNTIME_FEASIBILITY.find((r) => r.harnessName === harness.name);
+    yield {
+      type: "runtime.proof",
+      boxId: box.id,
+      harness: harness.name,
+      model: input.selection.model,
+      boxPromptApiUsed: false,
+      boxBuiltInAgentUsed: false,
+      hostAsciiAgentUsed: false,
+      continuation: "in-box-runtime-harness",
+      ...(runtimeProof?.proofPath ? { proofPath: runtimeProof.proofPath } : {}),
+      ...(runtimeProof?.streaming ? { streaming: runtimeProof.streaming } : {}),
+      ...(runtimeProof ? { blocker: runtimeProof.blocker } : {}),
     };
     transcript.push({
       role: "system",
@@ -653,10 +679,9 @@ export class ConsumerBoxAgentOrchestrator {
       box,
       transcript,
       sharedText,
-      "bridge",
+      resolvedStatus?.kind === "ready" ? "direct" : "bridge",
     );
   }
-
 
   private bumpTurnSequence(key: string): number {
     const next = (this.turnSequences.get(key) ?? 0) + 1;
@@ -739,10 +764,23 @@ export class ConsumerBoxAgentOrchestrator {
       partialShared,
     });
     let userText = "";
+    let lastToolStdout = "";
+    let sawToolUse = false;
     const itc = continued[Symbol.asyncIterator]();
+    const flushExecEvents = function* (): Iterable<ConsumerTurnEvent> {
+      while (execEvents.length) {
+        const ev = execEvents.shift()!;
+        if (ev.type === "harness.tool") {
+          if (ev.phase === "tool_use") sawToolUse = true;
+          if (ev.phase === "tool_result" && typeof ev.stdout === "string" && ev.stdout.trim())
+            lastToolStdout = ev.stdout.trim();
+        }
+        yield ev;
+      }
+    };
     while (true) {
       const n = await itc.next();
-      while (execEvents.length) yield execEvents.shift()!;
+      yield* flushExecEvents();
       if (n.done) break;
       const text = String(n.value ?? "");
       userText += text;
@@ -754,7 +792,18 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
       };
     }
-    while (execEvents.length) yield execEvents.shift()!;
+    yield* flushExecEvents();
+    if (!userText.trim() && sawToolUse && lastToolStdout) {
+      const fallback = buildToolResultFallback(input.message, lastToolStdout);
+      userText += fallback;
+      yield {
+        type: "user-box.delta",
+        text: fallback,
+        boxId: box.id,
+        harness: harness.name,
+        model: input.selection.model,
+      };
+    }
     if (userText)
       transcript.push({
         role: "assistant",
@@ -883,6 +932,20 @@ export class ConsumerBoxAgentOrchestrator {
     }
   }
 
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private async waitUntilArchived(
     boxId: string,
     label: string,
@@ -928,6 +991,75 @@ export class ConsumerBoxAgentOrchestrator {
       `Timed out waiting for Box ${boxId} to become ready for ${label}`,
     );
   }
+}
+
+
+interface ParsedSharedDecision {
+  needsPrivate: boolean;
+  text: string;
+}
+
+const SHARED_ROUTING_RE = /<shared-routing>\s*({[\s\S]*?})\s*<\/shared-routing>/i;
+
+function parseSharedDecision(text: string, message: string): ParsedSharedDecision {
+  const raw = String(text ?? "");
+  const match = raw.match(SHARED_ROUTING_RE);
+  const visible = stripSharedControl(raw);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[1]!);
+      return {
+        needsPrivate: Boolean(parsed.needsPrivate),
+        text: visible,
+      };
+    } catch {
+      // Fall through to conservative fallback below.
+    }
+  }
+  return {
+    needsPrivate: fallbackNeedsPrivate(message),
+    text: visible,
+  };
+}
+
+function stripSharedControl(text: string): string {
+  return String(text ?? "")
+    .replace(SHARED_ROUTING_RE, "")
+    .replace(/\s+\n/g, "\n")
+    .trim();
+}
+
+function fallbackNeedsPrivate(message: string): boolean {
+  // Safety fallback for malformed/missing model routing metadata. The primary
+  // route is LLM-selected via <shared-routing>; this only prevents obviously
+  // tool-dependent requests from being stranded on the shared no-tools side.
+  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
+}
+
+function sanitizeSharedBridgeText(text: string): string {
+  const trimmed = String(text ?? "").replace(/\s+/g, " ").trim();
+  const fallback = nextBridgeText();
+  if (!trimmed) return fallback;
+  if (/\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect)\b/i.test(trimmed)) {
+    return fallback;
+  }
+  return trimmed;
+}
+
+function nextBridgeText(): string {
+  const options = [
+    "I’m checking that now.",
+    "I’m looking into it.",
+    "On it — I’ll take a look.",
+    "Got it, I’m checking.",
+  ];
+  return options[Math.floor(Math.random() * options.length)]!;
+}
+
+function buildToolResultFallback(message: string, stdout: string): string {
+  const marker = /\breply\s+(?:exactly\s+)?(?:with\s+)?([A-Z][A-Z0-9_]{2,})\b/.exec(message)?.[1];
+  const value = stdout.trim();
+  return marker ? `${marker} ${value}` : `Done — observed: ${value}`;
 }
 
 function isReady(state: string): boolean {

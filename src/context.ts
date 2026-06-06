@@ -85,10 +85,10 @@ function escapeXml(s: string): string {
   return s.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c] as string));
 }
 
-/** Heuristic: does this user message ask for real tool work (files/commands)? */
+/**
+ * Legacy helper for callers that still need a cheap UI hint. The orchestrator's
+ * primary routing is shared-model selected, not this regexp.
+ */
 export function detectToolIntent(message: string): boolean {
-  const text = message.toLowerCase();
-  return /\b(create|make|write|edit|append|modify|update|delete|remove|run|execute|install|build|compile|test|fix|refactor|file|folder|directory|script|command|cat|ls|grep|npm|git|code|implement|add|ip|ipv4|ipv6|v4|v6|ifconfig|ipconfig|hostname|whoami|pwd|curl|wget|nproc|lscpu|uname|uptime|df|free|top|ps|env|printenv|public\s+address|external\s+address|network\s+address)\b/i.test(text)
-    || /\b(cpu|cpus|core|cores|processor|processors|hardware|ram|memory|disk|storage|kernel|os|operating\s+system|load\s+average|machine\s+specs?|system\s+info|system\s+hardware)\b/i.test(text)
-    || /\b(how many|count|number of)\b.*\b(cores?|cpus?|processors?)\b/i.test(text);
+  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
 }

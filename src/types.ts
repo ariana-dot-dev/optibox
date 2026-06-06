@@ -172,6 +172,7 @@ export interface HarnessAdapter {
 export interface SessionStore {
   get(userId: string, conversationId: string): Promise<UserSession | undefined>;
   put(session: UserSession): Promise<void>;
+  delete?(userId: string, conversationId: string): Promise<void>;
 }
 
 export interface Recapper {

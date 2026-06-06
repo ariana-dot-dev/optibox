@@ -952,14 +952,12 @@ export class ConsumerBoxAgentOrchestrator {
 }
 
 
-function sanitizeSharedBridgeText(text: string): string {
-  const trimmed = String(text ?? "").replace(/\s+/g, " ").trim();
-  const fallback = "Yep — I’m looking into it.";
-  if (!trimmed) return fallback;
-  if (/\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect)\b/i.test(trimmed)) {
-    return fallback;
-  }
-  return trimmed;
+function sanitizeSharedBridgeText(_text: string): string {
+  // The shared model is a bridge only. Never let it answer the user's request,
+  // even if the restricted shared harness returns an answer-looking sentence.
+  // A deterministic ack keeps the UI responsive without creating a duplicate
+  // authoritative responder or starving the private runtime of its own chunks.
+  return "Yep — I’m looking into it.";
 }
 
 function isReady(state: string): boolean {

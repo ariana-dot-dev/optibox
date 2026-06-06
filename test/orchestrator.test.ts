@@ -349,21 +349,79 @@ class SlowUserBoxClient extends FakeBoxClient {
   }
 }
 
+class SlowArchivingBoxClient extends FakeBoxClient {
+  archiveReadyAt = new Map<string, number>();
+  archiveDelayMs = 80;
+  override async stop(boxId: string): Promise<BoxInfo> {
+    const box = { ...(await this.get(boxId)), state: "archiving" };
+    this.boxes.set(boxId, box);
+    this.archiveReadyAt.set(boxId, Date.now() + this.archiveDelayMs);
+    return box;
+  }
+  override async get(boxId: string): Promise<BoxInfo> {
+    const box = await super.get(boxId);
+    const at = this.archiveReadyAt.get(boxId);
+    if (at !== undefined && box.state === "archiving" && Date.now() >= at) {
+      const archived: BoxInfo = { ...box, state: "archived" };
+      this.boxes.set(boxId, archived);
+      return archived;
+    }
+    return box;
+  }
+}
 
-test("social chat is answered by shared assistant without private duplicate", async () => {
+
+test("CPU request during archiving gets shared response before private resume", async () => {
+  const box = new SlowArchivingBoxClient();
+  box.archiveDelayMs = 90;
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, resumeTimeoutMs: 200, autoStopIdleMs: 100_000 });
+
+  const first: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
+    first.push(e);
+    if (e.type === "turn.done") break;
+  }
+  const boxId = first.find((e) => e.type === "turn.done")?.boxId;
+  assert.ok(boxId);
+
+  const stop: any[] = [];
+  const ds = (async () => { for await (const e of orchestrator.stopUserBox("u", "c")) stop.push(e); })();
+  await waitFor(() => stop.some((e) => e.type === "lifecycle" && e.state === "archiving"));
+
+  const cpu: any[] = [];
+  const started = Date.now();
+  const dc = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's your CPU count", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
+      cpu.push(e);
+      if (e.type === "turn.done") break;
+    }
+  })();
+  await waitFor(() => cpu.some((e) => e.type === "shared.delta"), 50);
+  assert.ok(Date.now() - started < box.archiveDelayMs, "shared response appears before archive completes");
+  assert.ok(!cpu.some((e) => e.type === "handoff.started"), "private runtime has not resumed before shared response");
+
+  await Promise.all([ds, dc]);
+  assert.ok(cpu.some((e) => e.type === "lifecycle" && /resumed|provisioned|warm/.test(e.note || "")), "private runtime resumes after the shared response");
+  assert.ok(cpu.some((e) => e.type === "user-box.delta"), "private runtime can answer or add after reading shared history");
+});
+
+
+test("not-ready turns answer from shared first while private runtime starts in parallel", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 60;
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 1 });
 
   const first: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "surprise me with a color", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
-  assert.equal(first.find((e) => e.type === "turn.done")?.route, "shared");
+  assert.equal(first.find((e) => e.type === "turn.done")?.route, "bridge");
   const sharedIdx = first.findIndex((e) => e.type === "shared.delta");
+  const bootIdx = first.findIndex((e) => e.type === "trace" && e.stage === "box.boot.start");
   const boxIdx = first.findIndex((e) => e.type === "user-box.delta");
-  assert.ok(sharedIdx >= 0, "shared answer is emitted");
-  assert.equal(boxIdx, -1, "private Box does not duplicate the shared answer");
-  assert.ok(!first.some((e) => e.type === "handoff.started"), "no handoff for social chat");
-  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 0, "no user Box is created");
+  assert.ok(sharedIdx >= 0, "shared response is emitted");
+  assert.ok(bootIdx >= 0 && bootIdx < sharedIdx, "private startup is kicked off before/during the shared response");
+  assert.ok(boxIdx > sharedIdx, "private runtime reads the shared response later and may add/suppress");
+  assert.ok(first.some((e) => e.type === "handoff.started"), "private runtime is started even for a not-ready shared-first turn");
+  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "one user Box is created in parallel");
 });
 
 test("stopUserBox streams stopping -> archiving -> archived and pauses billing", async () => {

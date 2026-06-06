@@ -424,35 +424,36 @@ export class ConsumerBoxAgentOrchestrator {
     const turnSequence = this.bumpTurnSequence(key);
     // Do not await the remote Box status before emitting. A slow Box API check
     // made the preview look like Send did nothing because no SSE bytes were
-    // flushed until userBoxStatus resolved. Status still runs, but the bridge
-    // and trace events start immediately.
+    // flushed until userBoxStatus resolved. Status still runs immediately.
     const statusPromise = this.userBoxStatus(input.userId, input.conversationId);
+    const lockBusyAtSubmit = this.boxLocks.has(key);
 
     yield {
       type: "trace",
       stage: "turn.submit.accepted",
-      message: "submit event reached backend turn loop; starting shared bridge before Box status check finishes",
+      message: lockBusyAtSubmit
+        ? "submit reached backend while private runtime is busy/stopping; shared assistant will answer first"
+        : "submit reached backend; checking private runtime state",
       harness: input.selection.harness,
       model: input.selection.model,
       turnId,
     };
 
-    const release = await this.acquireLock(this.boxLocks, key);
     let usedPrivateBox = false;
-    try {
-      for await (const ev of this.runAdaptiveTurn(input, key, statusPromise)) {
-        if (ev.type === "handoff.started" || ev.type === "user-box.delta")
-          usedPrivateBox = true;
-        yield { ...ev, turnId };
-      }
-    } finally {
-      release();
+    for await (const ev of this.runAdaptiveTurn(
+      input,
+      key,
+      statusPromise,
+      lockBusyAtSubmit,
+    )) {
+      if (ev.type === "handoff.started" || ev.type === "user-box.delta")
+        usedPrivateBox = true;
+      yield { ...ev, turnId };
     }
 
     // Keep the Box warm briefly after the answer. If another user turn arrives
     // during this window, it bumps turnSequences[key], this stop is skipped,
-    // and the next turn can reuse the warm Box immediately while still emitting
-    // a shared bridge acknowledgement first.
+    // and the next turn can reuse the warm Box immediately.
     if (usedPrivateBox) {
       for await (const ev of this.stopAfterIdle(input, key, turnSequence))
         yield { ...ev, turnId };
@@ -463,6 +464,7 @@ export class ConsumerBoxAgentOrchestrator {
     input: ConsumerTurnInput,
     key: string,
     statusPromise: Promise<UserBoxStatus>,
+    lockBusyAtSubmit: boolean,
   ): AsyncIterable<ConsumerTurnEvent> {
     const transcript = this.transcripts.get(key) ?? [];
     transcript.push({
@@ -488,7 +490,7 @@ export class ConsumerBoxAgentOrchestrator {
     yield {
       type: "trace",
       stage: "shared.reasoning.start",
-      message: "shared assistant is deciding whether it can answer or should hand off to the private runtime",
+      message: "shared assistant is ready to respond if the private runtime is not immediately available",
       harness: harness.name,
       model: input.selection.model,
     };
@@ -499,10 +501,95 @@ export class ConsumerBoxAgentOrchestrator {
       hidden: sharedHidden,
     };
 
+    let resolvedStatus = await statusPromise;
+    yield {
+      type: "trace",
+      stage: "box.status.resolved",
+      message: `private Box status resolved as ${resolvedStatus.kind}`,
+      harness: harness.name,
+      model: input.selection.model,
+      ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+    };
+
+    // True fast path: if the private runtime is known warm and no stop/turn has
+    // the private lock, route directly. This preserves the adaptive behavior
+    // that avoids unnecessary shared bridge text for a ready Box.
+    if (resolvedStatus.kind === "ready" && !lockBusyAtSubmit) {
+      const release = await this.acquireLock(this.boxLocks, key);
+      try {
+        const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
+        if (latestStatus.kind === "ready") {
+          yield {
+            type: "shared.larp",
+            harness: harness.name,
+            toolIntent: true,
+            note: "private environment already warm; skipping shared bridge and continuing directly",
+          };
+          yield* this.runPrivateRuntime(
+            input,
+            harness,
+            latestStatus.box,
+            transcript,
+            "",
+            latestStatus,
+          );
+          return;
+        }
+        resolvedStatus = latestStatus;
+      } finally {
+        release();
+      }
+    }
+
+    // Not immediately ready (including lock held by stop/archive): run the
+    // shared assistant visibly first while the private runtime is resumed or
+    // started in parallel behind the private lock. This prevents the UI from
+    // waiting silently during archiving/resume/cold-start windows.
+    const bridgeStatus: NonNullable<MachineState["status"]> =
+      resolvedStatus.kind === "archived" || resolvedStatus.kind === "archiving"
+        ? "resuming"
+        : "provisioning";
+    yield {
+      type: "shared.larp",
+      harness: harness.name,
+      toolIntent: true,
+      note:
+        bridgeStatus === "resuming"
+          ? "private environment is resuming; shared assistant is covering latency"
+          : "private environment is starting; shared assistant is covering latency",
+    };
+
     const recoveryEvents: ConsumerTurnEventBody[] = [];
-    let resolvedStatus: UserBoxStatus | undefined;
+    const privateReady = (async () => {
+      const release = await this.acquireLock(this.boxLocks, key);
+      try {
+        const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
+        const box = latestStatus.kind === "ready"
+          ? latestStatus.box
+          : await this.ensureUserBoxWithRecovery(
+              input.userId,
+              input.conversationId,
+              latestStatus,
+              (event) => recoveryEvents.push(event),
+            );
+        return { box, status: latestStatus, release };
+      } catch (error) {
+        release();
+        throw error;
+      }
+    })();
+
+    yield {
+      type: "trace",
+      stage: "box.boot.start",
+      message: "private Box boot/resume/recovery started in parallel with shared response",
+      harness: harness.name,
+      model: input.selection.model,
+      ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+    };
 
     let rawSharedText = "";
+    let emittedSharedText = "";
     for await (const text of harness.shared({
       userId: input.userId,
       conversationId: input.conversationId,
@@ -515,108 +602,71 @@ export class ConsumerBoxAgentOrchestrator {
       toolIntent: false,
     })) {
       rawSharedText += String(text ?? "");
-    }
-    const sharedDecision = parseSharedDecision(rawSharedText, input.message);
-    let sharedText = sharedDecision.text;
-
-    resolvedStatus = await statusPromise;
-    yield {
-      type: "trace",
-      stage: "box.status.resolved",
-      message: `private Box status resolved as ${resolvedStatus.kind}`,
-      harness: harness.name,
-      model: input.selection.model,
-      ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
-    };
-
-    if (!sharedDecision.needsPrivate) {
-      if (sharedText) {
-        yield { type: "shared.delta", text: sharedText, harness: harness.name, final: true };
-        transcript.push({
-          role: "assistant",
-          content: sharedText,
-          mode: "shared",
-          harness: harness.name,
-          model: input.selection.model,
-          at: new Date().toISOString(),
-        });
+      const visible = visibleSharedText(rawSharedText);
+      if (visible.length > emittedSharedText.length) {
+        const delta = visible.slice(emittedSharedText.length);
+        emittedSharedText = visible;
+        if (delta) yield { type: "shared.delta", text: delta, harness: harness.name, final: false };
       }
-      yield {
-        type: "turn.done",
-        harness: harness.name,
-        model: input.selection.model,
-        route: "shared",
-      };
-      return;
     }
 
-    const bridgeNeeded = resolvedStatus.kind !== "ready";
-    if (bridgeNeeded) {
-      sharedText = sanitizeSharedBridgeText(sharedText);
-      yield {
-        type: "shared.larp",
-        harness: harness.name,
-        toolIntent: true,
-        note:
-          resolvedStatus.kind === "archived" || resolvedStatus.kind === "archiving"
-            ? "private environment is resuming; shared assistant is covering latency"
-            : "private environment is starting; shared assistant is covering latency",
-      };
-      if (sharedText) yield { type: "shared.delta", text: sharedText, harness: harness.name, final: false };
+    const sharedDecision = parseSharedDecision(rawSharedText, input.message);
+    let sharedText = sanitizeSharedBridgeText(sharedDecision.text || emittedSharedText);
+    if (!emittedSharedText && sharedText) {
+      emittedSharedText = sharedText;
+      yield { type: "shared.delta", text: sharedText, harness: harness.name, final: false };
+    }
+    if (sharedText) {
       transcript.push({
         role: "assistant",
         content: sharedText,
         mode: "shared",
         harness: harness.name,
+        model: input.selection.model,
         at: new Date().toISOString(),
       });
-    } else {
-      // Warm private runtime: do not emit a latency bridge just because the
-      // shared model produced one. This prevents the "shared says something,
-      // Box repeats it" double-answer when handoff is immediate.
-      sharedText = "";
-      yield {
-        type: "shared.larp",
-        harness: harness.name,
-        toolIntent: true,
-        note: "private environment already warm; skipping shared bridge and continuing directly",
-      };
     }
 
-    let box: BoxInfo;
-    if (resolvedStatus.kind === "ready") {
-      box = resolvedStatus.box;
-    } else {
+    let privateResult: { box: BoxInfo; status: UserBoxStatus; release: () => void };
+    try {
+      privateResult = await privateReady;
+    } catch (error) {
+      while (recoveryEvents.length) yield recoveryEvents.shift()!;
       yield {
-        type: "trace",
-        stage: "box.boot.start",
-        message: "private Box boot/resume/recovery started",
+        type: "turn.blocked",
+        stage: "box.runtime.unavailable",
+        message: error instanceof Error ? (error.stack ?? error.message) : String(error),
+        retryable: true,
         harness: harness.name,
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
-      try {
-        box = await this.ensureUserBoxWithRecovery(
-          input.userId,
-          input.conversationId,
-          resolvedStatus,
-          (event) => recoveryEvents.push(event),
-        );
-      } catch (error) {
-        while (recoveryEvents.length) yield recoveryEvents.shift()!;
-        yield {
-          type: "turn.blocked",
-          stage: "box.runtime.unavailable",
-          message: error instanceof Error ? (error.stack ?? error.message) : String(error),
-          retryable: true,
-          harness: harness.name,
-          model: input.selection.model,
-          ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
-        };
-        return;
-      }
-      while (recoveryEvents.length) yield recoveryEvents.shift()!;
+      return;
     }
+
+    try {
+      while (recoveryEvents.length) yield recoveryEvents.shift()!;
+      yield* this.runPrivateRuntime(
+        input,
+        harness,
+        privateResult.box,
+        transcript,
+        sharedText,
+        privateResult.status,
+      );
+    } finally {
+      privateResult.release();
+    }
+  }
+
+  private async *runPrivateRuntime(
+    input: ConsumerTurnInput,
+    harness: HarnessAdapter,
+    box: BoxInfo,
+    transcript: TranscriptMessage[],
+    sharedText: string,
+    resolvedStatus: UserBoxStatus,
+  ): AsyncIterable<ConsumerTurnEvent> {
     yield {
       type: "trace",
       stage: "runtime.owner.selected",
@@ -638,9 +688,9 @@ export class ConsumerBoxAgentOrchestrator {
       boxId: box.id,
       state: box.state,
       note:
-        resolvedStatus?.kind === "ready"
-          ? "private box already warm — hot-swap continuing there after shared bridge"
-          : resolvedStatus?.kind === "archived" || resolvedStatus?.kind === "archiving"
+        resolvedStatus.kind === "ready"
+          ? "private box already warm — routing your message straight to it"
+          : resolvedStatus.kind === "archived" || resolvedStatus.kind === "archiving"
             ? "private box resumed from snapshot — no cold start"
             : "private box provisioned and ready",
     };
@@ -679,7 +729,7 @@ export class ConsumerBoxAgentOrchestrator {
       box,
       transcript,
       sharedText,
-      resolvedStatus?.kind === "ready" ? "direct" : "bridge",
+      resolvedStatus.kind === "ready" ? "direct" : "bridge",
     );
   }
 
@@ -1020,6 +1070,13 @@ function parseSharedDecision(text: string, message: string): ParsedSharedDecisio
     needsPrivate: fallbackNeedsPrivate(message),
     text: visible,
   };
+}
+
+function visibleSharedText(text: string): string {
+  const raw = String(text ?? "");
+  const controlStart = raw.search(/<shared-routing>/i);
+  const withoutPartial = controlStart >= 0 ? raw.slice(0, controlStart) : raw;
+  return stripSharedControl(withoutPartial);
 }
 
 function stripSharedControl(text: string): string {

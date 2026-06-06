@@ -42,6 +42,15 @@ class FakeBoxClient implements BoxClient {
   async writeFile(_boxId: string, path: string, content: string): Promise<void> { this.writes.push(`${path}:${content}`); }
 }
 
+
+class SlowStatusBoxClient extends FakeBoxClient {
+  slowGets = false;
+  override async get(boxId: string): Promise<BoxInfo> {
+    if (this.slowGets) await new Promise((r) => setTimeout(r, 80));
+    return super.get(boxId);
+  }
+}
+
 class StreamingLogBoxClient extends FakeBoxClient {
   catReads = 0;
   constructor(private snapshots: string[]) { super(); }
@@ -409,13 +418,42 @@ test("stuck resume times out, recovers, and queued follow-up also runs in a Box"
 });
 
 
+
+test("send emits immediate trace and bridge before slow Box status resolves", async () => {
+  const box = new SlowStatusBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  for await (const _ of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "first", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) void _;
+
+  box.slowGets = true;
+  const iterator = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "second", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })[Symbol.asyncIterator]();
+  const first = await Promise.race([
+    iterator.next(),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no immediate first event")), 25)),
+  ]);
+  assert.equal(first.value.type, "trace");
+  assert.equal(first.value.stage, "turn.submit.accepted");
+  const second = await Promise.race([
+    iterator.next(),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no immediate bridge event")), 25)),
+  ]);
+  assert.equal(second.value.type, "trace");
+  assert.equal(second.value.stage, "bridge.start");
+  for await (const _ of { [Symbol.asyncIterator]: () => iterator } as AsyncIterable<any>) void _;
+});
+
 test("interactive proof UI has no global message queue and can abort stale shared streams", async () => {
   const html = await import("node:fs/promises").then((fs) => fs.readFile("scripts/interactive-proof-server.ts", "utf8"));
   assert.match(html, /activeTurns=new Map/);
   assert.match(html, /abortInterruptibleSharedTurns/);
+  assert.match(html, /submit event fired/);
+  assert.match(html, /backend.request.received/);
+  assert.match(html, /bridge.start/);
   assert.doesNotMatch(html, new RegExp("Hot " + "swap:"));
   assert.doesNotMatch(html, /handoff\.swap/);
   assert.doesNotMatch(html, /queued #/);
+  const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+  assert.ok(script, "interactive proof page contains inline script");
+  assert.doesNotThrow(() => new Function(script));
   assert.doesNotMatch(html, /const queue=\[\]/);
 });
 

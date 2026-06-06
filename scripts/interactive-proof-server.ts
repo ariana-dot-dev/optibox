@@ -180,6 +180,13 @@ const server = http.createServer(async (req, res) => {
           message: String(body.message ?? ""),
           selection,
         };
+        send({
+          type: "trace",
+          stage: "backend.request.received",
+          message: "POST /api/send reached backend; SSE stream opened",
+          harness: selection.harness,
+          model: selection.model,
+        });
         for await (const event of orchestrator.runTurn(turnInput)) {
           auditEvent(event as ConsumerTurnEvent, turnInput);
           send(event as ConsumerTurnEvent);
@@ -284,7 +291,7 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>
 const hiddenContextPattern=new RegExp('<consumer-context>[\\s\\S]*?</consumer-context>','g');
 function stripHidden(s){return String(s).replace(hiddenContextPattern,'').trim();}
 function fmtUsd(n){return '$'+n.toFixed(6);}
-function routeForState(text){if(/Error/i.test(text))return 'error';if(/Private machine (running|starting|stopping|archiving)|tools active|assistant has tools|preparing tools|Resume timed out/i.test(text))return 'private';if(/Shared chat (thinking|replying|ready)/i.test(text))return 'shared';return 'idle';}
+function routeForState(text){if(/Error/i.test(text))return 'error';if(/Private machine (running|starting|stopping|archiving)|tools active|assistant has tools|preparing tools|Resume timed out/i.test(text))return 'private';if(/Shared (chat|bridge)|backend|submit event/i.test(text))return 'shared';return 'idle';}
 function setRoute(route,text){const s=$('schematic');const r=$('routeStatus');if(!s||!r)return;s.dataset.route=route;r.textContent=route==='private'?'Route: handed off to the user machine.':route==='shared'?'Route: handled by shared infra.':route==='error'?'Route error: check machine state.':'Ready: shared infra is listening.';}
 function setState(text){$('machineState').textContent=text;setRoute(routeForState(text),text);}
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}
@@ -302,33 +309,34 @@ function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID
 async function runTurn(msg){abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private machine preparing');try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:'conv-1',message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 let lastSubmitAt=0;
-function submitComposer(){
+function submitComposer(source){
   const text=msgEl.value.trim();
-  if(!text)return false;
+  console.debug('[trace] submit event fired', {source, hasText:Boolean(text), harness:selectedHarness, model:selectedModel});
+  if(!text){console.debug('[trace] empty submit ignored', {source});return false;}
   const now=Date.now();
-  if(now-lastSubmitAt<150)return false;
+  if(now-lastSubmitAt<150){console.debug('[trace] duplicate submit suppressed', {source});return false;}
   lastSubmitAt=now;
+  addMsg('trace','submit trace','submit event fired from '+source+' · request starting\\n');
   msgEl.value='';
   msgEl.focus();
   runTurn(text);
   return true;
 }
-composer.addEventListener('submit',e=>{e.preventDefault();submitComposer();});
-sendBtn.addEventListener('click',e=>{e.preventDefault();submitComposer();});
-sendBtn.addEventListener('pointerup',e=>{e.preventDefault();submitComposer();});
-sendBtn.addEventListener('touchend',e=>{e.preventDefault();submitComposer();},{passive:false});
-msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer();}});
-msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer();}});
-async function drain(res,localId){const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
+composer.addEventListener('submit',e=>{e.preventDefault();submitComposer('form.submit');});
+sendBtn.addEventListener('click',e=>{e.preventDefault();submitComposer('button.click');});
+msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer('textarea.enter');}});
+msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer('textarea.beforeinput');}});
+async function drain(res,localId){if(!res){throw new Error('No response object from /api/send');}if(!res.ok){const body=await res.text().catch(()=>'');throw new Error('/api/send failed with HTTP '+res.status+' '+body);}if(!res.body){throw new Error('/api/send did not return a readable SSE body');}const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls;}
-function handle(ev,localId){const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
-  if(ev.type==='shared.delta'){addMsg('assistant','assistant · shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
+function handle(ev,localId){console.debug('[trace] stream event', ev);const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
+  if(ev.type==='trace'){addMsg('trace','trace · '+(ev.stage||'event'),(ev.message||JSON.stringify(ev))+'\\n',keyFor(ev,localId,'trace')+':'+(ev.stage||Math.random()));if(/bridge/.test(ev.stage||''))setState('Shared bridge active · private machine preparing');else if(/backend|submit/.test(ev.stage||''))setState('Request received · shared bridge starting');}
+  else if(ev.type==='shared.delta'){addMsg('assistant','assistant · shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
   else if(ev.type==='shared.larp'){setState('Shared bridge active · private machine starting/resuming');}
   else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private machine preparing');}
   else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}
-  else if(ev.type==='runtime.proof'){addMsg('trace','proof · no Box prompt/API','boxPromptApiUsed='+ev.boxPromptApiUsed+' · boxBuiltInAgentUsed='+ev.boxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\n',keyFor(ev,localId,'proof'));}
+  else if(ev.type==='runtime.proof'){addMsg('trace','proof · no Box prompt/API','boxPromptApiUsed='+ev.boxPromptApiUsed+' · boxBuiltInAgentUsed='+ev.boxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\\n',keyFor(ev,localId,'proof'));}
   else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine; stdout/SSE relays native chunks as emitted.',keyFor(ev,localId,'exec'));}
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');const detail=ev.phase==='tool_use'?((ev.toolName||'tool')+(ev.command?': '+ev.command:'')):(ev.isError?'tool result error':'tool result')+(ev.stdout?': '+ev.stdout.trim():'');addMsg('trace','tool event · user machine',detail+'\\n',keyFor(ev,localId,'tool')+':'+ev.phase+':'+(ev.command||ev.stdout||Math.random()));}
   else if(ev.type==='user-box.delta'){addMsg('assistant','assistant · user machine · tools active',ev.text,keyFor(ev,localId,'box'));}

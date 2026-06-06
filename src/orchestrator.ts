@@ -478,27 +478,12 @@ export class ConsumerBoxAgentOrchestrator {
     const harness = this.harness(input.selection.harness);
     void this.ensureSharedBox().catch(() => undefined);
 
-    const sharedMachine: MachineState = {
-      location: "shared-box",
-      tools: false,
-      status: "provisioning",
-    };
-    const sharedHidden = buildHiddenContext({
-      transcript,
-      machine: sharedMachine,
-    });
     yield {
       type: "trace",
       stage: "shared.reasoning.start",
-      message: "shared assistant is ready to respond if the private runtime is not immediately available",
+      message: "shared assistant is ready to respond if the private runtime is not immediately available; waiting for precise status before injecting hidden machine state",
       harness: harness.name,
       model: input.selection.model,
-    };
-    yield {
-      type: "context.injected",
-      scope: "shared",
-      machine: sharedMachine,
-      hidden: sharedHidden,
     };
 
     let resolvedStatus = await statusPromise;
@@ -549,6 +534,21 @@ export class ConsumerBoxAgentOrchestrator {
       resolvedStatus.kind === "archived" || resolvedStatus.kind === "archiving"
         ? "resuming"
         : "provisioning";
+    const sharedMachine: MachineState = {
+      location: "shared-box",
+      tools: false,
+      status: bridgeStatus,
+    };
+    const sharedHidden = buildHiddenContext({
+      transcript,
+      machine: sharedMachine,
+    });
+    yield {
+      type: "context.injected",
+      scope: "shared",
+      machine: sharedMachine,
+      hidden: sharedHidden,
+    };
     yield {
       type: "shared.larp",
       harness: harness.name,

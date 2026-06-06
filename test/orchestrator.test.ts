@@ -399,6 +399,8 @@ test("CPU request during archiving gets shared response before private resume", 
   await waitFor(() => cpu.some((e) => e.type === "shared.delta"), 50);
   assert.ok(Date.now() - started < box.archiveDelayMs, "shared response appears before archive completes");
   assert.ok(!cpu.some((e) => e.type === "handoff.started"), "private runtime has not resumed before shared response");
+  const sharedContext = cpu.find((e) => e.type === "context.injected" && e.scope === "shared");
+  assert.equal(sharedContext?.machine.status, "resuming", "shared hidden context reflects archiving/resume rather than generic provisioning");
 
   await Promise.all([ds, dc]);
   assert.ok(cpu.some((e) => e.type === "lifecycle" && /resumed|provisioned|warm/.test(e.note || "")), "private runtime resumes after the shared response");

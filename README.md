@@ -1,31 +1,36 @@
 # Optibox
 
+Optibox is a small TypeScript orchestration layer for consumer agents on Box. It gives users an instant shared response while starting or resuming their private Box, then hands off tool work to your real harness running inside that Box.
+
+## Minimal wiring
+
+This is the smallest complete shape used by the demos: choose a harness, pass the Box client, inject the provider keys that the harness needs inside the Box, stream visible deltas, and stop the private Box when the conversation should pause billing.
+
 ```ts
 import {
   BoxHttpClient,
   ConsumerBoxAgentOrchestrator,
+  InMemorySessionStore,
 } from "@ascii-prototypes/consumer-box-agents";
-import { realCliHarness } from "./examples/shared.js";
-
-const harness = realCliHarness({
-  name: "my-agent",
-  bin: "my-agent",
-  models: [{ provider: "anthropic", model: "claude-sonnet-4-6" }],
-  buildArgv: ({ prompt, model }) => ["my-agent", "--model", model, prompt],
-});
+import { providerEnvForBox } from "./examples/shared.js";
+import { harness as claude } from "./examples/claude-sdk/adapter.js";
 
 const orchestrator = new ConsumerBoxAgentOrchestrator({
   box: new BoxHttpClient({ apiKey: process.env.BOX_API_KEY! }),
-  harnesses: [harness],
-  providerEnv: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
+  harnesses: [claude],
+  sessions: new InMemorySessionStore(),
+  providerEnv: providerEnvForBox(),
+  sharedBoxName: "my-app-shared-prewarm",
+  userBoxName: (userId) => `my-app-user-${userId}`,
+  autoStopIdleMs: 60_000,
 });
 
 for await (const event of orchestrator.runTurn({
   userId: "user-1",
   conversationId: "chat-1",
-  message: "What is my CPU count?",
+  message: "Check my CPU count.",
   selection: {
-    harness: "my-agent",
+    harness: "claude-agent-sdk",
     provider: "anthropic",
     model: "claude-sonnet-4-6",
   },
@@ -34,7 +39,14 @@ for await (const event of orchestrator.runTurn({
     process.stdout.write(event.text);
   }
 }
+
+// When the user closes the chat or asks to pause, archive the private Box.
+for await (const event of orchestrator.stopUserBox("user-1", "chat-1")) {
+  if (event.type === "billing.stop") console.log("billing paused");
+}
 ```
+
+A harness is the developer-owned agent loop. The included adapters in `examples/*/adapter.ts` all use the same contract: the shared phase performs a restricted text-only provider call, and the user-Box phase runs the real CLI inside the private Box with provider keys injected via `providerEnv`.
 
 ## Main use case
 
@@ -49,26 +61,30 @@ Your app provides:
 - a Box API key
 - one or more harness adapters
 - provider API keys for the models those harnesses use
+- session persistence so a user/conversation can resume the same Box
 
 Optibox provides:
 
 - per-user Box lifecycle management
 - shared-first routing when the private Box is not ready
+- direct-to-Box routing when the private Box is already warm
 - transcript and handoff context
-- streaming events for UI updates
+- provider environment injection for in-Box harness processes
+- streaming events for UI updates, tool telemetry, lifecycle, and billing
 - stop, archive, and resume handling
 
 The shared side is restricted and fast. The Box side has the user's private runtime and runs your harness through Box commands.
 
 ## Message flow
 
-1. The user sends a message.
-2. Optibox checks the user's Box state.
-3. If the Box is warm, the message can go directly to the Box harness.
-4. If the Box is not ready, the shared assistant responds first while Optibox starts or resumes the Box.
-5. When the Box is ready, the Box harness receives the conversation history plus any shared response.
-6. The Box harness answers, adds useful private information, or stays silent if the shared answer already handled the request.
-7. After the turn, the Box can stay warm briefly and then archive to stop billing.
+1. The user sends a message with a selected harness/provider/model.
+2. Optibox checks the user's Box state for that user/conversation.
+3. If the Box is warm, Optibox routes directly to the selected in-Box harness.
+4. If the Box is not ready, the shared assistant streams a restricted answer or bridge while Optibox starts or resumes the Box.
+5. The shared assistant emits a hidden routing decision: continue privately, or suppress handoff if the shared answer was enough.
+6. When private work is needed and the Box is ready, the harness receives the hidden conversation context, machine state, and any shared text already shown to the user.
+7. The harness runs inside the Box with provider keys and tools, streams `user-box.delta` output, and may emit tool telemetry.
+8. After the turn, Optibox can keep the Box briefly warm for follow-ups, then stop/archive it to pause billing.
 
 ## State machine
 
@@ -76,20 +92,20 @@ The shared side is restricted and fast. The Box side has the user's private runt
 stateDiagram-v2
   [*] --> SharedReady
   SharedReady --> CheckBox: user message
-  CheckBox --> DirectBox: Box ready
-  CheckBox --> SharedFirst: Box not ready
+  CheckBox --> DirectBox: Box ready + no private lock
+  CheckBox --> SharedFirst: Box missing/provisioning/archived/busy
+  SharedFirst --> SharedAnswer: restricted shared stream
   SharedFirst --> BoxStarting: start/resume in parallel
-  SharedFirst --> SharedAnswer: stream shared response
+  SharedAnswer --> Done: shared says no private work
+  SharedAnswer --> HandoffPending: shared says private work needed
   BoxStarting --> BoxReady
-  SharedAnswer --> Handoff
-  BoxReady --> Handoff
+  BoxReady --> HandoffPending
   DirectBox --> BoxAnswer
-  Handoff --> BoxAnswer: private work needed
-  Handoff --> Done: shared answer was enough
-  BoxAnswer --> Done
-  Done --> WarmIdle
-  WarmIdle --> Archived: idle timeout or stop
-  Archived --> SharedReady
+  HandoffPending --> BoxAnswer: run selected harness in Box
+  BoxAnswer --> WarmIdle
+  WarmIdle --> Archived: stop/idle timeout
+  Archived --> SharedReady: next message can resume
+  WarmIdle --> DirectBox: quick follow-up
 ```
 
 ## Running the repo

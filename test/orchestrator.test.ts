@@ -43,6 +43,20 @@ class FakeBoxClient implements BoxClient {
 }
 
 
+
+class FirstCreateStuckBoxClient extends FakeBoxClient {
+  firstCreate = true;
+  override async create(input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
+    const box = await super.create(input);
+    if (this.firstCreate && input.name?.startsWith("consumer-agent-user-")) {
+      this.firstCreate = false;
+      box.state = "provisioning";
+      this.boxes.set(box.id, box);
+    }
+    return box;
+  }
+}
+
 class SlowStatusBoxClient extends FakeBoxClient {
   slowGets = false;
   override async get(boxId: string): Promise<BoxInfo> {
@@ -419,6 +433,37 @@ test("stuck resume times out, recovers, and queued follow-up also runs in a Box"
 
 
 
+
+test("stuck first Box create does not poison second message session", async () => {
+  const box = new FirstCreateStuckBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, handoffTimeoutMs: 8, autoStopIdleMs: 1 });
+  const first: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "first", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  assert.ok(first.some((e) => e.type === "turn.blocked"), "first turn reports an explicit retryable blocker instead of a network error");
+
+  const second: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "second", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  assert.ok(second.some((e) => e.type === "runtime.proof"), "second turn reaches authoritative runtime after stale create is cleared");
+  assert.ok(second.some((e) => e.type === "user-box.delta"), "second turn streams private runtime chunks");
+  assert.equal(second.filter((e) => e.type === "turn.done").length, 1, "second turn completes once");
+});
+
+test("two successful messages reuse one Box conversation without duplicate answers", async () => {
+  const box = new FakeBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const first: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "first", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  const firstBoxId = first.find((e) => e.type === "turn.done")?.boxId;
+  assert.ok(firstBoxId);
+
+  const second: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "second", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  assert.equal(second.find((e) => e.type === "turn.done")?.boxId, firstBoxId, "same ready Box/session is reused");
+  assert.equal(second.filter((e) => e.type === "shared.delta").length, 1, "one shared bridge ack");
+  assert.equal(second.filter((e) => e.type === "user-box.delta").length, 1, "one private runtime answer");
+  assert.equal(second.filter((e) => e.type === "runtime.proof").length, 1, "one authoritative runtime owner");
+});
+
 test("send emits immediate trace and bridge before slow Box status resolves", async () => {
   const box = new SlowStatusBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
@@ -448,6 +493,8 @@ test("interactive proof UI has no global message queue and can abort stale share
   assert.match(html, /submit event fired/);
   assert.match(html, /backend.request.received/);
   assert.match(html, /bridge.start/);
+  assert.match(html, /turn.blocked/);
+  assert.match(html, /Private runtime is not ready yet/);
   assert.doesNotMatch(html, new RegExp("Hot " + "swap:"));
   assert.doesNotMatch(html, /handoff\.swap/);
   assert.doesNotMatch(html, /queued #/);

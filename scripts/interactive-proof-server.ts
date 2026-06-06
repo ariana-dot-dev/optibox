@@ -37,8 +37,9 @@ const orchestrator = new ConsumerBoxAgentOrchestrator({
   userBoxName: (userId) => `consumer-agent-user-${userId}`,
   userBoxTtlSeconds: 900,
   readinessPollMs: 2000,
-  handoffTimeoutMs: 180_000,
-  resumeTimeoutMs: 20_000,
+  handoffTimeoutMs: 120_000,
+  resumeTimeoutMs: 60_000,
+  autoStopIdleMs: 60_000,
 });
 
 function keyAvailable(provider: string): boolean {
@@ -330,6 +331,7 @@ async function drain(res,localId){if(!res){throw new Error('No response object f
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls;}
 function handle(ev,localId){console.debug('[trace] stream event', ev);const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
   if(ev.type==='trace'){addMsg('trace','trace · '+(ev.stage||'event'),(ev.message||JSON.stringify(ev))+'\\n',keyFor(ev,localId,'trace')+':'+(ev.stage||Math.random()));if(/bridge/.test(ev.stage||''))setState('Shared bridge active · private machine preparing');else if(/backend|submit/.test(ev.stage||''))setState('Request received · shared bridge starting');}
+  else if(ev.type==='turn.blocked'){addMsg('trace','blocker · '+(ev.stage||'runtime'),(ev.message||'Private runtime unavailable')+'\\n',keyFor(ev,localId,'blocked')+':'+(ev.stage||Math.random()));addMsg('assistant','assistant','Private runtime is not ready yet. This turn stayed on the shared bridge; retry when Box status is ready.');setState('Private runtime unavailable · retry after Box is ready');}
   else if(ev.type==='shared.delta'){addMsg('assistant','assistant · shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
   else if(ev.type==='shared.larp'){setState('Shared bridge active · private machine starting/resuming');}
   else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private machine preparing');}

@@ -29,6 +29,7 @@ export interface ConsumerTurnInput {
 
 export type ConsumerTurnEventBody =
   | { type: "trace"; stage: string; message: string; harness?: string; model?: string; boxId?: string }
+  | { type: "turn.blocked"; stage: string; message: string; retryable: boolean; harness?: string; model?: string; boxId?: string }
   | { type: "shared.delta"; text: string; harness: string }
   | { type: "shared.larp"; harness: string; toolIntent: boolean; note: string }
   | {
@@ -239,7 +240,11 @@ export class ConsumerBoxAgentOrchestrator {
     const started = this.ensureUserBoxUncached(userId, conversationId);
     this.userBoxStarts.set(key, started);
     try {
-      return await started;
+      return await this.withTimeout(
+        started,
+        this.options.handoffTimeoutMs ?? 120_000,
+        `Timed out waiting for private Box boot/handoff for ${key}`,
+      );
     } finally {
       if (this.userBoxStarts.get(key) === started)
         this.userBoxStarts.delete(key);
@@ -280,8 +285,15 @@ export class ConsumerBoxAgentOrchestrator {
           }
         }
         if (isReady(box.state)) return box;
-        if (box.state !== "error")
-          return this.waitUntilReady(existing.boxId, "existing");
+        if (box.state !== "error") {
+          try {
+            return await this.waitUntilReady(existing.boxId, "existing");
+          } catch {
+            await this.clearSession(userId, conversationId);
+            return this.createFreshUserBox(userId, conversationId);
+          }
+        }
+        await this.clearSession(userId, conversationId);
         // error state -> fall through and provision a fresh box
       }
     }
@@ -299,8 +311,17 @@ export class ConsumerBoxAgentOrchestrator {
       this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`;
     const boxes = await this.options.box.list().catch(() => []);
     const reusable = boxes
-      .filter((box) => box.name === expectedName && isReady(box.state))
+      .filter((box) => box.name === expectedName && (isReady(box.state) || box.state === "archived"))
       .sort((a, b) => {
+        // Prefer a warm ready Box. Otherwise prefer the newest archived snapshot
+        // over creating a fresh Box; this preserves the same user conversation
+        // and avoids poisoning second turns with long-lived provisioning rows.
+        const ar = isReady(a.state) ? 1 : 0;
+        const br = isReady(b.state) ? 1 : 0;
+        if (ar !== br) return br - ar;
+        const as = (a as any).snapshotAvailable ? 1 : 0;
+        const bs = (b as any).snapshotAvailable ? 1 : 0;
+        if (as !== bs) return bs - as;
         const au = Date.parse(String((a as any).updatedAt ?? ""));
         const bu = Date.parse(String((b as any).updatedAt ?? ""));
         return (Number.isFinite(bu) ? bu : 0) - (Number.isFinite(au) ? au : 0);
@@ -312,7 +333,18 @@ export class ConsumerBoxAgentOrchestrator {
       boxId: reusable.id,
       lastSeenAt: Date.now(),
     });
-    const box = await this.waitUntilReady(reusable.id, "adopt-existing");
+    let box = reusable;
+    if (box.state === "archived") {
+      try {
+        await this.options.box.resume(box.id);
+        box = await this.waitUntilReady(box.id, "adopt-archived", this.options.resumeTimeoutMs);
+      } catch {
+        await this.clearSession(userId, conversationId);
+        return undefined;
+      }
+    } else {
+      box = await this.waitUntilReady(reusable.id, "adopt-existing");
+    }
     return this.options.userBoxTtlSeconds === null
       ? box
       : this.options.box.update(box.id, {
@@ -329,13 +361,18 @@ export class ConsumerBoxAgentOrchestrator {
         this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`,
       ttlSeconds: this.options.userBoxTtlSeconds ?? 3600,
     });
+    const ready = await this.waitUntilReady(created.id, "create");
     await this.sessions.put({
       userId,
       conversationId,
-      boxId: created.id,
+      boxId: ready.id,
       lastSeenAt: Date.now(),
     });
-    return this.waitUntilReady(created.id, "create");
+    return ready;
+  }
+
+  private async clearSession(userId: string, conversationId: string): Promise<void> {
+    if (this.sessions.delete) await this.sessions.delete(userId, conversationId);
   }
 
   private async ensureUserBoxWithRecovery(
@@ -540,12 +577,26 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
-      box = await this.ensureUserBoxWithRecovery(
-        input.userId,
-        input.conversationId,
-        resolvedStatus,
-        (event) => recoveryEvents.push(event),
-      );
+      try {
+        box = await this.ensureUserBoxWithRecovery(
+          input.userId,
+          input.conversationId,
+          resolvedStatus,
+          (event) => recoveryEvents.push(event),
+        );
+      } catch (error) {
+        while (recoveryEvents.length) yield recoveryEvents.shift()!;
+        yield {
+          type: "turn.blocked",
+          stage: "box.runtime.unavailable",
+          message: error instanceof Error ? (error.stack ?? error.message) : String(error),
+          retryable: true,
+          harness: harness.name,
+          model: input.selection.model,
+          ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+        };
+        return;
+      }
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
     }
     yield {
@@ -836,6 +887,20 @@ export class ConsumerBoxAgentOrchestrator {
     if (session?.boxId) {
       await this.options.box.stop(session.boxId);
       this.billing.delete(session.boxId);
+    }
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

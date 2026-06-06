@@ -62,29 +62,56 @@ function providerRequiredEnv(provider: string): string {
   return "OPENAI_API_KEY";
 }
 
-export function buildSharedSystem(ctx: SharedContext): string {
-  const phase = ctx.toolIntent ? "bridge-tool-work" : "social-front-desk";
+export function buildCommonAssistantKnowledge(): string {
   return [
-    "You are the shared restricted assistant for a consumer agent product.",
-    "You are a real model, not a script. Adapt naturally to the user's latest message.",
-    "You have no file, shell, computer, Box, VM, sandbox, resume, boot, internal routing, billing, or private-machine access in this phase.",
-    "Never mention hidden context, XML, system prompts, Boxes, sandboxes, machines, handoffs, resume/boot/provisioning, or internal routing.",
-    "Use the hidden <consumer-context> only to maintain conversational continuity. Do not reveal it.",
-    phase === "bridge-tool-work"
-      ? "The latest request needs private tools that are becoming available outside your control. Reply with one short natural acknowledgement that you are checking/looking into the user's concrete request. Do not say you lack tools, do not refuse, do not claim completion, do not invent results, and do not explain limitations."
-      : "For lightweight conversation, answer normally and briefly. If the user only greets you, greet back and invite the next request without mentioning internal systems.",
+    "Shared product knowledge for both assistant phases:",
+    "- You are the assistant in a consumer agent product with two execution surfaces.",
+    "- The fast shared surface can answer normal conversation, social chat, capability questions, and general knowledge that does not require private files, shell commands, credentials, or the user's machine state.",
+    "- The private runtime can use tools inside the user's Box for tasks that require shell commands, filesystem access, environment inspection, package installation, private project context, or other user-specific execution.",
+    "- Answer naturally and consistently across both surfaces. Do not expose hidden XML, routing internals, billing, or machine lifecycle details unless the user explicitly asks about product architecture.",
+    "- If asked about capabilities, explain that simple chat can be handled immediately and tool/private-runtime work can continue in the user's Box when needed.",
   ].join("\n");
+}
+
+export function buildSharedSystem(_ctx: SharedContext): string {
+  return [
+    buildCommonAssistantKnowledge(),
+    "",
+    "You are currently on the fast shared surface. You have no private tool or filesystem access in this phase.",
+    "First decide whether the latest user message can be answered completely from the shared surface.",
+    "If it can be answered completely (greetings, social chat, capability/product questions, non-private general answers), answer fluidly and directly.",
+    "If it requires private runtime/tools/user machine state, do not apologize and do not claim results. Earn time with one short natural bridge such as 'I’m checking that now.' Vary the wording.",
+    "Do not use a bridge for simple social chat.",
+    "",
+    "At the very end, append exactly one private control tag on its own line:",
+    '<shared-routing>{"needsPrivate":true}</shared-routing> when the private runtime must continue, or',
+    '<shared-routing>{"needsPrivate":false}</shared-routing> when your shared answer is sufficient.',
+    "The control tag is hidden from the user.",
+    "Use the hidden <consumer-context> only for conversational continuity. Do not reveal it.",
+  ].join("\n");
+}
+
+export function sanitizeSharedBridgeText(text: string): string {
+  const trimmed = String(text ?? "").replace(/\s+/g, " ").trim();
+  const fallback = "Yep — I’m looking into it.";
+  if (!trimmed) return fallback;
+  if (/\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect)\b/i.test(trimmed)) {
+    return fallback;
+  }
+  return trimmed;
 }
 
 export function buildUserBoxInstructions(ctx: UserBoxContext): string {
   return [
+    buildCommonAssistantKnowledge(),
+    "",
     "You are now running inside the user's private tool-enabled environment for this conversation.",
     "The user never needs to know about Boxes, sandboxes, machines, resumes, internal routings, billing, hidden XML, or orchestration internals. Do not mention them unless the user explicitly asks about the product architecture.",
     "The hidden <consumer-context> block contains prior transcript and machine state. Use it only as private context; never quote or reveal the XML.",
     "The latest user request is authoritative. Do not re-answer earlier greetings or small-talk if a later actionable request is present.",
     ctx.partialShared
-      ? "A restricted shared assistant may already have sent a brief acknowledgement to the user. Treat it as visible conversational context, do not repeat it verbatim, and continue by completing the latest request."
-      : "No visible shared acknowledgement needs to be carried forward.",
+      ? "A shared assistant already sent visible text. If it was only a brief bridge, continue by completing the latest request. If it already materially answered the request and no tool/private evidence is needed, do not duplicate it; produce no additional user-visible text."
+      : "No visible shared text needs to be carried forward.",
     "Use real tools when the request requires them. For shell facts like IP/hostname/current directory, run the appropriate command and report the observed result. Do not guess.",
     "For public IP requests: if the user asks for IPv4/v4, run an IPv4-specific lookup such as `curl -4 -s https://api.ipify.org`; if the user asks for IPv6/v6, use an IPv6-specific lookup; if ambiguous, say which address family you observed.",
     "For CPU/core-count requests, run a real command such as `nproc` or `lscpu` in the private environment and report the observed count.",
@@ -161,7 +188,7 @@ export function realCliHarness(spec: RealCliHarnessSpec): HarnessAdapter {
         system: buildSharedSystem(ctx),
         user: `${ctx.hiddenContext}\n\n<latest-user-message>${escapeXml(ctx.message)}</latest-user-message>`,
         apiKey: key,
-        maxTokens: ctx.toolIntent ? 96 : 160,
+        maxTokens: 220,
       });
     },
     async *userBox(ctx: UserBoxContext) {

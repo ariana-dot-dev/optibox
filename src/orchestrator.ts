@@ -764,10 +764,23 @@ export class ConsumerBoxAgentOrchestrator {
       partialShared,
     });
     let userText = "";
+    let lastToolStdout = "";
+    let sawToolUse = false;
     const itc = continued[Symbol.asyncIterator]();
+    const flushExecEvents = function* (): Iterable<ConsumerTurnEvent> {
+      while (execEvents.length) {
+        const ev = execEvents.shift()!;
+        if (ev.type === "harness.tool") {
+          if (ev.phase === "tool_use") sawToolUse = true;
+          if (ev.phase === "tool_result" && typeof ev.stdout === "string" && ev.stdout.trim())
+            lastToolStdout = ev.stdout.trim();
+        }
+        yield ev;
+      }
+    };
     while (true) {
       const n = await itc.next();
-      while (execEvents.length) yield execEvents.shift()!;
+      yield* flushExecEvents();
       if (n.done) break;
       const text = String(n.value ?? "");
       userText += text;
@@ -779,7 +792,18 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
       };
     }
-    while (execEvents.length) yield execEvents.shift()!;
+    yield* flushExecEvents();
+    if (!userText.trim() && sawToolUse && lastToolStdout) {
+      const fallback = buildToolResultFallback(input.message, lastToolStdout);
+      userText += fallback;
+      yield {
+        type: "user-box.delta",
+        text: fallback,
+        boxId: box.id,
+        harness: harness.name,
+        model: input.selection.model,
+      };
+    }
     if (userText)
       transcript.push({
         role: "assistant",
@@ -1030,6 +1054,12 @@ function nextBridgeText(): string {
     "Got it, I’m checking.",
   ];
   return options[Math.floor(Math.random() * options.length)]!;
+}
+
+function buildToolResultFallback(message: string, stdout: string): string {
+  const marker = /\breply\s+(?:exactly\s+)?(?:with\s+)?([A-Z][A-Z0-9_]{2,})\b/.exec(message)?.[1];
+  const value = stdout.trim();
+  return marker ? `${marker} ${value}` : `Done — observed: ${value}`;
 }
 
 function isReady(state: string): boolean {

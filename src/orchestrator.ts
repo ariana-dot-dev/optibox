@@ -30,7 +30,7 @@ export interface ConsumerTurnInput {
 export type ConsumerTurnEventBody =
   | { type: "trace"; stage: string; message: string; harness?: string; model?: string; boxId?: string }
   | { type: "turn.blocked"; stage: string; message: string; retryable: boolean; harness?: string; model?: string; boxId?: string }
-  | { type: "shared.delta"; text: string; harness: string }
+  | { type: "shared.delta"; text: string; harness: string; final?: boolean }
   | { type: "shared.larp"; harness: string; toolIntent: boolean; note: string }
   | {
       type: "context.injected";
@@ -100,10 +100,10 @@ export type ConsumerTurnEventBody =
     }
   | {
       type: "turn.done";
-      boxId: string;
+      boxId?: string;
       harness: string;
       model: string;
-      route?: "direct" | "bridge";
+      route?: "shared" | "direct" | "bridge";
     };
 
 /**
@@ -134,11 +134,7 @@ export class ConsumerBoxAgentOrchestrator {
   private sharedBoxPromise?: Promise<BoxInfo>;
   /** Per-conversation in-flight private-box startup/resume, used to dedupe foreground handoffs. */
   private readonly userBoxStarts = new Map<string, Promise<BoxInfo>>();
-  /**
-   * Per-conversation FIFO mutex for private Box work. Every user turn goes
-   * through this lock and into the Box; there is deliberately no message
-   * content heuristic that can keep a turn on the shared machine.
-   */
+  /** Per-conversation FIFO mutex for private Box work. */
   private readonly boxLocks = new Map<string, Promise<void>>();
   /** Monotonic per-conversation counter. Delayed auto-stop only fires if no newer user turn bumped this value. */
   private readonly turnSequences = new Map<string, number>();
@@ -441,14 +437,14 @@ export class ConsumerBoxAgentOrchestrator {
       turnId,
     };
 
-    // Every user message follows the same resilient loop: shared bridge first,
-    // private Box boot/resume/reuse in the background, then hot-swap the SAME
-    // turn into the real tool-enabled harness. There is intentionally no
-    // message classifier or shared-only final success path here.
     const release = await this.acquireLock(this.boxLocks, key);
+    let usedPrivateBox = false;
     try {
-      for await (const ev of this.runBoxTurn(input, key, statusPromise))
+      for await (const ev of this.runAdaptiveTurn(input, key, statusPromise)) {
+        if (ev.type === "handoff.started" || ev.type === "user-box.delta")
+          usedPrivateBox = true;
         yield { ...ev, turnId };
+      }
     } finally {
       release();
     }
@@ -457,11 +453,13 @@ export class ConsumerBoxAgentOrchestrator {
     // during this window, it bumps turnSequences[key], this stop is skipped,
     // and the next turn can reuse the warm Box immediately while still emitting
     // a shared bridge acknowledgement first.
-    for await (const ev of this.stopAfterIdle(input, key, turnSequence))
-      yield { ...ev, turnId };
+    if (usedPrivateBox) {
+      for await (const ev of this.stopAfterIdle(input, key, turnSequence))
+        yield { ...ev, turnId };
+    }
   }
 
-  private async *runBoxTurn(
+  private async *runAdaptiveTurn(
     input: ConsumerTurnInput,
     key: string,
     statusPromise: Promise<UserBoxStatus>,
@@ -478,14 +476,6 @@ export class ConsumerBoxAgentOrchestrator {
     const harness = this.harness(input.selection.harness);
     void this.ensureSharedBox().catch(() => undefined);
 
-    yield {
-      type: "trace",
-      stage: "bridge.start",
-      message: "shared bridge stream started; private Box status/boot is concurrent",
-      harness: harness.name,
-      model: input.selection.model,
-    };
-
     const sharedMachine: MachineState = {
       location: "shared-box",
       tools: false,
@@ -496,25 +486,22 @@ export class ConsumerBoxAgentOrchestrator {
       machine: sharedMachine,
     });
     yield {
+      type: "trace",
+      stage: "shared.reasoning.start",
+      message: "shared assistant is deciding whether it can answer or should hand off to the private runtime",
+      harness: harness.name,
+      model: input.selection.model,
+    };
+    yield {
       type: "context.injected",
       scope: "shared",
       machine: sharedMachine,
       hidden: sharedHidden,
     };
-    yield {
-      type: "shared.larp",
-      harness: harness.name,
-      toolIntent: true,
-      note: "private environment status check/boot may only bridge before handoff",
-    };
 
     const recoveryEvents: ConsumerTurnEventBody[] = [];
     let resolvedStatus: UserBoxStatus | undefined;
 
-    // The shared restricted assistant is bridge-only for ALL user messages. We
-    // buffer its tiny acknowledgement so a model drift into "I can't…" cannot
-    // leak as a final-looking no-tools answer; the private harness response is
-    // still streamed normally below.
     let rawSharedText = "";
     for await (const text of harness.shared({
       userId: input.userId,
@@ -525,21 +512,12 @@ export class ConsumerBoxAgentOrchestrator {
       capabilities: createRestrictedSharedCapabilities(),
       hiddenContext: sharedHidden,
       machine: sharedMachine,
-      toolIntent: true,
+      toolIntent: false,
     })) {
       rawSharedText += String(text ?? "");
     }
-    const sharedText = sanitizeSharedBridgeText(rawSharedText);
-    if (sharedText) {
-      yield { type: "shared.delta", text: sharedText, harness: harness.name };
-      transcript.push({
-        role: "assistant",
-        content: sharedText,
-        mode: "shared",
-        harness: harness.name,
-        at: new Date().toISOString(),
-      });
-    }
+    const sharedDecision = parseSharedDecision(rawSharedText, input.message);
+    let sharedText = sharedDecision.text;
 
     resolvedStatus = await statusPromise;
     yield {
@@ -550,25 +528,65 @@ export class ConsumerBoxAgentOrchestrator {
       model: input.selection.model,
       ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
     };
-    let box: BoxInfo;
-    if (resolvedStatus.kind === "ready") {
+
+    if (!sharedDecision.needsPrivate) {
+      if (sharedText) {
+        yield { type: "shared.delta", text: sharedText, harness: harness.name, final: true };
+        transcript.push({
+          role: "assistant",
+          content: sharedText,
+          mode: "shared",
+          harness: harness.name,
+          model: input.selection.model,
+          at: new Date().toISOString(),
+        });
+      }
+      yield {
+        type: "turn.done",
+        harness: harness.name,
+        model: input.selection.model,
+        route: "shared",
+      };
+      return;
+    }
+
+    const bridgeNeeded = resolvedStatus.kind !== "ready";
+    if (bridgeNeeded) {
+      sharedText = sanitizeSharedBridgeText(sharedText);
       yield {
         type: "shared.larp",
         harness: harness.name,
         toolIntent: true,
-        note: "private environment already warm; shared model may only bridge before handoff",
+        note:
+          resolvedStatus.kind === "archived" || resolvedStatus.kind === "archiving"
+            ? "private environment is resuming; shared assistant is covering latency"
+            : "private environment is starting; shared assistant is covering latency",
       };
+      if (sharedText) yield { type: "shared.delta", text: sharedText, harness: harness.name, final: false };
+      transcript.push({
+        role: "assistant",
+        content: sharedText,
+        mode: "shared",
+        harness: harness.name,
+        at: new Date().toISOString(),
+      });
+    } else {
+      // Warm private runtime: do not emit a latency bridge just because the
+      // shared model produced one. This prevents the "shared says something,
+      // Box repeats it" double-answer when handoff is immediate.
+      sharedText = "";
+      yield {
+        type: "shared.larp",
+        harness: harness.name,
+        toolIntent: true,
+        note: "private environment already warm; skipping shared bridge and continuing directly",
+      };
+    }
+
+    let box: BoxInfo;
+    if (resolvedStatus.kind === "ready") {
       box = resolvedStatus.box;
     } else {
-      const resuming = resolvedStatus.kind === "archived" || resolvedStatus.kind === "archiving";
-      if (resuming) {
-        yield {
-          type: "shared.larp",
-          harness: harness.name,
-          toolIntent: true,
-          note: "private environment is resuming; shared model may only bridge before handoff",
-        };
-      }
       yield {
         type: "trace",
         stage: "box.boot.start",
@@ -952,12 +970,66 @@ export class ConsumerBoxAgentOrchestrator {
 }
 
 
-function sanitizeSharedBridgeText(_text: string): string {
-  // The shared model is a bridge only. Never let it answer the user's request,
-  // even if the restricted shared harness returns an answer-looking sentence.
-  // A deterministic ack keeps the UI responsive without creating a duplicate
-  // authoritative responder or starving the private runtime of its own chunks.
-  return "Yep — I’m looking into it.";
+interface ParsedSharedDecision {
+  needsPrivate: boolean;
+  text: string;
+}
+
+const SHARED_ROUTING_RE = /<shared-routing>\s*({[\s\S]*?})\s*<\/shared-routing>/i;
+
+function parseSharedDecision(text: string, message: string): ParsedSharedDecision {
+  const raw = String(text ?? "");
+  const match = raw.match(SHARED_ROUTING_RE);
+  const visible = stripSharedControl(raw);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[1]!);
+      return {
+        needsPrivate: Boolean(parsed.needsPrivate),
+        text: visible,
+      };
+    } catch {
+      // Fall through to conservative fallback below.
+    }
+  }
+  return {
+    needsPrivate: fallbackNeedsPrivate(message),
+    text: visible,
+  };
+}
+
+function stripSharedControl(text: string): string {
+  return String(text ?? "")
+    .replace(SHARED_ROUTING_RE, "")
+    .replace(/\s+\n/g, "\n")
+    .trim();
+}
+
+function fallbackNeedsPrivate(message: string): boolean {
+  // Safety fallback for malformed/missing model routing metadata. The primary
+  // route is LLM-selected via <shared-routing>; this only prevents obviously
+  // tool-dependent requests from being stranded on the shared no-tools side.
+  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
+}
+
+function sanitizeSharedBridgeText(text: string): string {
+  const trimmed = String(text ?? "").replace(/\s+/g, " ").trim();
+  const fallback = nextBridgeText();
+  if (!trimmed) return fallback;
+  if (/\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect)\b/i.test(trimmed)) {
+    return fallback;
+  }
+  return trimmed;
+}
+
+function nextBridgeText(): string {
+  const options = [
+    "I’m checking that now.",
+    "I’m looking into it.",
+    "On it — I’ll take a look.",
+    "Got it, I’m checking.",
+  ];
+  return options[Math.floor(Math.random() * options.length)]!;
 }
 
 function isReady(state: string): boolean {

@@ -96,7 +96,11 @@ function probeHarness(name: string): HarnessAdapter {
     models: [{ provider: "anthropic", model: "m-1" }, { provider: "openai", model: "m-2" }],
     async *shared({ capabilities, message }) {
       await assert.rejects(capabilities.bash("whoami"));
-      yield `shared:${name}:${message}`;
+      if (/^(hello|hi)\b|capab|surprise/i.test(message)) {
+        yield `shared:${name}:I can answer simple chat here and use the private runtime for tool work.\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+      } else {
+        yield `shared:${name}:I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+      }
     },
     async *userBox({ capabilities, recap, hiddenContext, machine, partialShared }) {
       const r = await capabilities.command(`echo ${name}`);
@@ -282,10 +286,10 @@ test("hidden context envelope carries transcript + machine state, strips cleanly
   assert.equal(stripHiddenContext(`before ${hidden} after`), "before  after".trim());
 });
 
-test("legacy detectToolIntent no longer gates routing", () => {
+test("legacy detectToolIntent is only a cheap UI hint", () => {
   assert.equal(detectToolIntent("create a file foo.txt"), true);
-  assert.equal(detectToolIntent("hello, how are you today?"), true);
-  assert.equal(detectToolIntent("surprise me with a color"), true);
+  assert.equal(detectToolIntent("hello, how are you today?"), false);
+  assert.equal(detectToolIntent("surprise me with a color"), false);
 });
 
 test("runHarness extracts real Claude stream-json text deltas without duplicating final result", async () => {
@@ -346,20 +350,20 @@ class SlowUserBoxClient extends FakeBoxClient {
 }
 
 
-test("arbitrary chatty turn bridges first, then continues in the Box without classification", async () => {
+test("social chat is answered by shared assistant without private duplicate", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 60;
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 1 });
 
   const first: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "surprise me with a color", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
-  assert.equal(first.find((e) => e.type === "turn.done")?.route, "bridge");
+  assert.equal(first.find((e) => e.type === "turn.done")?.route, "shared");
   const sharedIdx = first.findIndex((e) => e.type === "shared.delta");
   const boxIdx = first.findIndex((e) => e.type === "user-box.delta");
-  assert.ok(sharedIdx >= 0, "shared bridge acknowledgement is emitted");
-  assert.ok(boxIdx > sharedIdx, "private Box answer follows the shared bridge");
-  assert.ok(first.some((e) => e.type === "handoff.started"), "same turn hot-swaps into the Box");
-  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "exactly one user Box is used");
+  assert.ok(sharedIdx >= 0, "shared answer is emitted");
+  assert.equal(boxIdx, -1, "private Box does not duplicate the shared answer");
+  assert.ok(!first.some((e) => e.type === "handoff.started"), "no handoff for social chat");
+  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 0, "no user Box is created");
 });
 
 test("stopUserBox streams stopping -> archiving -> archived and pauses billing", async () => {
@@ -438,11 +442,11 @@ test("stuck first Box create does not poison second message session", async () =
   const box = new FirstCreateStuckBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, handoffTimeoutMs: 8, autoStopIdleMs: 1 });
   const first: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "first", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create first proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
   assert.ok(first.some((e) => e.type === "turn.blocked"), "first turn reports an explicit retryable blocker instead of a network error");
 
   const second: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "second", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create second proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
   assert.ok(second.some((e) => e.type === "runtime.proof"), "second turn reaches authoritative runtime after stale create is cleared");
   assert.ok(second.some((e) => e.type === "user-box.delta"), "second turn streams private runtime chunks");
   assert.equal(second.filter((e) => e.type === "turn.done").length, 1, "second turn completes once");
@@ -452,14 +456,14 @@ test("two successful messages reuse one Box conversation without duplicate answe
   const box = new FakeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
   const first: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "first", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create first proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
   const firstBoxId = first.find((e) => e.type === "turn.done")?.boxId;
   assert.ok(firstBoxId);
 
   const second: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "second", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create second proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
   assert.equal(second.find((e) => e.type === "turn.done")?.boxId, firstBoxId, "same ready Box/session is reused");
-  assert.equal(second.filter((e) => e.type === "shared.delta").length, 1, "one shared bridge ack");
+  assert.equal(second.filter((e) => e.type === "shared.delta").length, 1, "one shared bridge ack during resume");
   assert.equal(second.filter((e) => e.type === "user-box.delta").length, 1, "one private runtime answer");
   assert.equal(second.filter((e) => e.type === "runtime.proof").length, 1, "one authoritative runtime owner");
 });
@@ -467,10 +471,10 @@ test("two successful messages reuse one Box conversation without duplicate answe
 test("send emits immediate trace and bridge before slow Box status resolves", async () => {
   const box = new SlowStatusBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
-  for await (const _ of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "first", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) void _;
+  for await (const _ of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create first proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) void _;
 
   box.slowGets = true;
-  const iterator = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "second", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })[Symbol.asyncIterator]();
+  const iterator = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create second proof file", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })[Symbol.asyncIterator]();
   const first = await Promise.race([
     iterator.next(),
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no immediate first event")), 25)),
@@ -482,7 +486,7 @@ test("send emits immediate trace and bridge before slow Box status resolves", as
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error("no immediate bridge event")), 25)),
   ]);
   assert.equal(second.value.type, "trace");
-  assert.equal(second.value.stage, "bridge.start");
+  assert.equal(second.value.stage, "shared.reasoning.start");
   for await (const _ of { [Symbol.asyncIterator]: () => iterator } as AsyncIterable<any>) void _;
 });
 
@@ -492,7 +496,7 @@ test("interactive proof UI has no global message queue and can abort stale share
   assert.match(html, /abortInterruptibleSharedTurns/);
   assert.match(html, /submit event fired/);
   assert.match(html, /backend.request.received/);
-  assert.match(html, /bridge.start/);
+  assert.match(html, /shared.delta/);
   assert.match(html, /turn.blocked/);
   assert.match(html, /Private runtime is not ready yet/);
   assert.doesNotMatch(html, new RegExp("Hot " + "swap:"));
@@ -508,7 +512,7 @@ test("runtime proof event states continuation is in-box harness, not Box prompt/
   const box = new FakeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("opencode")], readinessPollMs: 1, autoStopIdleMs: 1 });
   const events: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "say hi", selection: { harness: "opencode", provider: "anthropic", model: "m-1" } })) events.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run pwd", selection: { harness: "opencode", provider: "anthropic", model: "m-1" } })) events.push(e);
   const proof = events.find((e) => e.type === "runtime.proof");
   assert.ok(proof, "runtime proof is emitted before in-Box deltas");
   assert.equal(proof.boxPromptApiUsed, false);

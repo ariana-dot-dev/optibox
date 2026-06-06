@@ -86,11 +86,9 @@ function escapeXml(s: string): string {
 }
 
 /**
- * Legacy compatibility shim. Routing deliberately no longer classifies user
- * text: every turn starts with an open shared bridge and then continues in the
- * private Box, where the real harness decides whether tools/commands are
- * needed. Keep this export truthy for older callers/tests that still ask.
+ * Legacy helper for callers that still need a cheap UI hint. The orchestrator's
+ * primary routing is shared-model selected, not this regexp.
  */
-export function detectToolIntent(_message: string): boolean {
-  return true;
+export function detectToolIntent(message: string): boolean {
+  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
 }

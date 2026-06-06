@@ -272,13 +272,13 @@ function html() {
   <div class="route">
     <div class="node user-node"><strong><span class="dot"></span>You</strong><span>Message enters the demo</span></div>
     <div class="path to-shared"><span>fast path</span></div>
-    <div class="node shared-node"><strong><span class="dot"></span>Shared infra</strong><span>Open bridge ack only</span></div>
+    <div class="node shared-node"><strong><span class="dot"></span>Shared infra</strong><span>Natural answer, or bridge only when tools need time</span></div>
     <div class="path to-private"><span>handoff</span></div>
     <div class="node private-node"><strong><span class="dot"></span>User machine</strong><span>Private Box with tools + billing</span></div>
   </div>
   <div class="routeStatus" id="routeStatus">Ready: shared infra is listening.</div>
   <div class="matrix" id="matrix"></div>
-  <p class="hint">Matrix reports whether live token/chunk streaming is possible for Claude SDK, codebase daemon, Pi, Hermès, and OpenCode. The chat trace proves continuation is an in-Box runtime, not Box prompt/API or the host agent.</p>
+  <p class="hint">Claude-only proof: simple/social turns can finish on shared infra; tool/private turns hand off to the user Box runtime. The trace proves continuation is an in-Box runtime, not Box prompt/API or the host agent.</p>
 </aside>
 </div>
 <script>

@@ -30,7 +30,7 @@ export const RUNTIME_FEASIBILITY: RuntimeFeasibility[] = [
     harnessName: "codebase-daemon",
     supported: true,
     streaming: "stdout-chunks",
-    proofPath: "./bin/agent-daemon --stream or npm run agent:daemon -- --stream",
+    proofPath: "CODEBASE_DAEMON_DIR=/home/user/codebase ./bin/agent-daemon --stream --provider <provider> --model <model> --cwd <optibox-cwd> --system-prompt-file <file>",
     blocker: "Only token-level if the product daemon flushes token chunks; otherwise we relay whatever stdout chunks it emits.",
     source: "Product-owned daemon contract in examples/codebase-daemon.",
   },

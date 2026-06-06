@@ -1,36 +1,36 @@
 import { realCliHarness } from "../shared.js";
 
-// Checked-out codebase daemon adapter. Products can bake their own daemon into
-// the repo/image as ./bin/agent-daemon or npm run agent:daemon. The framework
-// only starts that process inside the private Box and streams its native stdout.
+// Checked-out codebase daemon adapter. The product image/Box should contain the
+// product daemon checkout at CODEBASE_DAEMON_DIR, defaulting to
+// /home/user/codebase. The daemon receives the full Optibox prompt on stdin and
+// the per-turn instruction workspace through explicit flags.
 export const harness = realCliHarness({
   name: "codebase-daemon",
   description: "Developer's checked-out codebase daemon running inside the user Box.",
-  bin: "node",
+  bin: "bash",
   instructionDelivery: "workspace-agents-md",
   models: [
     { provider: "anthropic", model: "claude-sonnet-4-6", label: "Codebase daemon · Sonnet 4.6" },
     { provider: "openai", model: "gpt-4.1", label: "Codebase daemon · GPT-4.1" },
   ],
   outputMode: "raw-stdout",
-  prepare: async (caps) => {
-    const script = `const text = 'Codebase daemon fallback running inside the private Box. Replace ./bin/agent-daemon or npm run agent:daemon with your real checked-out daemon. ';\nfor (const chunk of text.match(/.{1,18}/g) || []) { process.stdout.write(chunk); await new Promise(r => setTimeout(r, 30)); }\n`;
-    const encoded = Buffer.from(script, "utf8").toString("base64");
-    await caps.command(`printf %s '${encoded}' | base64 -d > /tmp/cba-codebase-daemon.mjs`);
-  },
-  buildArgv: ({ prompt, model, provider }) => [
+  buildArgv: ({ prompt, model, provider, cwd, systemInstructionPath }) => [
     "bash",
     "-lc",
     [
-      "prompt=$1; provider=$2; model=$3",
-      "cp /tmp/cba-codebase-daemon.mjs ./cba-codebase-daemon.mjs",
-      "if [ -x ./bin/agent-daemon ]; then printf %s \"$prompt\" | exec ./bin/agent-daemon --stream --provider \"$provider\" --model \"$model\"; fi",
-      "if [ -f package.json ] && npm run 2>/dev/null | grep -q 'agent:daemon'; then printf %s \"$prompt\" | exec npm run -s agent:daemon -- --stream --provider \"$provider\" --model \"$model\"; fi",
-      "node ./cba-codebase-daemon.mjs",
+      "set -euo pipefail",
+      "prompt=$1; provider=$2; model=$3; optibox_cwd=$4; system_file=$5",
+      'daemon_dir="${CODEBASE_DAEMON_DIR:-/home/user/codebase}"',
+      'if [ -x "$daemon_dir/bin/agent-daemon" ]; then printf %s "$prompt" | exec "$daemon_dir/bin/agent-daemon" --stream --provider "$provider" --model "$model" --cwd "$optibox_cwd" --system-prompt-file "$system_file"; fi',
+      'if [ -f "$daemon_dir/package.json" ] && npm --prefix "$daemon_dir" run 2>/dev/null | grep -q "agent:daemon"; then printf %s "$prompt" | exec npm --prefix "$daemon_dir" run -s agent:daemon -- --stream --provider "$provider" --model "$model" --cwd "$optibox_cwd" --system-prompt-file "$system_file"; fi',
+      'echo "Missing codebase daemon. Set CODEBASE_DAEMON_DIR to a checkout containing ./bin/agent-daemon or package.json with an agent:daemon script." >&2',
+      "exit 127",
     ].join("; "),
-    "cba-codebase-daemon",
+    "codebase-daemon",
     prompt,
     provider,
     model,
+    cwd,
+    systemInstructionPath,
   ],
 });

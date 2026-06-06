@@ -446,8 +446,11 @@ export class ConsumerBoxAgentOrchestrator {
       statusPromise,
       lockBusyAtSubmit,
     )) {
-      if (ev.type === "handoff.started" || ev.type === "user-box.delta")
-        usedPrivateBox = true;
+      if (
+        ev.type === "handoff.started" ||
+        ev.type === "user-box.delta" ||
+        (ev.type === "turn.done" && Boolean(ev.boxId))
+      ) usedPrivateBox = true;
       yield { ...ev, turnId };
     }
 
@@ -466,14 +469,17 @@ export class ConsumerBoxAgentOrchestrator {
     statusPromise: Promise<UserBoxStatus>,
     lockBusyAtSubmit: boolean,
   ): AsyncIterable<ConsumerTurnEvent> {
-    const transcript = this.transcripts.get(key) ?? [];
-    transcript.push({
+    const userMessage: TranscriptMessage = {
       role: "user",
       content: input.message,
       mode: "shared",
       at: new Date().toISOString(),
-    });
-    this.transcripts.set(key, transcript);
+    };
+    // Each turn keeps an immutable snapshot for its own shared/private handoff.
+    // The global transcript is updated append-only through appendTranscript so
+    // a later user message cannot mutate an earlier in-flight Box prompt.
+    const transcript = [...(this.transcripts.get(key) ?? []), userMessage];
+    this.transcripts.set(key, [...transcript]);
 
     const harness = this.harness(input.selection.harness);
     void this.ensureSharedBox().catch(() => undefined);
@@ -512,6 +518,7 @@ export class ConsumerBoxAgentOrchestrator {
           };
           yield* this.runPrivateRuntime(
             input,
+            key,
             harness,
             latestStatus.box,
             transcript,
@@ -617,14 +624,16 @@ export class ConsumerBoxAgentOrchestrator {
       yield { type: "shared.delta", text: sharedText, harness: harness.name, final: false };
     }
     if (sharedText) {
-      transcript.push({
+      const sharedMessage: TranscriptMessage = {
         role: "assistant",
         content: sharedText,
         mode: "shared",
         harness: harness.name,
         model: input.selection.model,
         at: new Date().toISOString(),
-      });
+      };
+      transcript.push(sharedMessage);
+      this.appendTranscript(key, sharedMessage);
     }
 
     let privateResult: { box: BoxInfo; status: UserBoxStatus; release: () => void };
@@ -632,6 +641,18 @@ export class ConsumerBoxAgentOrchestrator {
       privateResult = await privateReady;
     } catch (error) {
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
+      if (!sharedDecision.needsPrivate) {
+        yield {
+          type: "trace",
+          stage: "handoff.suppressed",
+          message: "shared answer was sufficient; private runtime startup failed but no private continuation was required",
+          harness: harness.name,
+          model: input.selection.model,
+          ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+        };
+        yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+        return;
+      }
       yield {
         type: "turn.blocked",
         stage: "box.runtime.unavailable",
@@ -646,8 +667,21 @@ export class ConsumerBoxAgentOrchestrator {
 
     try {
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
+      if (!sharedDecision.needsPrivate) {
+        yield {
+          type: "trace",
+          stage: "handoff.suppressed",
+          message: "shared answer was sufficient; private Box was prepared but no duplicate private answer was needed",
+          harness: harness.name,
+          model: input.selection.model,
+          boxId: privateResult.box.id,
+        };
+        yield { type: "turn.done", boxId: privateResult.box.id, harness: harness.name, model: input.selection.model, route: "shared" };
+        return;
+      }
       yield* this.runPrivateRuntime(
         input,
+        key,
         harness,
         privateResult.box,
         transcript,
@@ -661,6 +695,7 @@ export class ConsumerBoxAgentOrchestrator {
 
   private async *runPrivateRuntime(
     input: ConsumerTurnInput,
+    key: string,
     harness: HarnessAdapter,
     box: BoxInfo,
     transcript: TranscriptMessage[],
@@ -725,12 +760,19 @@ export class ConsumerBoxAgentOrchestrator {
 
     yield* this.continueInUserBox(
       input,
+      key,
       harness,
       box,
       transcript,
       sharedText,
       resolvedStatus.kind === "ready" ? "direct" : "bridge",
     );
+  }
+
+
+  private appendTranscript(key: string, message: TranscriptMessage): void {
+    const current = this.transcripts.get(key) ?? [];
+    this.transcripts.set(key, [...current, message]);
   }
 
   private bumpTurnSequence(key: string): number {
@@ -765,6 +807,7 @@ export class ConsumerBoxAgentOrchestrator {
    */
   private async *continueInUserBox(
     input: ConsumerTurnInput,
+    key: string,
     harness: HarnessAdapter,
     box: BoxInfo,
     transcript: TranscriptMessage[],
@@ -854,15 +897,18 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
       };
     }
-    if (userText)
-      transcript.push({
+    if (userText) {
+      const assistantMessage: TranscriptMessage = {
         role: "assistant",
         content: userText,
         mode: "user-box",
         harness: harness.name,
         model: input.selection.model,
         at: new Date().toISOString(),
-      });
+      };
+      transcript.push(assistantMessage);
+      this.appendTranscript(key, assistantMessage);
+    }
     yield {
       type: "turn.done",
       boxId: box.id,

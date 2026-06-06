@@ -96,7 +96,7 @@ function probeHarness(name: string): HarnessAdapter {
     models: [{ provider: "anthropic", model: "m-1" }, { provider: "openai", model: "m-2" }],
     async *shared({ capabilities, message }) {
       await assert.rejects(capabilities.bash("whoami"));
-      if (/^(hello|hi)\b|capab|surprise/i.test(message)) {
+      if (/^(hello|hi|hey)\b|capab|surprise/i.test(message)) {
         yield `shared:${name}:I can answer simple chat here and use the private runtime for tool work.\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
       } else {
         yield `shared:${name}:I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
@@ -408,13 +408,43 @@ test("CPU request during archiving gets shared response before private resume", 
 });
 
 
+
+test("shared-only cold greeting does not later answer a follow-up private turn", async () => {
+  const box = new SlowUserBoxClient();
+  box.delayMs = 80;
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 100_000 });
+
+  const greeting: any[] = [];
+  const dg = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
+      greeting.push(e);
+      if (e.type === "turn.done") break;
+    }
+  })();
+  await waitFor(() => greeting.some((e) => e.type === "shared.delta"), 50);
+
+  const ip: any[] = [];
+  const di = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "whats ur ip", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
+      ip.push(e);
+      if (e.type === "turn.done") break;
+    }
+  })();
+  await Promise.all([dg, di]);
+
+  assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "handoff.suppressed"), "shared-only greeting prepares Box but suppresses private answer");
+  assert.equal(greeting.filter((e) => e.type === "user-box.delta").length, 0, "greeting does not emit a private answer");
+  assert.equal(ip.filter((e) => e.type === "user-box.delta").length, 1, "follow-up gets exactly one private answer");
+  assert.ok(ip.some((e) => e.type === "shared.delta"), "follow-up still receives immediate shared bridge while Box is not ready/busy");
+});
+
 test("not-ready turns answer from shared first while private runtime starts in parallel", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 60;
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 1 });
 
   const first: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "surprise me with a color", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "whats ur ip", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
   assert.equal(first.find((e) => e.type === "turn.done")?.route, "bridge");
   const sharedIdx = first.findIndex((e) => e.type === "shared.delta");
   const bootIdx = first.findIndex((e) => e.type === "trace" && e.stage === "box.boot.start");
@@ -559,6 +589,9 @@ test("interactive proof UI has no global message queue and can abort stale share
   assert.match(html, /shared.delta/);
   assert.match(html, /turn.blocked/);
   assert.match(html, /Private runtime is not ready yet/);
+  assert.match(html, /Show traces/);
+  assert.match(html, /body\.hide-traces \.msg\.trace\{display:none\}/);
+  assert.match(html, /id="showTraces" type="checkbox"/);
   assert.doesNotMatch(html, new RegExp("Hot " + "swap:"));
   assert.doesNotMatch(html, /handoff\.swap/);
   assert.doesNotMatch(html, /queued #/);

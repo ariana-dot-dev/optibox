@@ -1,5 +1,5 @@
 import { streamSharedAnswer } from "../src/providerClient.js";
-import type { HarnessAdapter, ModelOption, SharedContext, UserBoxCapabilities, UserBoxContext } from "../src/index.js";
+import type { HarnessAdapter, HarnessOutputMode, ModelOption, SharedContext, UserBoxCapabilities, UserBoxContext } from "../src/index.js";
 
 /** Resolve the LLM API key for a provider from the host environment. */
 export function providerKey(provider: string): string | undefined {
@@ -40,6 +40,8 @@ export interface RealCliHarnessSpec {
    * carry instructions in the hidden XML prompt body.
    */
   instructionDelivery?: InstructionDelivery;
+  /** How to extract assistant text from the harness stdout stream. */
+  outputMode?: HarnessOutputMode;
   /** Build the argv that runs the real harness for one turn inside the Box. */
   buildArgv: (input: {
     prompt: string;
@@ -175,7 +177,7 @@ export function realCliHarness(spec: RealCliHarnessSpec): HarnessAdapter {
       const { cwd, systemInstructionPath } = await prepareInstructionWorkspace(capabilities, spec.name, instructions, delivery);
       const prompt = buildPrompt(ctx, instructions);
       const argv = spec.buildArgv({ prompt, model: selection.model, provider: selection.provider, cwd, systemInstructionPath });
-      yield* capabilities.runHarness({ argv, cwd });
+      yield* capabilities.runHarness({ argv, cwd, ...(spec.outputMode ? { outputMode: spec.outputMode } : {}), pollMs: 150 });
     },
   };
 }

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   ConsumerBoxAgentOrchestrator,
   createRestrictedSharedCapabilities,
+  createUserBoxCapabilities,
   assertNoBoxAgent,
   buildHiddenContext,
   detectToolIntent,
@@ -38,6 +39,19 @@ class FakeBoxClient implements BoxClient {
   async command(_boxId: string, input: { command: string }): Promise<CommandResult> { this.commands.push(input.command); return { exitCode: 0, stdout: `ran:${input.command}`, stderr: "" }; }
   async readFile(_boxId: string, path: string): Promise<string> { return `file:${path}`; }
   async writeFile(_boxId: string, path: string, content: string): Promise<void> { this.writes.push(`${path}:${content}`); }
+}
+
+class StreamingLogBoxClient extends FakeBoxClient {
+  catReads = 0;
+  constructor(private snapshots: string[]) { super(); }
+  override async command(_boxId: string, input: { command: string }): Promise<CommandResult> {
+    this.commands.push(input.command);
+    if (/^cat\s/.test(input.command)) {
+      const index = Math.min(this.catReads++, this.snapshots.length - 1);
+      return { exitCode: 0, stdout: this.snapshots[index] ?? "", stderr: "" };
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  }
 }
 
 
@@ -233,6 +247,31 @@ test("detectToolIntent flags tool work but not pure chit-chat", () => {
   assert.equal(detectToolIntent("run the build and fix the test"), true);
   assert.equal(detectToolIntent("what's ur ip"), true);
   assert.equal(detectToolIntent("hello, how are you today?"), false);
+});
+
+test("runHarness extracts real Claude stream-json text deltas without duplicating final result", async () => {
+  const snapshots = [
+    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n${JSON.stringify({ type: "result", result: "Hello" })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1 });
+  const chunks: string[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json", pollMs: 1 })) chunks.push(chunk);
+  assert.deepEqual(chunks, ["Hel", "lo"]);
+});
+
+test("runHarness forwards Codex JSON final message only when token deltas are not exposed", async () => {
+  const snapshots = [
+    `${JSON.stringify({ type: "session.started" })}\n`,
+    `${JSON.stringify({ type: "session.started" })}\n${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Done." } })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1 });
+  const chunks: string[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["codex", "exec", "--json", "hi"], outputMode: "codex-json", pollMs: 1 })) chunks.push(chunk);
+  assert.deepEqual(chunks, ["Done."]);
 });
 
 // A user box that takes time to provision: lets a follow-up message genuinely

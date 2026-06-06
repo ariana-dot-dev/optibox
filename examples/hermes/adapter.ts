@@ -13,5 +13,6 @@ export const harness = realCliHarness({
   models: [
     { provider: "openrouter", model: "nousresearch/hermes-4-70b", label: "Hermes 4 70B" },
   ],
-  buildArgv: ({ prompt, model }) => ["opencode", "run", "--model", `openrouter/${model}`, prompt],
+  outputMode: "opencode-json",
+  buildArgv: ({ prompt, model }) => ["opencode", "run", "--format", "json", "--model", `openrouter/${model}`, prompt],
 });

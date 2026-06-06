@@ -12,10 +12,14 @@ export const harness = realCliHarness({
     { provider: "anthropic", model: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
     { provider: "anthropic", model: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
   ],
+  outputMode: "claude-stream-json",
   buildArgv: ({ prompt, model, systemInstructionPath }) => [
     "claude", "-p", prompt,
     "--model", model,
     "--append-system-prompt-file", systemInstructionPath,
     "--dangerously-skip-permissions",
+    "--output-format", "stream-json",
+    "--include-partial-messages",
+    "--verbose",
   ],
 });

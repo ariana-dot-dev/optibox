@@ -12,5 +12,6 @@ export const harness = realCliHarness({
     { provider: "anthropic", model: "claude-sonnet-4-6", label: "Pi · Sonnet 4.6" },
     { provider: "anthropic", model: "claude-haiku-4-5-20251001", label: "Pi · Haiku 4.5" },
   ],
-  buildArgv: ({ prompt, model }) => ["pi", "-p", prompt, "--model", model],
+  outputMode: "pi-json",
+  buildArgv: ({ prompt, model }) => ["pi", "--mode", "json", prompt, "--model", model],
 });

@@ -57,6 +57,13 @@ export interface HarnessSelection {
 }
 
 /** Spec for running the developer's real harness binary inside the user Box. */
+export type HarnessOutputMode =
+  | "raw-stdout"
+  | "claude-stream-json"
+  | "codex-json"
+  | "opencode-json"
+  | "pi-json";
+
 export interface HarnessRunSpec {
   /** argv[0] is the binary (e.g. "codex", "claude", "opencode"). */
   argv: string[];
@@ -64,6 +71,10 @@ export interface HarnessRunSpec {
   env?: Record<string, string>;
   cwd?: string;
   timeoutMs?: number;
+  /** How to extract user-visible assistant text from the harness stdout stream. */
+  outputMode?: HarnessOutputMode;
+  /** Poll cadence for the remote log tail; lower values expose real chunks sooner. */
+  pollMs?: number;
 }
 
 export interface SafeSharedCapabilities {

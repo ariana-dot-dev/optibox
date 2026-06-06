@@ -14,5 +14,6 @@ export const harness = realCliHarness({
     { provider: "anthropic", model: "claude-sonnet-4-6", label: "OpenCode · Sonnet 4.6" },
     { provider: "anthropic", model: "claude-haiku-4-5-20251001", label: "OpenCode · Haiku 4.5" },
   ],
-  buildArgv: ({ prompt, model, provider }) => ["opencode", "run", "--model", `${provider}/${model}`, prompt],
+  outputMode: "opencode-json",
+  buildArgv: ({ prompt, model, provider }) => ["opencode", "run", "--format", "json", "--model", `${provider}/${model}`, prompt],
 });

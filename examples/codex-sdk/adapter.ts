@@ -12,8 +12,10 @@ export const harness = realCliHarness({
     { provider: "openai", model: "gpt-5.5", label: "GPT-5.5 (Codex)" },
     { provider: "openai", model: "gpt-5.1-codex", label: "GPT-5.1 Codex" },
   ],
+  outputMode: "codex-json",
   buildArgv: ({ prompt, model, cwd }) => [
     "codex", "exec",
+    "--json",
     "--skip-git-repo-check",
     "--dangerously-bypass-approvals-and-sandbox",
     "--cd", cwd,

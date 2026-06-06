@@ -84,6 +84,8 @@ function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversat
   const redacted: any = { ...event };
   if (redacted.hidden) redacted.hidden = "[redacted hidden context]";
   if (redacted.recap) redacted.recap = "[redacted recap]";
+  if (Array.isArray(redacted.argv)) redacted.argv = redacted.argv.map((v: unknown, i: number) => i === 2 ? "[redacted prompt]" : String(v).slice(0, 120));
+  if (typeof redacted.command === "string" && redacted.command.includes("base64 -d")) redacted.command = "[redacted instruction-file write]";
   if (redacted.text && String(redacted.text).length > 160) redacted.text = String(redacted.text).slice(0, 160) + "…";
   console.log(JSON.stringify({
     ts: new Date().toISOString(),
@@ -313,7 +315,7 @@ function handle(ev,localId){const t=activeTurns.get(localId);if(t&&ev.type==='sh
   else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}
-  else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real harness inside user machine: '+(ev.argv||[]).slice(0,3).join(' '),keyFor(ev,localId,'exec'));}
+  else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine (stream-json).',keyFor(ev,localId,'exec'));}
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');const detail=ev.phase==='tool_use'?((ev.toolName||'tool')+(ev.command?': '+ev.command:'')):(ev.isError?'tool result error':'tool result')+(ev.stdout?': '+ev.stdout.trim():'');addMsg('trace','tool event · user machine',detail+'\\n',keyFor(ev,localId,'tool')+':'+ev.phase+':'+(ev.command||ev.stdout||Math.random()));}
   else if(ev.type==='user-box.delta'){addMsg('assistant','assistant · user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);}

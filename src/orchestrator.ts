@@ -533,6 +533,9 @@ export class ConsumerBoxAgentOrchestrator {
       input.conversationId,
       status,
       (event) => recoveryEvents.push(event),
+    ).then(
+      (box) => ({ box, error: undefined as unknown }),
+      (error) => ({ box: undefined as unknown as BoxInfo, error }),
     );
 
     let sharedText = "";
@@ -560,7 +563,9 @@ export class ConsumerBoxAgentOrchestrator {
         at: new Date().toISOString(),
       });
 
-    const box = await userBoxPromise;
+    const boxResult = await userBoxPromise;
+    if (boxResult.error) throw boxResult.error;
+    const box = boxResult.box;
     while (recoveryEvents.length) yield recoveryEvents.shift()!;
     const { since } = this.startBilling(box.id);
     yield {

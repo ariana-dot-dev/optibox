@@ -77,6 +77,17 @@ export interface HarnessRunSpec {
   pollMs?: number;
 }
 
+/** Real tool telemetry emitted by a harness' native streaming/event output. */
+export interface HarnessToolEvent {
+  phase: "tool_use" | "tool_result";
+  toolName?: string;
+  command?: string;
+  description?: string;
+  stdout?: string;
+  stderr?: string;
+  isError?: boolean;
+}
+
 export interface SafeSharedCapabilities {
   readonly mode: "shared-restricted";
   /** Safe: a constrained text/search-only LLM answer. Provided by the host. */

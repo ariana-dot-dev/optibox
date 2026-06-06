@@ -86,6 +86,7 @@ export function buildUserBoxInstructions(ctx: UserBoxContext): string {
       ? "A restricted shared assistant may already have sent a brief acknowledgement to the user. Treat it as visible conversational context, do not repeat it verbatim, and continue by completing the latest request."
       : "No visible shared acknowledgement needs to be carried forward.",
     "Use real tools when the request requires them. For shell facts like IP/hostname/current directory, run the appropriate command and report the observed result. Do not guess.",
+    "For public IP requests: if the user asks for IPv4/v4, run an IPv4-specific lookup such as `curl -4 -s https://api.ipify.org`; if the user asks for IPv6/v6, use an IPv6-specific lookup; if ambiguous, say which address family you observed.",
     "When done, answer the latest user request directly and concisely. If you changed files or ran commands, summarize the concrete result.",
   ].filter(Boolean).join("\n");
 }

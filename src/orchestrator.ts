@@ -66,6 +66,17 @@ export type ConsumerTurnEventBody =
       boxId: string;
     }
   | {
+      type: "harness.tool";
+      phase: "tool_use" | "tool_result";
+      boxId: string;
+      toolName?: string;
+      command?: string;
+      description?: string;
+      stdout?: string;
+      stderr?: string;
+      isError?: boolean;
+    }
+  | {
       type: "user-box.delta";
       text: string;
       boxId: string;
@@ -673,6 +684,8 @@ export class ConsumerBoxAgentOrchestrator {
         : {}),
       onExec: (info) =>
         execEvents.push({ type: "exec", boxId: box.id, ...info }),
+      onHarnessEvent: (event) =>
+        execEvents.push({ type: "harness.tool", boxId: box.id, ...event }),
     });
     const continued = harness.userBox({
       userId: input.userId,

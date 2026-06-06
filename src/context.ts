@@ -87,7 +87,7 @@ function escapeXml(s: string): string {
 
 /** Heuristic: does this user message ask for real tool work (files/commands)? */
 export function detectToolIntent(message: string): boolean {
-  return /\b(create|make|write|edit|append|modify|update|delete|remove|run|execute|install|build|compile|test|fix|refactor|file|folder|directory|script|command|cat|ls|grep|npm|git|code|implement|add|ip|ifconfig|hostname|whoami|pwd|curl|wget)\b/i.test(
+  return /\b(create|make|write|edit|append|modify|update|delete|remove|run|execute|install|build|compile|test|fix|refactor|file|folder|directory|script|command|cat|ls|grep|npm|git|code|implement|add|ip|ipv4|ipv6|v4|v6|ifconfig|ipconfig|hostname|whoami|pwd|curl|wget|public\s+address|external\s+address|network\s+address)\b/i.test(
     message,
   );
 }

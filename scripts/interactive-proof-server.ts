@@ -80,6 +80,21 @@ function readBody(req: http.IncomingMessage): Promise<any> {
   });
 }
 
+function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversationId: string; message: string }) {
+  const redacted: any = { ...event };
+  if (redacted.hidden) redacted.hidden = "[redacted hidden context]";
+  if (redacted.recap) redacted.recap = "[redacted recap]";
+  if (redacted.text && String(redacted.text).length > 160) redacted.text = String(redacted.text).slice(0, 160) + "…";
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    audit: "turn-event",
+    userId: input.userId,
+    conversationId: input.conversationId,
+    message: input.message,
+    event: redacted,
+  }));
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(
@@ -146,12 +161,14 @@ const server = http.createServer(async (req, res) => {
         model: String(body.model),
       };
       try {
-        for await (const event of orchestrator.runTurn({
+        const turnInput = {
           userId: String(body.userId ?? "user-a"),
           conversationId: String(body.conversationId ?? "conv-1"),
           message: String(body.message ?? ""),
           selection,
-        })) {
+        };
+        for await (const event of orchestrator.runTurn(turnInput)) {
+          auditEvent(event as ConsumerTurnEvent, turnInput);
           send(event as ConsumerTurnEvent);
         }
         send({ type: "stream.end" });
@@ -212,7 +229,7 @@ function html() {
 .shell{height:100dvh;max-width:1120px;margin:0 auto;display:grid;grid-template-columns:minmax(360px,520px) 320px;gap:18px;align-items:stretch;padding:0 18px}.app{height:100dvh;min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e2ded3;border-right:1px solid #e2ded3;box-shadow:0 24px 80px rgba(25,20,10,.08)}
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e6e1d6;padding:calc(12px + env(safe-area-inset-top)) 14px 12px;display:grid;gap:10px}
 .counters{display:grid;grid-template-columns:1fr 1fr;gap:8px}.counter{border:1px solid #ded8ca;background:#fbfaf7;border-radius:18px;padding:11px 12px;min-width:0}.label{display:block;color:#736b5c;text-transform:uppercase;letter-spacing:.08em;font-size:10px;font-weight:800}.value{display:block;margin-top:3px;font:800 21px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:1px solid #171717;background:#171717;color:#fff;border-radius:999px;padding:10px 13px;font-size:13px;font-weight:750;text-align:center;box-shadow:0 10px 24px rgba(0,0,0,.12)}
-.chat{flex:1;overflow:auto;padding:16px 14px 18px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#7c7468;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;border-radius:20px;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 1px 0 rgba(0,0,0,.04)}.msg.user{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:6px}.msg.assistant{align-self:flex-start;background:#f1efe8;color:#161616;border:1px solid #e2ded3;border-bottom-left-radius:6px}.tag{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.chat{flex:1;overflow:auto;padding:16px 14px 18px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#7c7468;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;border-radius:20px;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 1px 0 rgba(0,0,0,.04)}.msg.user{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:6px}.msg.assistant{align-self:flex-start;background:#f1efe8;color:#161616;border:1px solid #e2ded3;border-bottom-left-radius:6px}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed #d6cebf;color:#6d6457;border-radius:14px;font-size:12px;max-width:92%;padding:8px 10px}.tag{display:block;margin-bottom:4px;color:#756d60;text-transform:uppercase;letter-spacing:.08em;font-size:9px;font-weight:900}.msg.user .tag{color:#dedede}.msg.trace .tag{color:#8c8375}
 .composer{display:flex;gap:9px;align-items:flex-end;padding:10px 14px calc(12px + env(safe-area-inset-bottom));border-top:1px solid #e6e1d6;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}textarea{flex:1;min-height:46px;max-height:130px;resize:none;border:1px solid #d8d2c5;border-radius:18px;background:#fbfaf7;color:#111;padding:12px 13px;font:inherit;outline:none}textarea:focus{border-color:#111}button{min-height:46px;border:0;border-radius:18px;background:#111;color:#fff;padding:0 16px;font-weight:850;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}
 .schematic{align-self:center;border:1px solid #e1dbcf;background:rgba(255,255,255,.76);backdrop-filter:blur(14px);border-radius:28px;padding:18px;box-shadow:0 24px 80px rgba(25,20,10,.08);color:#191714}.schematic h2{font-size:13px;margin:0 0 14px;text-transform:uppercase;letter-spacing:.1em;color:#6e6659}.route{display:grid;gap:12px}.node{border:1px solid #ddd6c8;background:#fbfaf7;border-radius:20px;padding:13px;transition:.18s ease}.node strong{display:block;font-size:15px}.node span{display:block;margin-top:3px;color:#746c5f;font-size:12px}.node .dot{width:8px;height:8px;border-radius:999px;background:#c8c0b2;display:inline-block;margin-right:7px}.path{height:34px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;color:#8c8374;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.path:before,.path:after{content:"";height:1px;background:#ded7ca}.path span{border:1px solid #ded7ca;background:#fff;border-radius:999px;padding:5px 8px}.hint{margin:14px 0 0;color:#6f675b;font-size:12px;line-height:1.45}.schematic[data-route="shared"] .shared-node,.schematic[data-route="private"] .private-node{border-color:#111;background:#111;color:#fff;box-shadow:0 12px 28px rgba(0,0,0,.14)}.schematic[data-route="shared"] .shared-node span,.schematic[data-route="private"] .private-node span{color:#e9e4dc}.schematic[data-route="shared"] .shared-node .dot,.schematic[data-route="private"] .private-node .dot{background:#70e000;box-shadow:0 0 0 5px rgba(112,224,0,.16)}.schematic[data-route="private"] .to-private span,.schematic[data-route="shared"] .to-shared span{border-color:#111;color:#111;font-weight:850}.schematic[data-route="idle"] .shared-node{border-color:#bdb4a5}.routeStatus{margin-top:12px;border:1px solid #ded7ca;border-radius:16px;padding:10px 12px;background:#fff;font-size:12px;font-weight:800;color:#26231f}
 @media(max-width:900px){.shell{display:block;height:100dvh;padding:0}.schematic{display:none}.app{max-width:720px;margin:0 auto}}
@@ -290,14 +307,15 @@ msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.
 async function drain(res,localId){const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls;}
 function handle(ev,localId){const t=activeTurns.get(localId);if(t&&ev.type==='shared.larp'&&ev.toolIntent===false)t.interruptible=true;if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
-  if(ev.type==='shared.delta'){addMsg('assistant','assistant',ev.text,keyFor(ev,localId,'shared'));}
+  if(ev.type==='shared.delta'){addMsg('assistant','assistant · shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
   else if(ev.type==='shared.larp'){setState(ev.toolIntent?'Private machine starting · preparing tools':'Shared chat replying · private machine stopped');}
   else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared chat ready · private machine stopped');}
   else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}
-  else if(ev.type==='exec'){setState('Private machine running · using tools');}
-  else if(ev.type==='user-box.delta'){addMsg('assistant','assistant',ev.text,keyFor(ev,localId,'box'));}
+  else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real harness inside user machine: '+(ev.argv||[]).slice(0,3).join(' '),keyFor(ev,localId,'exec'));}
+  else if(ev.type==='harness.tool'){setState('Private machine running · using tools');const detail=ev.phase==='tool_use'?((ev.toolName||'tool')+(ev.command?': '+ev.command:'')):(ev.isError?'tool result error':'tool result')+(ev.stdout?': '+ev.stdout.trim():'');addMsg('trace','tool event · user machine',detail+'\\n',keyFor(ev,localId,'tool')+':'+ev.phase+':'+(ev.command||ev.stdout||Math.random()));}
+  else if(ev.type==='user-box.delta'){addMsg('assistant','assistant · user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);}
   else if(ev.type==='turn.done'){setState(ev.route==='shared-only'?'Shared chat ready · private machine stopped':'Turn complete · private machine may keep warm briefly');}
   else if(ev.type==='error'){addMsg('assistant','assistant','Error: '+ev.message);setState('Error · check model credentials or machine state');}}

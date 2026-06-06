@@ -246,20 +246,27 @@ test("detectToolIntent flags tool work but not pure chit-chat", () => {
   assert.equal(detectToolIntent("create a file foo.txt"), true);
   assert.equal(detectToolIntent("run the build and fix the test"), true);
   assert.equal(detectToolIntent("what's ur ip"), true);
+  assert.equal(detectToolIntent("nice and ipv4"), true);
+  assert.equal(detectToolIntent("and v4?"), true);
   assert.equal(detectToolIntent("hello, how are you today?"), false);
 });
 
 test("runHarness extracts real Claude stream-json text deltas without duplicating final result", async () => {
+  const toolUse = { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "curl -4 -s https://api.ipify.org", description: "Get IPv4" } }] } };
+  const toolResult = { type: "user", tool_use_result: { stdout: "78.47.150.66", stderr: "", is_error: false } };
   const snapshots = [
     `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n`,
-    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n`,
-    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n${JSON.stringify({ type: "result", result: "Hello" })}\n__CBA_EXIT__:0\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify(toolUse)}\n${JSON.stringify(toolResult)}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify(toolUse)}\n${JSON.stringify(toolResult)}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n${JSON.stringify({ type: "result", result: "Hello" })}\n__CBA_EXIT__:0\n`,
   ];
   const box = new StreamingLogBoxClient(snapshots);
-  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1 });
+  const toolEvents: any[] = [];
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (event) => toolEvents.push(event) });
   const chunks: string[] = [];
   for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json", pollMs: 1 })) chunks.push(chunk);
   assert.deepEqual(chunks, ["Hel", "lo"]);
+  assert.ok(toolEvents.some((e) => e.phase === "tool_use" && e.command === "curl -4 -s https://api.ipify.org"));
+  assert.ok(toolEvents.some((e) => e.phase === "tool_result" && e.stdout === "78.47.150.66"));
 });
 
 test("runHarness forwards Codex JSON final message only when token deltas are not exposed", async () => {

@@ -1,4 +1,4 @@
-import type { BoxClient, CommandResult, HarnessOutputMode, HarnessRunSpec, SafeSharedCapabilities, UserBoxCapabilities } from "./types.js";
+import type { BoxClient, CommandResult, HarnessOutputMode, HarnessRunSpec, HarnessToolEvent, SafeSharedCapabilities, UserBoxCapabilities } from "./types.js";
 
 class CapabilityDeniedError extends Error {
   constructor(action: string) {
@@ -36,10 +36,11 @@ interface HarnessOutputParser {
   mode: HarnessOutputMode;
   lineBuffer: string;
   emittedText: string;
+  onToolEvent?: (event: HarnessToolEvent) => void;
 }
 
-function createHarnessOutputParser(mode: HarnessOutputMode): HarnessOutputParser {
-  return { mode, lineBuffer: "", emittedText: "" };
+function createHarnessOutputParser(mode: HarnessOutputMode, onToolEvent?: (event: HarnessToolEvent) => void): HarnessOutputParser {
+  return { mode, lineBuffer: "", emittedText: "", ...(onToolEvent ? { onToolEvent } : {}) };
 }
 
 function* parseHarnessOutput(rawDelta: string, parser: HarnessOutputParser): Iterable<string> {
@@ -63,6 +64,7 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): string
   try { j = JSON.parse(trimmed); } catch { return ""; }
 
   if (parser.mode === "claude-stream-json") {
+    emitClaudeToolEvent(j, parser);
     const delta = j.type === "stream_event" && j.event?.type === "content_block_delta" && j.event.delta?.type === "text_delta"
       ? j.event.delta.text
       : undefined;
@@ -101,6 +103,30 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): string
   return "";
 }
 
+function emitClaudeToolEvent(j: any, parser: HarnessOutputParser): void {
+  if (!parser.onToolEvent) return;
+  if (j.type === "assistant" && Array.isArray(j.message?.content)) {
+    for (const part of j.message.content) {
+      if (part?.type !== "tool_use") continue;
+      parser.onToolEvent({
+        phase: "tool_use",
+        toolName: String(part.name ?? "tool"),
+        command: typeof part.input?.command === "string" ? part.input.command : undefined,
+        description: typeof part.input?.description === "string" ? part.input.description : undefined,
+      });
+    }
+  }
+  if (j.type === "user" && j.tool_use_result) {
+    parser.onToolEvent({
+      phase: "tool_result",
+      toolName: "tool",
+      stdout: typeof j.tool_use_result.stdout === "string" ? j.tool_use_result.stdout : undefined,
+      stderr: typeof j.tool_use_result.stderr === "string" ? j.tool_use_result.stderr : undefined,
+      isError: Boolean(j.tool_use_result.is_error ?? j.tool_use_result.isError),
+    });
+  }
+}
+
 function emitNewSuffix(fullText: string, parser: HarnessOutputParser): string {
   if (!fullText) return "";
   if (fullText.startsWith(parser.emittedText)) {
@@ -134,6 +160,8 @@ export interface UserBoxCapabilityOptions {
   pollMs?: number;
   /** Called every time a real Box command/harness is launched (audit/proof). */
   onExec?: (info: { kind: "command" | "harness"; argv?: string[]; command?: string }) => void;
+  /** Called when the harness' own stream reports a native tool call/result. */
+  onHarnessEvent?: (event: HarnessToolEvent) => void;
 }
 
 /**
@@ -163,7 +191,7 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     const envPrefix = Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}; `).join("");
     const argvStr = spec.argv.map(shq).join(" ");
     const timeoutMs = spec.timeoutMs ?? 240_000;
-    const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout");
+    const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent);
     const effectivePollMs = spec.pollMs ?? pollMs;
     // Launch detached, tee to a log so we can poll for incremental output.
     // The harness process runs in spec.cwd so AGENTS.md / other native rule

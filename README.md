@@ -36,9 +36,11 @@ sequenceDiagram
   which throws if anything tries to call Box's built-in `prompt`/`events` agent.
   The framework only uses `create/get/update/stop/resume/command/readFile/writeFile`.
 - **Real external harnesses.** `UserBoxCapabilities.runHarness({ argv })` launches
-  the developer's real CLI **inside the user Box** (`claude`, `codex`, `opencode`,
-  …) and streams its stdout. Codex and Claude Code are preinstalled in every Box;
-  others are `npm i -g`'d on demand.
+  the developer's real CLI/daemon **inside the user Box** (`claude`, `codex`, `opencode`,
+  Pi, Hermes, or a checked-out codebase daemon) and streams its stdout. Codex and Claude Code are preinstalled in every Box;
+  others are `npm i -g`'d on demand. The trace emits `runtime.proof` with
+  `boxPromptApiUsed=false`, `boxBuiltInAgentUsed=false`, and
+  `hostAsciiAgentUsed=false`.
 - **Real LLM calls.** Harnesses call their provider with the developer's API key,
   injected into the Box env (`providerEnv`). The restricted shared answer is a
   real text-only provider call (`src/providerClient.ts`).
@@ -104,15 +106,29 @@ for await (const ev of orchestrator.stopUserBox("u1", "c1")) {
 
 | Folder | Harness | Status |
 | --- | --- | --- |
-| `examples/claude-sdk` | Claude Code / Claude Agent SDK | verified-real (preinstalled) |
-| `examples/codex-sdk` | OpenAI Codex CLI / SDK | verified-real (preinstalled) |
-| `examples/opencode` | OpenCode (multi-provider) | real (installed on demand) |
-| `examples/pi` | Pi coding-agent | best-effort (flags may need tuning) |
-| `examples/hermes` | Hermes / Nous via OpenCode+OpenRouter | best-effort |
+| `examples/claude-sdk` | Claude Code / Claude Agent SDK | native token streaming via `stream-json` + partial messages |
+| `examples/codebase-daemon` | Checked-out codebase daemon | stdout chunk streaming; token-level if the daemon flushes tokens |
+| `examples/codex-sdk` | OpenAI Codex CLI / SDK | JSON final/delta events where exposed |
+| `examples/opencode` | OpenCode (multi-provider) | JSON text/tool events from `opencode run --format json` |
+| `examples/pi` | Pi coding-agent | supported; strict token streaming requires Pi RPC/AgentSession wiring |
+| `examples/hermes` | Hermes / Nous via OpenCode+OpenRouter | supported; direct Hermes schema still treated as stdout/OpenCode chunks |
 | `examples/openclaude` | OpenClaude | best-effort |
 
-All six use the identical `realCliHarness` contract — that's the point: the
+All listed adapters use the identical `realCliHarness` contract — that's the point: the
 framework treats every harness the same.
+
+
+## Runtime streaming feasibility
+
+The demo exposes this same matrix through `/api/harnesses` and the right-side UI panel.
+
+| Required runtime | Harness | True live stream? | Exact blocker / limitation |
+| --- | --- | --- | --- |
+| Claude SDK / Claude Code | `claude-agent-sdk` | Yes — native token deltas | Uses `claude -p --output-format stream-json --include-partial-messages --verbose`. |
+| Checked-out codebase daemon | `codebase-daemon` | Yes for stdout chunks | Token-level only if the product daemon flushes token chunks; otherwise chunks are whatever the daemon emits. |
+| Pi | `pi` | Possible via RPC / AgentSession | The current simple adapter must be upgraded to Pi RPC stdin/stdout for strict token events; simple JSON CLI can collapse updates. |
+| Hermès / Hermes | `hermes` | Possible as CLI/OpenCode chunks | Direct Hermes token-event schema is not stabilized here; Hermes via OpenCode inherits OpenCode JSON event granularity. |
+| OpenCode | `opencode` | Yes as native JSON text/tool events | `opencode run --format json` emits raw JSON events, but not guaranteed one event per provider token. |
 
 ## Required secrets
 

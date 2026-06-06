@@ -7,12 +7,16 @@ import {
   ConsumerBoxAgentOrchestrator,
   InMemorySessionStore,
   createRestrictedSharedCapabilities,
+  RUNTIME_FEASIBILITY,
   type ConsumerTurnEvent,
 } from "../src/index.js";
 import { providerEnvForBox, providerKey } from "../examples/shared.js";
 import { harness as claude } from "../examples/claude-sdk/adapter.js";
 import { harness as opencode } from "../examples/opencode/adapter.js";
 import { harness as pi } from "../examples/pi/adapter.js";
+import { harness as codex } from "../examples/codex-sdk/adapter.js";
+import { harness as hermes } from "../examples/hermes/adapter.js";
+import { harness as codebaseDaemon } from "../examples/codebase-daemon/adapter.js";
 
 const apiKey = process.env.BOX_API_KEY;
 if (!apiKey)
@@ -23,7 +27,7 @@ if (!apiKey)
 const port = Number(process.env.PORT ?? 4178);
 const box = assertNoBoxAgent(new BoxHttpClient({ apiKey })); // runtime proof: Box's built-in agent is forbidden
 // Prefer Claude/Anthropic when its key is configured; the client still falls back to OpenCode/OpenAI if Anthropic is absent.
-const allHarnesses = [claude, opencode, pi];
+const allHarnesses = [claude, codebaseDaemon, opencode, pi, hermes, codex];
 const orchestrator = new ConsumerBoxAgentOrchestrator({
   box,
   harnesses: allHarnesses,
@@ -84,7 +88,12 @@ function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversat
   const redacted: any = { ...event };
   if (redacted.hidden) redacted.hidden = "[redacted hidden context]";
   if (redacted.recap) redacted.recap = "[redacted recap]";
-  if (Array.isArray(redacted.argv)) redacted.argv = redacted.argv.map((v: unknown, i: number) => i === 2 ? "[redacted prompt]" : String(v).slice(0, 120));
+  if (Array.isArray(redacted.argv)) redacted.argv = redacted.argv.map((v: unknown) => {
+    const text = String(v);
+    return /<consumer-agent-system-instructions>|<consumer-context>|<latest-user-request>/.test(text) || text.length > 300
+      ? "[redacted harness prompt]"
+      : text.slice(0, 120);
+  });
   if (typeof redacted.command === "string" && redacted.command.includes("base64 -d")) redacted.command = "[redacted instruction-file write]";
   if (redacted.text && String(redacted.text).length > 160) redacted.text = String(redacted.text).slice(0, 160) + "…";
   console.log(JSON.stringify({
@@ -117,7 +126,9 @@ const server = http.createServer(async (req, res) => {
           env: {
             ANTHROPIC_API_KEY: keyAvailable("anthropic"),
             OPENAI_API_KEY: keyAvailable("openai"),
+            OPENROUTER_API_KEY: keyAvailable("openrouter"),
           },
+          runtimeFeasibility: RUNTIME_FEASIBILITY,
           boxAgent: "disabled (assertNoBoxAgent guard)",
           pricing: BOX_PRICING,
         }),
@@ -233,7 +244,7 @@ function html() {
 .counters{display:grid;grid-template-columns:1fr 1fr;gap:8px}.counter{border:1px solid #ded8ca;background:#fbfaf7;border-radius:18px;padding:11px 12px;min-width:0}.label{display:block;color:#736b5c;text-transform:uppercase;letter-spacing:.08em;font-size:10px;font-weight:800}.value{display:block;margin-top:3px;font:800 21px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:1px solid #171717;background:#171717;color:#fff;border-radius:999px;padding:10px 13px;font-size:13px;font-weight:750;text-align:center;box-shadow:0 10px 24px rgba(0,0,0,.12)}
 .chat{flex:1;overflow:auto;padding:16px 14px 18px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#7c7468;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;border-radius:20px;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 1px 0 rgba(0,0,0,.04)}.msg.user{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:6px}.msg.assistant{align-self:flex-start;background:#f1efe8;color:#161616;border:1px solid #e2ded3;border-bottom-left-radius:6px}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed #d6cebf;color:#6d6457;border-radius:14px;font-size:12px;max-width:92%;padding:8px 10px}.tag{display:block;margin-bottom:4px;color:#756d60;text-transform:uppercase;letter-spacing:.08em;font-size:9px;font-weight:900}.msg.user .tag{color:#dedede}.msg.trace .tag{color:#8c8375}
 .composer{display:flex;gap:9px;align-items:flex-end;padding:10px 14px calc(12px + env(safe-area-inset-bottom));border-top:1px solid #e6e1d6;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}textarea{flex:1;min-height:46px;max-height:130px;resize:none;border:1px solid #d8d2c5;border-radius:18px;background:#fbfaf7;color:#111;padding:12px 13px;font:inherit;outline:none}textarea:focus{border-color:#111}button{min-height:46px;border:0;border-radius:18px;background:#111;color:#fff;padding:0 16px;font-weight:850;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}
-.schematic{align-self:center;border:1px solid #e1dbcf;background:rgba(255,255,255,.76);backdrop-filter:blur(14px);border-radius:28px;padding:18px;box-shadow:0 24px 80px rgba(25,20,10,.08);color:#191714}.schematic h2{font-size:13px;margin:0 0 14px;text-transform:uppercase;letter-spacing:.1em;color:#6e6659}.route{display:grid;gap:12px}.node{border:1px solid #ddd6c8;background:#fbfaf7;border-radius:20px;padding:13px;transition:.18s ease}.node strong{display:block;font-size:15px}.node span{display:block;margin-top:3px;color:#746c5f;font-size:12px}.node .dot{width:8px;height:8px;border-radius:999px;background:#c8c0b2;display:inline-block;margin-right:7px}.path{height:34px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;color:#8c8374;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.path:before,.path:after{content:"";height:1px;background:#ded7ca}.path span{border:1px solid #ded7ca;background:#fff;border-radius:999px;padding:5px 8px}.hint{margin:14px 0 0;color:#6f675b;font-size:12px;line-height:1.45}.schematic[data-route="shared"] .shared-node,.schematic[data-route="private"] .private-node{border-color:#111;background:#111;color:#fff;box-shadow:0 12px 28px rgba(0,0,0,.14)}.schematic[data-route="shared"] .shared-node span,.schematic[data-route="private"] .private-node span{color:#e9e4dc}.schematic[data-route="shared"] .shared-node .dot,.schematic[data-route="private"] .private-node .dot{background:#70e000;box-shadow:0 0 0 5px rgba(112,224,0,.16)}.schematic[data-route="private"] .to-private span,.schematic[data-route="shared"] .to-shared span{border-color:#111;color:#111;font-weight:850}.schematic[data-route="idle"] .shared-node{border-color:#bdb4a5}.routeStatus{margin-top:12px;border:1px solid #ded7ca;border-radius:16px;padding:10px 12px;background:#fff;font-size:12px;font-weight:800;color:#26231f}
+.schematic{align-self:center;border:1px solid #e1dbcf;background:rgba(255,255,255,.76);backdrop-filter:blur(14px);border-radius:28px;padding:18px;box-shadow:0 24px 80px rgba(25,20,10,.08);color:#191714}.schematic h2{font-size:13px;margin:0 0 14px;text-transform:uppercase;letter-spacing:.1em;color:#6e6659}.route{display:grid;gap:12px}.node{border:1px solid #ddd6c8;background:#fbfaf7;border-radius:20px;padding:13px;transition:.18s ease}.node strong{display:block;font-size:15px}.node span{display:block;margin-top:3px;color:#746c5f;font-size:12px}.node .dot{width:8px;height:8px;border-radius:999px;background:#c8c0b2;display:inline-block;margin-right:7px}.path{height:34px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;color:#8c8374;font-size:11px;text-transform:uppercase;letter-spacing:.08em}.path:before,.path:after{content:"";height:1px;background:#ded7ca}.path span{border:1px solid #ded7ca;background:#fff;border-radius:999px;padding:5px 8px}.hint{margin:14px 0 0;color:#6f675b;font-size:12px;line-height:1.45}.schematic[data-route="shared"] .shared-node,.schematic[data-route="private"] .private-node{border-color:#111;background:#111;color:#fff;box-shadow:0 12px 28px rgba(0,0,0,.14)}.schematic[data-route="shared"] .shared-node span,.schematic[data-route="private"] .private-node span{color:#e9e4dc}.schematic[data-route="shared"] .shared-node .dot,.schematic[data-route="private"] .private-node .dot{background:#70e000;box-shadow:0 0 0 5px rgba(112,224,0,.16)}.schematic[data-route="private"] .to-private span,.schematic[data-route="shared"] .to-shared span{border-color:#111;color:#111;font-weight:850}.schematic[data-route="idle"] .shared-node{border-color:#bdb4a5}.routeStatus{margin-top:12px;border:1px solid #ded7ca;border-radius:16px;padding:10px 12px;background:#fff;font-size:12px;font-weight:800;color:#26231f}.matrix{margin-top:12px;display:grid;gap:7px}.matrixRow{border:1px solid #e0d9cc;background:#fff;border-radius:13px;padding:8px 9px;font-size:11px}.matrixRow strong{display:block;font-size:12px}.matrixRow span{display:block;color:#72695c;margin-top:2px}
 @media(max-width:900px){.shell{display:block;height:100dvh;padding:0}.schematic{display:none}.app{max-width:720px;margin:0 auto}}
 @media(max-width:520px){.app{max-width:none;border:0}.top{padding-left:10px;padding-right:10px}.chat{padding-left:10px;padding-right:10px}.composer{padding-left:10px;padding-right:10px}.counter{border-radius:15px;padding:10px}.value{font-size:18px}.state{font-size:12px;line-height:1.25;border-radius:16px}.msg{max-width:90%;font-size:14px}.label{font-size:9px}button{padding:0 14px}}
 </style></head><body><div class="shell">
@@ -261,11 +272,12 @@ function html() {
     <div class="node private-node"><strong><span class="dot"></span>User machine</strong><span>Private Box with tools + billing</span></div>
   </div>
   <div class="routeStatus" id="routeStatus">Ready: shared infra is listening.</div>
-  <p class="hint">On wide screens this shows the under-the-hood route. On mobile it stays hidden so the demo remains just chat and counters.</p>
+  <div class="matrix" id="matrix"></div>
+  <p class="hint">Matrix reports whether live token/chunk streaming is possible for Claude SDK, codebase daemon, Pi, Hermès, and OpenCode. The chat trace proves continuation is an in-Box runtime, not Box prompt/API or the host agent.</p>
 </aside>
 </div>
 <script>
-let H=[]; let PRICING=null; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser='user-a';
+let H=[]; let MATRIX=[]; let PRICING=null; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser='user-a';
 let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
@@ -277,7 +289,8 @@ function setRoute(route,text){const s=$('schematic');const r=$('routeStatus');if
 function setState(text){$('machineState').textContent=text;setRoute(routeForState(text),text);}
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}
 function renderTotals(){const seconds=activeSeconds();$('totalSeconds').textContent=seconds.toFixed(1)+'s';$('totalCost').textContent=fmtUsd(seconds*billRate);}
-async function load(){const r=await fetch('/api/harnesses');const j=await r.json();H=j.harnesses;PRICING=j.pricing;billRate=PRICING.ratePerSecond;chooseDefaultModel();renderTotals();}
+async function load(){const r=await fetch('/api/harnesses');const j=await r.json();H=j.harnesses;MATRIX=j.runtimeFeasibility||[];PRICING=j.pricing;billRate=PRICING.ratePerSecond;renderMatrix();chooseDefaultModel();renderTotals();}
+function renderMatrix(){const el=$('matrix');if(!el)return;el.innerHTML=MATRIX.map(r=>'<div class="matrixRow"><strong>'+esc(r.runtime)+' · '+esc(r.streaming)+'</strong><span>'+esc(r.blocker||'true live chunks supported')+'</span></div>').join('');}
 function chooseDefaultModel(){const preferred=H.find(h=>h.models.some(m=>m.keyAvailable))||H[0];if(!preferred){setState('No harnesses available');return;}const model=preferred.models.find(m=>m.keyAvailable)||preferred.models[0];selectedHarness=preferred.name;selectedProvider=model.provider;selectedModel=model.model;if(!model.keyAvailable)setState('Waiting for a valid model key · private machine stopped');}
 const bubbles=new Map();
 function addMsg(cls,tag,text,key){const c=$('chat');$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML='<div class="tag">'+esc(tag)+'</div><div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');body.textContent=stripHidden(body.textContent+text);c.scrollTop=c.scrollHeight;return el;}
@@ -315,7 +328,8 @@ function handle(ev,localId){const t=activeTurns.get(localId);if(t&&['handoff.sta
   else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}
-  else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine (stream-json).',keyFor(ev,localId,'exec'));}
+  else if(ev.type==='runtime.proof'){addMsg('trace','proof · no Box prompt/API','boxPromptApiUsed='+ev.boxPromptApiUsed+' · boxBuiltInAgentUsed='+ev.boxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\n',keyFor(ev,localId,'proof'));}
+  else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine; stdout/SSE relays native chunks as emitted.',keyFor(ev,localId,'exec'));}
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');const detail=ev.phase==='tool_use'?((ev.toolName||'tool')+(ev.command?': '+ev.command:'')):(ev.isError?'tool result error':'tool result')+(ev.stdout?': '+ev.stdout.trim():'');addMsg('trace','tool event · user machine',detail+'\\n',keyFor(ev,localId,'tool')+':'+ev.phase+':'+(ev.command||ev.stdout||Math.random()));}
   else if(ev.type==='user-box.delta'){addMsg('assistant','assistant · user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);}

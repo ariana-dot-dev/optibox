@@ -10,6 +10,7 @@ import {
   type MachineState,
 } from "./context.js";
 import { ExtractiveRecapper } from "./recap.js";
+import { RUNTIME_FEASIBILITY } from "./runtimeMatrix.js";
 import { InMemorySessionStore } from "./store.js";
 import type {
   BoxInfo,
@@ -56,6 +57,19 @@ export type ConsumerTurnEventBody =
       boxId: string;
       harness: string;
       model: string;
+    }
+  | {
+      type: "runtime.proof";
+      boxId: string;
+      harness: string;
+      model: string;
+      boxPromptApiUsed: false;
+      boxBuiltInAgentUsed: false;
+      hostAsciiAgentUsed: false;
+      continuation: "in-box-runtime-harness";
+      proofPath?: string;
+      streaming?: string;
+      blocker?: string | null;
     }
   | {
       type: "exec";
@@ -519,6 +533,20 @@ export class ConsumerBoxAgentOrchestrator {
       recap,
       harness: harness.name,
       model: input.selection.model,
+    };
+    const runtimeProof = RUNTIME_FEASIBILITY.find((r) => r.harnessName === harness.name);
+    yield {
+      type: "runtime.proof",
+      boxId: box.id,
+      harness: harness.name,
+      model: input.selection.model,
+      boxPromptApiUsed: false,
+      boxBuiltInAgentUsed: false,
+      hostAsciiAgentUsed: false,
+      continuation: "in-box-runtime-harness",
+      ...(runtimeProof?.proofPath ? { proofPath: runtimeProof.proofPath } : {}),
+      ...(runtimeProof?.streaming ? { streaming: runtimeProof.streaming } : {}),
+      ...(runtimeProof ? { blocker: runtimeProof.blocker } : {}),
     };
     transcript.push({
       role: "system",

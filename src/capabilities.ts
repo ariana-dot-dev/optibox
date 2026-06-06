@@ -80,11 +80,19 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): string
   }
 
   if (parser.mode === "opencode-json" || parser.mode === "pi-json") {
+    emitGenericToolEvent(j, parser);
     const ev = j.assistantMessageEvent;
     if (j.type === "message_update" && ev?.type === "text_delta" && typeof ev.delta === "string") {
       parser.emittedText += ev.delta;
       return ev.delta;
     }
+    // OpenCode's documented JSON mode emits raw JSON events such as `text` and
+    // `tool_use`; Pi RPC/JSON variants commonly emit message_update deltas.
+    const directText = j.type === "text" && typeof j.text === "string" ? j.text
+      : j.type === "text" && typeof j.part?.text === "string" ? j.part.text
+      : typeof j.delta === "string" ? j.delta
+      : "";
+    if (directText) return emitNewSuffix(parser.emittedText + directText, parser);
     const full = j.type === "message_end" && extractAssistantMessageText(j.message);
     return emitNewSuffix(String(full || ""), parser);
   }
@@ -123,6 +131,23 @@ function emitClaudeToolEvent(j: any, parser: HarnessOutputParser): void {
       stdout: typeof j.tool_use_result.stdout === "string" ? j.tool_use_result.stdout : undefined,
       stderr: typeof j.tool_use_result.stderr === "string" ? j.tool_use_result.stderr : undefined,
       isError: Boolean(j.tool_use_result.is_error ?? j.tool_use_result.isError),
+    });
+  }
+}
+
+
+function emitGenericToolEvent(j: any, parser: HarnessOutputParser): void {
+  if (!parser.onToolEvent) return;
+  if (j.type === "tool_use") {
+    const part = j.part ?? j;
+    parser.onToolEvent({
+      phase: "tool_use",
+      toolName: String(part.tool ?? j.tool ?? "tool"),
+      command: typeof part.state?.input?.command === "string" ? part.state.input.command
+        : typeof part.input?.command === "string" ? part.input.command
+        : undefined,
+      description: typeof part.state?.title === "string" ? part.state.title : undefined,
+      stdout: typeof part.state?.output === "string" ? part.state.output : undefined,
     });
   }
 }

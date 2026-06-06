@@ -418,3 +418,43 @@ test("interactive proof UI has no global message queue and can abort stale share
   assert.doesNotMatch(html, /queued #/);
   assert.doesNotMatch(html, /const queue=\[\]/);
 });
+
+test("runtime proof event states continuation is in-box harness, not Box prompt/API or host agent", async () => {
+  const box = new FakeBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("opencode")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "say hi", selection: { harness: "opencode", provider: "anthropic", model: "m-1" } })) events.push(e);
+  const proof = events.find((e) => e.type === "runtime.proof");
+  assert.ok(proof, "runtime proof is emitted before in-Box deltas");
+  assert.equal(proof.boxPromptApiUsed, false);
+  assert.equal(proof.boxBuiltInAgentUsed, false);
+  assert.equal(proof.hostAsciiAgentUsed, false);
+  assert.equal(proof.continuation, "in-box-runtime-harness");
+  assert.equal(proof.streaming, "native-json-events");
+  assert.ok(events.some((e) => e.type === "exec" && e.kind === "command"), "continuation uses Box command substrate");
+  assert.ok(!box.commands.some((cmd) => /\/prompt\b|ascii agent|ascii task|claude-code.*host/i.test(cmd)), "no Box prompt endpoint or host agent command is used");
+});
+
+test("runtime feasibility matrix covers required harnesses", async () => {
+  const { RUNTIME_FEASIBILITY } = await import("../src/runtimeMatrix.js");
+  for (const harness of ["claude-agent-sdk", "codebase-daemon", "pi", "hermes", "opencode"]) {
+    const row = RUNTIME_FEASIBILITY.find((r) => r.harnessName === harness);
+    assert.ok(row, `${harness} is in the feasibility matrix`);
+    assert.equal(row.supported, true);
+    assert.ok(row.proofPath);
+  }
+});
+
+test("OpenCode JSON parser streams documented text events and tool events", async () => {
+  const snapshots = [
+    `${JSON.stringify({ type: "text", text: "Hel" })}\n`,
+    `${JSON.stringify({ type: "text", text: "Hel" })}\n${JSON.stringify({ type: "tool_use", part: { tool: "bash", state: { title: "Run nproc", input: { command: "nproc" }, output: "4" } } })}\n${JSON.stringify({ type: "text", text: "lo" })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const toolEvents: any[] = [];
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (event) => toolEvents.push(event) });
+  const chunks: string[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["opencode", "run", "--format", "json", "hi"], outputMode: "opencode-json", pollMs: 1 })) chunks.push(chunk);
+  assert.deepEqual(chunks, ["Hel", "lo"]);
+  assert.ok(toolEvents.some((e) => e.toolName === "bash" && e.command === "nproc"));
+});

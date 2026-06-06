@@ -40,6 +40,7 @@ export interface CommandResult {
  */
 export interface BoxClient {
   create(input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo>;
+  list?(): Promise<BoxInfo[]>;
   get(boxId: string): Promise<BoxInfo>;
   update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo>;
   stop(boxId: string): Promise<BoxInfo | { ok: boolean }>;

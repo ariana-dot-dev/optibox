@@ -26,6 +26,7 @@ class FakeBoxClient implements BoxClient {
     this.boxes.set(id, box);
     return box;
   }
+  async list(): Promise<BoxInfo[]> { return [...this.boxes.values()]; }
   async get(boxId: string): Promise<BoxInfo> { return this.boxes.get(boxId) ?? { id: boxId, state: "error" }; }
   async update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
     const updated: BoxInfo = { ...(await this.get(boxId)) };
@@ -210,6 +211,21 @@ test("userBoxStatus reports precise, non-mutating state", async () => {
   assert.equal((await orchestrator.userBoxStatus("u", "c")).kind, "archived");
   await orchestrator.stopIdleUserBox("u", "c");
   assert.equal((await orchestrator.userBoxStatus("u", "c")).kind, "archived");
+});
+
+test("tool turn adopts an existing named warm user Box before creating another", async () => {
+  const box = new FakeBoxClient();
+  box.boxes.set("box-existing", {
+    id: "box-existing",
+    name: "consumer-agent-user-u",
+    state: "idle",
+    archiveAfter: new Date(Date.now() + 60_000).toISOString(),
+  } as any);
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's ur ip", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) events.push(e);
+  assert.equal(events.find((e) => e.type === "turn.done")?.boxId, "box-existing");
+  assert.equal([...box.boxes.values()].filter((b) => b.name === "consumer-agent-user-u").length, 1, "no duplicate user box created");
 });
 
 test("resume path bridges as 'resuming' and reuses the same box", async () => {

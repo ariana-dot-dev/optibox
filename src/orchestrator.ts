@@ -271,7 +271,39 @@ export class ConsumerBoxAgentOrchestrator {
         // error state -> fall through and provision a fresh box
       }
     }
+    const adopted = await this.findReusableNamedUserBox(userId, conversationId);
+    if (adopted) return adopted;
     return this.createFreshUserBox(userId, conversationId);
+  }
+
+  private async findReusableNamedUserBox(
+    userId: string,
+    conversationId: string,
+  ): Promise<BoxInfo | undefined> {
+    if (!this.options.box.list) return undefined;
+    const expectedName =
+      this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`;
+    const boxes = await this.options.box.list().catch(() => []);
+    const reusable = boxes
+      .filter((box) => box.name === expectedName && isReady(box.state))
+      .sort((a, b) => {
+        const au = Date.parse(String((a as any).updatedAt ?? ""));
+        const bu = Date.parse(String((b as any).updatedAt ?? ""));
+        return (Number.isFinite(bu) ? bu : 0) - (Number.isFinite(au) ? au : 0);
+      })[0];
+    if (!reusable) return undefined;
+    await this.sessions.put({
+      userId,
+      conversationId,
+      boxId: reusable.id,
+      lastSeenAt: Date.now(),
+    });
+    const box = await this.waitUntilReady(reusable.id, "adopt-existing");
+    return this.options.userBoxTtlSeconds === null
+      ? box
+      : this.options.box.update(box.id, {
+          ttlSeconds: this.options.userBoxTtlSeconds ?? 3600,
+        });
   }
 
   private async createFreshUserBox(

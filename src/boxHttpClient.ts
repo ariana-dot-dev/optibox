@@ -60,6 +60,11 @@ export class BoxHttpClient implements BoxClient {
     return json.box;
   }
 
+  async list(): Promise<BoxInfo[]> {
+    const json = await this.request<{ boxes?: BoxInfo[] }>("/boxes");
+    return json.boxes ?? [];
+  }
+
   async get(boxId: string): Promise<BoxInfo> {
     return (await this.request<{ box: BoxInfo }>(`/boxes/${encodeURIComponent(boxId)}`)).box;
   }

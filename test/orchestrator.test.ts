@@ -130,6 +130,7 @@ test("tool turns resume the Box and auto-stop after answering", async () => {
   assert.ok(boxId);
   assert.ok(first.some((e) => e.type === "handoff.started"), "first tool turn bridges into the Box");
   assert.ok(first.some((e) => e.type === "user-box.delta"), "first tool turn is answered by the Box");
+  assert.ok(!first.some((e) => e.type === "shared.delta"), "tool turn has no shared-model answer");
   assert.ok(first.some((e) => e.type === "billing.stop"), "first turn auto-stops billing");
   assert.equal((await box.get(boxId)).state, "archived", "Box is archived after the turn finishes");
 

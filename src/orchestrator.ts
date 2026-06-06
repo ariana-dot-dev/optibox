@@ -582,20 +582,26 @@ export class ConsumerBoxAgentOrchestrator {
     );
 
     let sharedText = "";
-    for await (const text of harness.shared({
-      userId: input.userId,
-      conversationId: input.conversationId,
-      message: input.message,
-      transcript,
-      selection: input.selection,
-      capabilities: createRestrictedSharedCapabilities(),
-      hiddenContext: sharedHidden,
-      machine: sharedMachine,
-      toolIntent,
-    })) {
-      const chunk = String(text ?? "");
-      sharedText += chunk;
-      yield { type: "shared.delta", text: chunk, harness: harness.name };
+    // Tool turns must not be answered by the restricted shared model. It has no
+    // machine access and even a well-prompted "holding" LLM can drift into
+    // answering from transcript/context. For tool work, emit only lifecycle
+    // state and wait for the real user-box harness.
+    if (!toolIntent) {
+      for await (const text of harness.shared({
+        userId: input.userId,
+        conversationId: input.conversationId,
+        message: input.message,
+        transcript,
+        selection: input.selection,
+        capabilities: createRestrictedSharedCapabilities(),
+        hiddenContext: sharedHidden,
+        machine: sharedMachine,
+        toolIntent,
+      })) {
+        const chunk = String(text ?? "");
+        sharedText += chunk;
+        yield { type: "shared.delta", text: chunk, harness: harness.name };
+      }
     }
     if (sharedText)
       transcript.push({

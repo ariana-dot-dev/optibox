@@ -10,29 +10,28 @@ import {
   RUNTIME_FEASIBILITY,
   type ConsumerTurnEvent,
 } from "../src/index.js";
-import { providerEnvForBox, providerKey } from "../examples/shared.js";
 import { harness as claude } from "../examples/claude-sdk/adapter.js";
-import { harness as opencode } from "../examples/opencode/adapter.js";
-import { harness as pi } from "../examples/pi/adapter.js";
-import { harness as codex } from "../examples/codex-sdk/adapter.js";
-import { harness as hermes } from "../examples/hermes/adapter.js";
-import { harness as codebaseDaemon } from "../examples/codebase-daemon/adapter.js";
 
 const apiKey = process.env.BOX_API_KEY;
 if (!apiKey)
   throw new Error(
     "BOX_API_KEY is required; this server refuses to run without the real Box credential.",
   );
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+if (!anthropicApiKey)
+  throw new Error(
+    "ANTHROPIC_API_KEY is required; demo backend proof is Claude-only and will not substitute OpenAI/Codex/GPT providers.",
+  );
 
 const port = Number(process.env.PORT ?? 4178);
 const box = assertNoBoxAgent(new BoxHttpClient({ apiKey })); // runtime proof: Box's built-in agent is forbidden
-// Prefer Claude/Anthropic when its key is configured; the client still falls back to OpenCode/OpenAI if Anthropic is absent.
-const allHarnesses = [claude, codebaseDaemon, opencode, pi, hermes, codex];
+// Demo proof is Claude-only: Sonnet/Haiku via Anthropic, never Opus by default, never OpenAI/Codex/GPT fallback.
+const allHarnesses = [claude];
 const orchestrator = new ConsumerBoxAgentOrchestrator({
   box,
   harnesses: allHarnesses,
   sessions: new InMemorySessionStore(),
-  providerEnv: providerEnvForBox(),
+  providerEnv: { ANTHROPIC_API_KEY: anthropicApiKey },
   sharedBoxName: "consumer-agent-shared-prewarm",
   userBoxName: (userId) => `consumer-agent-user-${userId}`,
   userBoxTtlSeconds: 900,
@@ -43,7 +42,7 @@ const orchestrator = new ConsumerBoxAgentOrchestrator({
 });
 
 function keyAvailable(provider: string): boolean {
-  return Boolean(providerKey(provider));
+  return provider === "anthropic" && Boolean(anthropicApiKey);
 }
 
 function harnessInfo() {
@@ -126,10 +125,8 @@ const server = http.createServer(async (req, res) => {
           harnesses: harnessInfo(),
           env: {
             ANTHROPIC_API_KEY: keyAvailable("anthropic"),
-            OPENAI_API_KEY: keyAvailable("openai"),
-            OPENROUTER_API_KEY: keyAvailable("openrouter"),
           },
-          runtimeFeasibility: RUNTIME_FEASIBILITY,
+          runtimeFeasibility: RUNTIME_FEASIBILITY.filter((r) => r.harnessName === claude.name),
           boxAgent: "disabled (assertNoBoxAgent guard)",
           pricing: BOX_PRICING,
         }),

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { test } from "node:test";
 import {
   ConsumerBoxAgentOrchestrator,
@@ -617,6 +618,30 @@ test("runtime proof event states continuation is in-box harness, not Box prompt/
   assert.ok(!box.commands.some((cmd) => /\/prompt\b|ascii agent|ascii task|claude-code.*host/i.test(cmd)), "no Box prompt endpoint or host agent command is used");
 });
 
+
+test("codebase daemon example is executable and self-contained", async () => {
+  const child = spawn(process.execPath, [
+    "dist/examples/codebase-daemon/agentDaemon.js",
+    "--stream",
+    "--provider",
+    "anthropic",
+    "--model",
+    "claude-sonnet-4-6",
+    "--cwd",
+    "/tmp",
+    "--system-prompt-file",
+    "/tmp/CONSUMER_AGENT_SYSTEM.md",
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+  child.stdin.end("<latest-user-request>Check my CPU count.</latest-user-request>");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+  assert.equal(code, 0, stderr);
+  assert.match(stdout, /Example codebase daemon observed \d+ CPU cores/);
+  assert.match(stdout, /Runtime selection: anthropic\/claude-sonnet-4-6/);
+});
 test("runtime feasibility matrix covers required harnesses", async () => {
   const { RUNTIME_FEASIBILITY } = await import("../src/runtimeMatrix.js");
   for (const harness of ["claude-agent-sdk", "codebase-daemon", "pi", "hermes", "opencode"]) {

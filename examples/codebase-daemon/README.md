@@ -1,12 +1,36 @@
 # Codebase daemon adapter
 
-This is the minimal custom-harness example for a product-owned daemon that is already checked out inside the user's Box.
+This is the self-contained custom-harness example.
 
-The adapter does **not** implement an agent. It only locates your daemon and starts it inside the private Box. Your daemon owns the LLM loop, tool use, and stdout streaming.
+In this example, **daemon** means a product-owned, non-interactive agent process that Optibox starts for each private-Box turn. It is not a server and it is not Box's built-in agent. It is just your code: read a turn prompt from stdin, use whatever model/tool loop your product owns, and stream user-visible text to stdout.
 
-## Box layout
+The example includes that missing daemon code in `agentDaemon.ts`. The adapter copies the compiled daemon into the user Box by default, so the example is executable without a separate product repo.
 
-Set `CODEBASE_DAEMON_DIR` in the env passed to `ConsumerBoxAgentOrchestrator.providerEnv`, or put the checkout at `/home/user/codebase`:
+## Included daemon
+
+`agentDaemon.ts` is intentionally small and dependency-free. It demonstrates the contract by:
+
+- reading the full Optibox prompt from stdin
+- accepting `--stream`, `--provider`, `--model`, `--cwd`, and `--system-prompt-file`
+- reading host instructions from `--system-prompt-file` / `AGENTS.md`
+- answering a couple of simple runtime requests, such as CPU count or current workspace
+- flushing stdout in chunks
+
+Run it locally after `npm run build`:
+
+```bash
+printf '<latest-user-request>Check my CPU count.</latest-user-request>' | \
+  node dist/examples/codebase-daemon/agentDaemon.js \
+    --stream \
+    --provider anthropic \
+    --model claude-sonnet-4-6 \
+    --cwd /tmp \
+    --system-prompt-file /tmp/CONSUMER_AGENT_SYSTEM.md
+```
+
+## Replacing it with your product daemon
+
+For a real product, replace the sample daemon with your own checked-out code by setting `CODEBASE_DAEMON_DIR` in the env passed to `ConsumerBoxAgentOrchestrator.providerEnv`:
 
 ```ts
 const orchestrator = new ConsumerBoxAgentOrchestrator({
@@ -19,14 +43,12 @@ const orchestrator = new ConsumerBoxAgentOrchestrator({
 });
 ```
 
-The checkout must provide one of:
+That checkout must provide one of:
 
 - `./bin/agent-daemon`
 - `package.json` with an `agent:daemon` npm script
 
-## Daemon contract
-
-Optibox starts the daemon from a per-turn instruction workspace containing `AGENTS.md` and passes the same workspace explicitly:
+Optibox invokes it like this:
 
 ```bash
 printf '%s' "$OPTIBOX_PROMPT" | ./bin/agent-daemon \
@@ -37,12 +59,4 @@ printf '%s' "$OPTIBOX_PROMPT" | ./bin/agent-daemon \
   --system-prompt-file "$OPTIBOX_CWD/CONSUMER_AGENT_SYSTEM.md"
 ```
 
-Your daemon should:
-
-- read the full turn prompt from stdin
-- read host control instructions from `--system-prompt-file` or `$OPTIBOX_CWD/AGENTS.md`
-- use provider keys from the process environment
-- flush user-visible assistant text to stdout as it becomes available
-- write diagnostics to stderr
-
-That is all the adapter assumes.
+Your daemon owns the real LLM loop and tool behavior. Optibox only handles shared/private routing, hidden context, Box lifecycle, env injection, and stdout streaming.

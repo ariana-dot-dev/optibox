@@ -44,10 +44,60 @@ interface HarnessOutputParser {
   activeMessageIndex: number;
   emittedByMessage: Map<string, string>;
   onToolEvent?: (event: HarnessToolEvent) => void;
+  onSessionId?: (sessionId: string) => void;
+  sessionIdEmitted: boolean;
 }
 
-function createHarnessOutputParser(mode: HarnessOutputMode, onToolEvent?: (event: HarnessToolEvent) => void): HarnessOutputParser {
-  return { mode, lineBuffer: "", emittedText: "", activeMessageIndex: 0, emittedByMessage: new Map(), ...(onToolEvent ? { onToolEvent } : {}) };
+function createHarnessOutputParser(
+  mode: HarnessOutputMode,
+  onToolEvent?: (event: HarnessToolEvent) => void,
+  onSessionId?: (sessionId: string) => void,
+): HarnessOutputParser {
+  return {
+    mode,
+    lineBuffer: "",
+    emittedText: "",
+    activeMessageIndex: 0,
+    emittedByMessage: new Map(),
+    sessionIdEmitted: false,
+    ...(onToolEvent ? { onToolEvent } : {}),
+    ...(onSessionId ? { onSessionId } : {}),
+  };
+}
+
+/**
+ * Best-effort extraction of the native session/thread id from a harness JSON
+ * event, per the proven per-CLI shapes (docs/harness-interrupt-resume-evidence.md):
+ *   - claude-stream-json: `session_id` on the `system`/`result` events
+ *   - codex-json: `{"type":"thread.started","thread_id":"…"}`
+ *   - opencode-json: `sessionID` (e.g. `ses_…`) on message info/parts
+ *   - pi-json: the first header line `{"type":"session","id":"…"}`
+ */
+function extractSessionId(j: any, mode: HarnessOutputMode): string | undefined {
+  const pick = (...vals: unknown[]): string | undefined => {
+    for (const v of vals) if (typeof v === "string" && v) return v;
+    return undefined;
+  };
+  if (mode === "claude-stream-json") return pick(j.session_id, j.sessionId, j.message?.session_id);
+  if (mode === "codex-json") {
+    if (j.type === "thread.started") return pick(j.thread_id, j.threadId);
+    return pick(j.thread_id, j.session_id, j.session?.id);
+  }
+  if (mode === "opencode-json") return pick(j.sessionID, j.info?.sessionID, j.part?.sessionID, j.properties?.sessionID, j.message?.sessionID);
+  if (mode === "pi-json") {
+    if (j.type === "session") return pick(j.id, j.session?.id);
+    return pick(j.sessionId, j.session?.id);
+  }
+  return undefined;
+}
+
+function noteSessionId(j: any, parser: HarnessOutputParser): void {
+  if (parser.sessionIdEmitted || !parser.onSessionId) return;
+  const id = extractSessionId(j, parser.mode);
+  if (id) {
+    parser.sessionIdEmitted = true;
+    parser.onSessionId(id);
+  }
 }
 
 function* parseHarnessOutput(rawDelta: string, parser: HarnessOutputParser): Iterable<HarnessTextChunk> {
@@ -69,6 +119,8 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): Harnes
   if (!trimmed.startsWith("{")) return undefined;
   let j: any;
   try { j = JSON.parse(trimmed); } catch { return undefined; }
+
+  noteSessionId(j, parser);
 
   if (parser.mode === "claude-stream-json") {
     emitClaudeToolEvent(j, parser);
@@ -258,7 +310,7 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     const envPrefix = Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}; `).join("");
     const argvStr = spec.argv.map(shq).join(" ");
     const timeoutMs = spec.timeoutMs ?? 240_000;
-    const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent);
+    const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent, spec.onSessionId);
     const effectivePollMs = spec.pollMs ?? pollMs;
     // Launch detached, tee to a log so we can poll for incremental output.
     // The harness process runs in spec.cwd so AGENTS.md / other native rule
@@ -267,10 +319,25 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     const launched = await box.command(boxId, { command: launch, timeoutMs: 30_000 });
     const pid = launched.stdout.trim().split(/\s+/).pop() ?? "";
 
+    // Interrupt == "agent stops talking": SIGINT then SIGKILL the captured PID
+    // inside the Box. The harness' session file is already flushed for completed
+    // turns, so the conversation remains resumable by id on the next message.
+    const interruptInBox = async (): Promise<void> => {
+      if (!pid) return;
+      await box.command(boxId, { command: `kill -INT ${pid} 2>/dev/null; sleep 0.2; kill -KILL ${pid} 2>/dev/null; true`, timeoutMs: 15_000 }).catch(() => undefined);
+    };
+    if (spec.signal?.aborted) { await interruptInBox(); return; }
+    let aborted = false;
+    const onAbort = () => { aborted = true; void interruptInBox(); };
+    spec.signal?.addEventListener("abort", onAbort, { once: true });
+
     const started = Date.now();
     let offset = 0;
+    try {
     while (Date.now() - started < timeoutMs) {
+      if (aborted) return;
       await new Promise((r) => setTimeout(r, effectivePollMs));
+      if (aborted) return;
       let content = "";
       try {
         content = (await box.command(boxId, { command: `cat ${shq(log)} 2>/dev/null || true`, timeoutMs: 15_000 })).stdout;
@@ -296,7 +363,11 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
         if (alive === "down") { if (visible.length > offset) yield { text: visible.slice(offset), messageId: "stdout-0", messageIndex: 0 }; return; }
       }
     }
+    if (aborted) return;
     yield { text: `\n[runHarness timed out after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 };
+    } finally {
+      spec.signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   return {
@@ -357,13 +428,24 @@ export function createSharedInfraCapabilities(options: SharedInfraCapabilityOpti
 
   async function* runHarness(spec: HarnessRunSpec): AsyncIterable<HarnessTextChunk> {
     options.onExec?.({ kind: "harness", argv: spec.argv });
-    const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent);
+    const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent, spec.onSessionId);
     const bin = spec.argv[0] ?? "";
     const args = spec.argv.slice(1);
     const child = spawnFn(bin, args, { cwd: spec.cwd, env: baseEnv(spec.env), stdio: ["ignore", "pipe", "pipe"] });
     const timeoutMs = spec.timeoutMs ?? 240_000;
     let timedOut = false;
+    let aborted = false;
     const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    // Interrupt == "agent stops talking": SIGINT for a graceful stop, then a hard
+    // SIGKILL if it lingers. Completed turns are already flushed to the harness'
+    // session file, so the conversation stays resumable by id next turn.
+    const onAbort = () => {
+      aborted = true;
+      try { child.kill("SIGINT"); } catch { /* already gone */ }
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } }, 2000);
+    };
+    if (spec.signal?.aborted) onAbort();
+    else spec.signal?.addEventListener("abort", onAbort, { once: true });
     child.stderr?.on("data", () => { /* surfaced via exit if non-zero; harness owns its own error text */ });
     try {
       if (child.stdout) {
@@ -379,9 +461,10 @@ export function createSharedInfraCapabilities(options: SharedInfraCapabilityOpti
       }
     } finally {
       clearTimeout(timer);
+      spec.signal?.removeEventListener("abort", onAbort);
     }
     await new Promise<void>((resolve) => { child.on("close", () => resolve()); if (child.exitCode !== null) resolve(); });
-    if (timedOut) yield { text: `\n[shared harness timed out after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 };
+    if (timedOut && !aborted) yield { text: `\n[shared harness timed out after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 };
   }
 
   async function writeFile(path: string, content: string): Promise<void> {

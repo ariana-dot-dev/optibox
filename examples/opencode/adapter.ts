@@ -15,7 +15,15 @@ export const spec: RealCliHarnessSpec = {
     { provider: "anthropic", model: "claude-haiku-4-5-20251001", label: "OpenCode · Haiku 4.5" },
   ],
   outputMode: "opencode-json",
-  buildArgv: ({ prompt, model, provider }) => ["opencode", "run", "--format", "json", "--model", `${provider}/${model}`, prompt],
+  // OpenCode emits `"sessionID":"ses_…"` on turn 1; we capture it and continue the
+  // SAME session with `-s <sessionID>` (verified, opencode 1.16.2 —
+  // docs/harness-interrupt-resume-evidence.md).
+  sessionStrategy: "capture",
+  buildArgv: ({ prompt, model, provider, resumeSessionId }) => [
+    "opencode", "run", "--format", "json",
+    ...(resumeSessionId ? ["-s", resumeSessionId] : []),
+    "--model", `${provider}/${model}`, prompt,
+  ],
   // Structural no-tool mode (shared infra): OpenCode's permission system is
   // framework-enforced. We inject an inline config via OPENCODE_CONFIG_CONTENT
   // that denies every tool (`permission: { "*": "deny" }`), so the agent cannot

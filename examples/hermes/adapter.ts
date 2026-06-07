@@ -14,7 +14,13 @@ export const spec: RealCliHarnessSpec = {
     { provider: "openrouter", model: "nousresearch/hermes-4-70b", label: "Hermes 4 70B" },
   ],
   outputMode: "opencode-json",
-  buildArgv: ({ prompt, model }) => ["opencode", "run", "--format", "json", "--model", `openrouter/${model}`, prompt],
+  // Same OpenCode session model: capture `sessionID` on turn 1, resume with `-s`.
+  sessionStrategy: "capture",
+  buildArgv: ({ prompt, model, resumeSessionId }) => [
+    "opencode", "run", "--format", "json",
+    ...(resumeSessionId ? ["-s", resumeSessionId] : []),
+    "--model", `openrouter/${model}`, prompt,
+  ],
   // Hermes runs through OpenCode, so it inherits OpenCode's structural no-tool
   // mode: an inline OPENCODE_CONFIG_CONTENT permission map that denies all tools.
   buildEnv: ({ toolsAllowed }) => opencodeNoToolEnv(toolsAllowed),

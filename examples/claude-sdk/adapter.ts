@@ -13,12 +13,17 @@ export const spec: RealCliHarnessSpec = {
     { provider: "anthropic", model: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
   ],
   outputMode: "claude-stream-json",
+  // Claude Code assigns a session id up front (`--session-id <uuid>`) and resumes
+  // the SAME conversation with `-r <uuid>` (verified, Claude Code 2.1.145 —
+  // docs/harness-interrupt-resume-evidence.md).
+  sessionStrategy: "assign",
   // Structural no-tool mode (shared infra): `--tools ""` makes Claude Code
   // register ZERO built-in tools. Verified against Claude Code 2.1.145: the
   // stream-json `init` event then reports `"tools":[]`. With tools the Box run
   // uses --dangerously-skip-permissions so the native tools execute.
-  buildArgv: ({ prompt, model, systemInstructionPath, toolsAllowed }) => [
+  buildArgv: ({ prompt, model, systemInstructionPath, toolsAllowed, sessionId, resumeSessionId }) => [
     "claude", "-p", prompt,
+    ...(resumeSessionId ? ["-r", resumeSessionId] : sessionId ? ["--session-id", sessionId] : []),
     "--model", model,
     "--append-system-prompt-file", systemInstructionPath,
     ...(toolsAllowed ? ["--dangerously-skip-permissions"] : ["--tools", ""]),

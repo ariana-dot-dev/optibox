@@ -124,6 +124,19 @@ export type UserBoxStatus =
   | { kind: "archived"; boxId: string; box: BoxInfo }
   | { kind: "error"; boxId: string; box: BoxInfo };
 
+type UserBoxBootAction =
+  | "already-ready"
+  | "create-requested"
+  | "resume-requested"
+  | "existing-boot"
+  | "adopt-ready"
+  | "adopt-resume-requested";
+
+interface UserBoxBootAck {
+  action: UserBoxBootAction;
+  box: BoxInfo;
+}
+
 export class ConsumerBoxAgentOrchestrator {
   private readonly sessions;
   private readonly recapper;
@@ -229,11 +242,12 @@ export class ConsumerBoxAgentOrchestrator {
   async ensureUserBox(
     userId: string,
     conversationId: string,
+    onBootAck?: (ack: UserBoxBootAck) => void,
   ): Promise<BoxInfo> {
     const key = `${userId}:${conversationId}`;
     const inFlight = this.userBoxStarts.get(key);
     if (inFlight) return inFlight;
-    const started = this.ensureUserBoxUncached(userId, conversationId);
+    const started = this.ensureUserBoxUncached(userId, conversationId, onBootAck);
     this.userBoxStarts.set(key, started);
     try {
       return await this.withTimeout(
@@ -250,6 +264,7 @@ export class ConsumerBoxAgentOrchestrator {
   private async ensureUserBoxUncached(
     userId: string,
     conversationId: string,
+    onBootAck?: (ack: UserBoxBootAck) => void,
   ): Promise<BoxInfo> {
     const existing = await this.sessions.get(userId, conversationId);
     if (existing?.boxId) {
@@ -262,6 +277,7 @@ export class ConsumerBoxAgentOrchestrator {
         if (box.state === "archiving") {
           await this.waitUntilArchived(existing.boxId, "archive-before-resume");
           await this.options.box.resume(existing.boxId);
+          onBootAck?.({ action: "resume-requested", box: await this.options.box.get(existing.boxId).catch(() => box) });
           return this.waitUntilReady(
             existing.boxId,
             "resume",
@@ -270,6 +286,7 @@ export class ConsumerBoxAgentOrchestrator {
         }
         if (box.state === "archived") {
           await this.options.box.resume(existing.boxId);
+          onBootAck?.({ action: "resume-requested", box: await this.options.box.get(existing.boxId).catch(() => box) });
           try {
             return await this.waitUntilReady(
               existing.boxId,
@@ -277,30 +294,35 @@ export class ConsumerBoxAgentOrchestrator {
               this.options.resumeTimeoutMs,
             );
           } catch {
-            return this.createFreshUserBox(userId, conversationId);
+            return this.createFreshUserBox(userId, conversationId, onBootAck);
           }
         }
-        if (isReady(box.state)) return box;
+        if (isReady(box.state)) {
+          onBootAck?.({ action: "already-ready", box });
+          return box;
+        }
         if (box.state !== "error") {
+          onBootAck?.({ action: "existing-boot", box });
           try {
             return await this.waitUntilReady(existing.boxId, "existing");
           } catch {
             await this.clearSession(userId, conversationId);
-            return this.createFreshUserBox(userId, conversationId);
+            return this.createFreshUserBox(userId, conversationId, onBootAck);
           }
         }
         await this.clearSession(userId, conversationId);
         // error state -> fall through and provision a fresh box
       }
     }
-    const adopted = await this.findReusableNamedUserBox(userId, conversationId);
+    const adopted = await this.findReusableNamedUserBox(userId, conversationId, onBootAck);
     if (adopted) return adopted;
-    return this.createFreshUserBox(userId, conversationId);
+    return this.createFreshUserBox(userId, conversationId, onBootAck);
   }
 
   private async findReusableNamedUserBox(
     userId: string,
     conversationId: string,
+    onBootAck?: (ack: UserBoxBootAck) => void,
   ): Promise<BoxInfo | undefined> {
     if (!this.options.box.list) return undefined;
     const expectedName =
@@ -333,12 +355,14 @@ export class ConsumerBoxAgentOrchestrator {
     if (box.state === "archived") {
       try {
         await this.options.box.resume(box.id);
+        onBootAck?.({ action: "adopt-resume-requested", box: await this.options.box.get(box.id).catch(() => box) });
         box = await this.waitUntilReady(box.id, "adopt-archived", this.options.resumeTimeoutMs);
       } catch {
         await this.clearSession(userId, conversationId);
         return undefined;
       }
     } else {
+      onBootAck?.({ action: "adopt-ready", box });
       box = await this.waitUntilReady(reusable.id, "adopt-existing");
     }
     return this.options.userBoxTtlSeconds === null
@@ -351,12 +375,14 @@ export class ConsumerBoxAgentOrchestrator {
   private async createFreshUserBox(
     userId: string,
     conversationId: string,
+    onBootAck?: (ack: UserBoxBootAck) => void,
   ): Promise<BoxInfo> {
     const created = await this.options.box.create({
       name:
         this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`,
       ttlSeconds: this.options.userBoxTtlSeconds ?? 3600,
     });
+    onBootAck?.({ action: "create-requested", box: created });
     const ready = await this.waitUntilReady(created.id, "create");
     await this.sessions.put({
       userId,
@@ -376,6 +402,7 @@ export class ConsumerBoxAgentOrchestrator {
     conversationId: string,
     status: UserBoxStatus,
     emit: (event: ConsumerTurnEventBody) => void,
+    onBootAck?: (ack: UserBoxBootAck) => void,
   ): Promise<BoxInfo> {
     if (status.kind === "archived" || status.kind === "archiving") {
       const oldBoxId = status.boxId;
@@ -393,6 +420,7 @@ export class ConsumerBoxAgentOrchestrator {
           note: "resuming private box from disk snapshot",
         });
         await this.options.box.resume(oldBoxId);
+        onBootAck?.({ action: "resume-requested", box: await this.options.box.get(oldBoxId).catch(() => status.box) });
         return await this.waitUntilReady(
           oldBoxId,
           "resume",
@@ -405,7 +433,7 @@ export class ConsumerBoxAgentOrchestrator {
           state: "resume-timeout",
           note: `resume did not become ready within ${this.options.resumeTimeoutMs ?? this.options.handoffTimeoutMs ?? 120_000}ms — keeping shared chat live and provisioning a fresh private box`,
         });
-        const fresh = await this.createFreshUserBox(userId, conversationId);
+        const fresh = await this.createFreshUserBox(userId, conversationId, onBootAck);
         emit({
           type: "lifecycle",
           boxId: fresh.id,
@@ -415,7 +443,7 @@ export class ConsumerBoxAgentOrchestrator {
         return fresh;
       }
     }
-    return this.ensureUserBox(userId, conversationId);
+    return this.ensureUserBox(userId, conversationId, onBootAck);
   }
 
   async *runTurn(input: ConsumerTurnInput): AsyncIterable<ConsumerTurnEvent> {
@@ -487,29 +515,37 @@ export class ConsumerBoxAgentOrchestrator {
     yield {
       type: "trace",
       stage: "shared.reasoning.start",
-      message: "shared assistant is ready to respond if the private runtime is not immediately available; private Box boot/resume is being requested eagerly",
+      message: "shared assistant is ready to respond if the private runtime is not immediately available; private Box boot/resume will be requested eagerly, and box.boot.start is emitted only after Box API accepts it",
       harness: harness.name,
       model: input.selection.model,
     };
 
     const recoveryEvents: ConsumerTurnEventBody[] = [];
-    let privateStartedStatus: UserBoxStatus | undefined;
+    let settleBootAck!: (ack: UserBoxBootAck) => void;
+    let rejectBootAck!: (error: unknown) => void;
+    let confirmedBootEmitted = false;
+    const bootAckPromise = new Promise<UserBoxBootAck>((resolve, reject) => {
+      settleBootAck = resolve;
+      rejectBootAck = reject;
+    });
+    void bootAckPromise.catch(() => undefined);
     const privateReady = (async () => {
       const release = await this.acquireLock(this.boxLocks, key);
       try {
         const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
-        privateStartedStatus = latestStatus;
         const box = latestStatus.kind === "ready"
-          ? latestStatus.box
+          ? (settleBootAck({ action: "already-ready", box: latestStatus.box }), latestStatus.box)
           : await this.ensureUserBoxWithRecovery(
               input.userId,
               input.conversationId,
               latestStatus,
               (event) => recoveryEvents.push(event),
+              settleBootAck,
             );
         return { box, status: latestStatus, release };
       } catch (error) {
         release();
+        rejectBootAck(error);
         throw error;
       }
     })();
@@ -524,30 +560,32 @@ export class ConsumerBoxAgentOrchestrator {
       ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
     };
 
-    const bootStatus = privateStartedStatus ?? resolvedStatus;
-    const bootState = bootStatus.kind === "ready"
-      ? "ready"
-      : bootStatus.kind === "archived" || bootStatus.kind === "archiving"
-        ? "resuming"
-        : "starting";
-    yield {
-      type: "lifecycle",
-      state: bootState,
-      boxId: "boxId" in bootStatus ? bootStatus.boxId : "pending",
-      note: bootState === "ready"
-        ? "private Box was already warm when this turn arrived"
-        : bootState === "resuming"
-          ? "private Box resume requested eagerly in parallel with the shared response"
-          : "private Box start requested eagerly in parallel with the shared response",
-    };
-    yield {
-      type: "trace",
-      stage: "box.boot.start",
-      message: "private Box boot/resume/recovery was requested immediately for this user message",
-      harness: harness.name,
-      model: input.selection.model,
-      ...("boxId" in bootStatus ? { boxId: bootStatus.boxId } : {}),
-    };
+    if (lockBusyAtSubmit) {
+      yield {
+        type: "trace",
+        stage: "box.boot.queued",
+        message: "private Box boot/resume is queued behind an active private runtime or stop; no Box API start/resume has been confirmed for this turn yet",
+        harness: harness.name,
+        model: input.selection.model,
+        ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+      };
+    } else {
+      const bootAck = await bootAckPromise.catch((error) => {
+        recoveryEvents.push({
+          type: "trace",
+          stage: "box.boot.failed",
+          message: error instanceof Error ? error.message : String(error),
+          harness: harness.name,
+          model: input.selection.model,
+          ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+        });
+        return undefined;
+      });
+      if (bootAck) {
+        confirmedBootEmitted = true;
+        yield* this.emitConfirmedBootStart(bootAck, harness, input.selection.model);
+      }
+    }
 
     // True fast path: if the private runtime is known warm and no stop/turn has
     // the private lock, route directly. This preserves the adaptive behavior
@@ -683,12 +721,19 @@ export class ConsumerBoxAgentOrchestrator {
     }
 
     try {
+      if (!confirmedBootEmitted) {
+        const bootAck = await bootAckPromise.catch(() => undefined);
+        if (bootAck) {
+          confirmedBootEmitted = true;
+          yield* this.emitConfirmedBootStart(bootAck, harness, input.selection.model);
+        }
+      }
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
       if (!sharedDecision.needsPrivate) {
         yield {
           type: "trace",
           stage: "handoff.suppressed",
-          message: "shared answer was sufficient; private Box was prepared but no duplicate private answer was needed",
+          message: "shared answer was sufficient; private Box exists and is ready, so no duplicate private answer was needed",
           harness: harness.name,
           model: input.selection.model,
           boxId: privateResult.box.id,
@@ -727,14 +772,16 @@ export class ConsumerBoxAgentOrchestrator {
       model: input.selection.model,
       boxId: box.id,
     };
-    const { since } = this.startBilling(box.id);
-    yield {
-      type: "billing.start",
-      boxId: box.id,
-      ratePerSecond: BOX_PRICE_USD_PER_SECOND,
-      sinceEpochMs: since,
-      pricing: BOX_PRICING,
-    };
+    const { since, fresh } = this.startBilling(box.id);
+    if (fresh) {
+      yield {
+        type: "billing.start",
+        boxId: box.id,
+        ratePerSecond: BOX_PRICE_USD_PER_SECOND,
+        sinceEpochMs: since,
+        pricing: BOX_PRICING,
+      };
+    }
     yield {
       type: "lifecycle",
       boxId: box.id,
@@ -784,6 +831,40 @@ export class ConsumerBoxAgentOrchestrator {
       sharedText,
       resolvedStatus.kind === "ready" ? "direct" : "bridge",
     );
+  }
+
+  private *emitConfirmedBootStart(
+    bootAck: UserBoxBootAck,
+    harness: HarnessAdapter,
+    model: string,
+  ): Iterable<ConsumerTurnEventBody> {
+    const bootState = bootLifecycleState(bootAck);
+    yield {
+      type: "lifecycle",
+      state: bootState,
+      boxId: bootAck.box.id,
+      note: bootLifecycleNote(bootAck),
+    };
+    yield {
+      type: "trace",
+      stage: "box.boot.start",
+      message: bootTraceMessage(bootAck),
+      harness: harness.name,
+      model,
+      boxId: bootAck.box.id,
+    };
+    if (bootState !== "archived") {
+      const { since, fresh } = this.startBilling(bootAck.box.id);
+      if (fresh) {
+        yield {
+          type: "billing.start",
+          boxId: bootAck.box.id,
+          ratePerSecond: BOX_PRICE_USD_PER_SECOND,
+          sinceEpochMs: since,
+          pricing: BOX_PRICING,
+        };
+      }
+    }
   }
 
 
@@ -1180,6 +1261,46 @@ function buildToolResultFallback(message: string, stdout: string): string {
   const marker = /\breply\s+(?:exactly\s+)?(?:with\s+)?([A-Z][A-Z0-9_]{2,})\b/.exec(message)?.[1];
   const value = stdout.trim();
   return marker ? `${marker} ${value}` : `Done — observed: ${value}`;
+}
+
+function bootLifecycleState(ack: UserBoxBootAck): string {
+  if (ack.action === "resume-requested" || ack.action === "adopt-resume-requested") return "resuming";
+  if (ack.action === "already-ready" || ack.action === "adopt-ready" || isReady(ack.box.state)) return "ready";
+  return ack.box.state === "provisioning" || ack.box.state === "cloning" || ack.box.state === "provisioned"
+    ? ack.box.state
+    : "starting";
+}
+
+function bootLifecycleNote(ack: UserBoxBootAck): string {
+  switch (ack.action) {
+    case "already-ready":
+      return "private Box already exists and is warm";
+    case "adopt-ready":
+      return "existing named private Box was adopted and is warm";
+    case "adopt-resume-requested":
+      return "existing archived private Box resume was accepted by Box API";
+    case "resume-requested":
+      return "private Box resume was accepted by Box API";
+    case "existing-boot":
+      return `private Box already exists and is still booting (${ack.box.state})`;
+    case "create-requested":
+      return `private Box create was accepted by Box API (${ack.box.state})`;
+  }
+}
+
+function bootTraceMessage(ack: UserBoxBootAck): string {
+  switch (ack.action) {
+    case "already-ready":
+    case "adopt-ready":
+      return "private Box exists and is ready";
+    case "resume-requested":
+    case "adopt-resume-requested":
+      return "private Box resume request was accepted by Box API";
+    case "existing-boot":
+      return "private Box already exists and is booting";
+    case "create-requested":
+      return "private Box create request was accepted by Box API";
+  }
 }
 
 function isReady(state: string): boolean {

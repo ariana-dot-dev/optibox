@@ -40,6 +40,15 @@ export type ConsumerTurnEventBody =
     }
   | { type: "lifecycle"; state: string; boxId: string; note?: string }
   | {
+      type: "autostop.timer";
+      phase: "started" | "tick" | "canceled" | "stopping";
+      boxId?: string | undefined;
+      remainingMs: number;
+      deadlineEpochMs?: number;
+      reason: "idle-after-response" | "new-user-message" | "disabled";
+      note: string;
+    }
+  | {
       type: "billing.start";
       boxId: string;
       ratePerSecond: number;
@@ -168,8 +177,8 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly boxLocks = new Map<string, Promise<void>>();
   /** Monotonic per-conversation submit counter for tracing/order-sensitive bookkeeping. */
   private readonly turnSequences = new Map<string, number>();
-  /** Monotonic per-conversation private-work counter. Shared-only/suppressed chatter must not cancel private idle stops. */
-  private readonly privateActivitySequences = new Map<string, number>();
+  /** Number of response streams still active per conversation; auto-stop starts only when this reaches 0. */
+  private readonly activeTurnCounts = new Map<string, number>();
   /** Single authoritative per-conversation Box-request state machine. */
   private readonly privateRequests = new Map<string, ConversationPrivateRequestState>();
 
@@ -470,7 +479,8 @@ export class ConsumerBoxAgentOrchestrator {
   async *runTurn(input: ConsumerTurnInput): AsyncIterable<ConsumerTurnEvent> {
     const key = `${input.userId}:${input.conversationId}`;
     const turnId = randomUUID();
-    this.bumpTurnSequence(key);
+    const turnSequence = this.bumpTurnSequence(key);
+    this.activeTurnCounts.set(key, (this.activeTurnCounts.get(key) ?? 0) + 1);
     // Do not await the remote Box status before emitting. A slow Box API check
     // made the preview look like Send did nothing because no SSE bytes were
     // flushed until userBoxStatus resolved. Status still runs immediately.
@@ -504,12 +514,20 @@ export class ConsumerBoxAgentOrchestrator {
       yield { ...ev, turnId };
     }
 
-    // Keep the Box warm briefly after private work/billing. Only another
-    // private-producing turn bumps privateActivitySequences[key]; shared-only
-    // chatter must not cancel the original request's idle stop.
-    if (usedPrivateBox) {
-      const privateSequence = this.bumpPrivateActivitySequence(key);
-      for await (const ev of this.stopAfterIdle(input, key, privateSequence))
+    const activeTurns = Math.max(0, (this.activeTurnCounts.get(key) ?? 1) - 1);
+    if (activeTurns === 0) this.activeTurnCounts.delete(key);
+    else this.activeTurnCounts.set(key, activeTurns);
+
+    // Keep the Box warm briefly after all current responses are done. Any user
+    // message bumps turnSequences[key] immediately, which cancels/freezes an
+    // existing countdown. The last response to finish restarts the countdown if
+    // the Box is still billing, including shared-only follow-ups that arrived
+    // during the previous idle window.
+    const session = await this.sessions.get(input.userId, input.conversationId);
+    const hasBillableBox = Boolean(session?.boxId && this.billing.has(session.boxId));
+    if ((usedPrivateBox || hasBillableBox) && !this.activeTurnCounts.has(key)) {
+      const latestIdleSequence = this.turnSequences.get(key) ?? turnSequence;
+      for await (const ev of this.stopAfterIdle(input, key, latestIdleSequence))
         yield { ...ev, turnId };
     }
   }
@@ -998,24 +1016,100 @@ export class ConsumerBoxAgentOrchestrator {
     return next;
   }
 
-  private bumpPrivateActivitySequence(key: string): number {
-    const next = (this.privateActivitySequences.get(key) ?? 0) + 1;
-    this.privateActivitySequences.set(key, next);
-    return next;
-  }
-
   private async *stopAfterIdle(
     input: ConsumerTurnInput,
     key: string,
     turnSequence: number,
   ): AsyncIterable<ConsumerTurnEvent> {
     const delayMs = this.options.autoStopIdleMs ?? 5000;
-    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
-    if (this.privateActivitySequences.get(key) !== turnSequence) return;
+    const session = await this.sessions.get(input.userId, input.conversationId);
+    const boxId = session?.boxId;
+    if (delayMs <= 0) {
+      yield {
+        type: "autostop.timer",
+        phase: "stopping",
+        boxId,
+        remainingMs: 0,
+        reason: "disabled",
+        note: "auto-stop idle delay is disabled; stopping private Box now",
+      };
+    } else {
+      const deadlineEpochMs = Date.now() + delayMs;
+      yield {
+        type: "autostop.timer",
+        phase: "started",
+        boxId,
+        remainingMs: delayMs,
+        deadlineEpochMs,
+        reason: "idle-after-response",
+        note: "assistant finished; private Box will auto-stop when this visible idle countdown reaches zero",
+      };
+
+      // This generator runs only after the private response finishes. While the
+      // user is idle, emit countdown events and frequently check the private
+      // turn sequence so a new message visibly resets the timer instead of
+      // leaving a hidden stop tail.
+      let lastWholeSecond = Math.ceil(delayMs / 1000);
+      while (true) {
+        if (this.turnSequences.get(key) !== turnSequence) {
+          yield {
+            type: "autostop.timer",
+            phase: "canceled",
+            boxId,
+            remainingMs: Math.max(0, deadlineEpochMs - Date.now()),
+            deadlineEpochMs,
+            reason: "new-user-message",
+            note: "auto-stop countdown reset because a new user message arrived; it will restart after that response finishes",
+          };
+          return;
+        }
+
+        const remainingMs = Math.max(0, deadlineEpochMs - Date.now());
+        const wholeSecond = Math.ceil(remainingMs / 1000);
+        if (wholeSecond !== lastWholeSecond || remainingMs === 0) {
+          lastWholeSecond = wholeSecond;
+          yield {
+            type: "autostop.timer",
+            phase: remainingMs === 0 ? "stopping" : "tick",
+            boxId,
+            remainingMs,
+            deadlineEpochMs,
+            reason: "idle-after-response",
+            note: remainingMs === 0
+              ? "visible idle countdown reached zero; stopping private Box now"
+              : "private Box auto-stop countdown is running because the assistant is done and the user is idle",
+          };
+        }
+        if (remainingMs === 0) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(250, remainingMs)));
+      }
+    }
+
+    if (this.turnSequences.get(key) !== turnSequence) {
+      yield {
+        type: "autostop.timer",
+        phase: "canceled",
+        boxId,
+        remainingMs: 0,
+        reason: "new-user-message",
+        note: "auto-stop skipped because a new user message arrived before stop could begin",
+      };
+      return;
+    }
 
     const release = await this.acquireLock(this.boxLocks, key);
     try {
-      if (this.privateActivitySequences.get(key) !== turnSequence) return;
+      if (this.turnSequences.get(key) !== turnSequence) {
+        yield {
+          type: "autostop.timer",
+          phase: "canceled",
+          boxId,
+          remainingMs: 0,
+          reason: "new-user-message",
+          note: "auto-stop skipped because a new user message is using the private Box",
+        };
+        return;
+      }
       yield* this.stopUserBoxLocked(input.userId, input.conversationId);
     } finally {
       release();

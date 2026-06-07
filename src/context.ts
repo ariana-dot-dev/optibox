@@ -51,6 +51,7 @@ export function buildHiddenContext(input: {
   transcript: TranscriptMessage[];
   machine: MachineState;
   partialShared?: string;
+  staleDuplicateRequest?: boolean;
 }): string {
   const turns = input.transcript
     .slice(-40)
@@ -65,12 +66,15 @@ export function buildHiddenContext(input: {
   const partial = input.partialShared
     ? `\n  <partial-shared-response note="already shown to the user by the prewarm agent — continue from it, do not repeat verbatim">\n    ${escapeXml(input.partialShared.replace(/\s+/g, " ").trim())}\n  </partial-shared-response>`
     : "";
+  const staleDuplicate = input.staleDuplicateRequest
+    ? `\n  <stale-duplicate-request action="output-exact-end">The latest user request matches a request already answered by the private runtime in this conversation. Treat this as a stale queued duplicate unless new user-visible work is clearly required.</stale-duplicate-request>`
+    : "";
   return [
     `<${HIDDEN_CONTEXT_TAG}>`,
     `  <machine-state location="${input.machine.location}" tools="${input.machine.tools}"${input.machine.status ? ` status="${input.machine.status}"` : ""}${input.machine.boxId ? ` boxId="${input.machine.boxId}"` : ""}/>`,
     `  <prior-transcript count="${input.transcript.length}">`,
     turns,
-    `  </prior-transcript>${partial}`,
+    `  </prior-transcript>${partial}${staleDuplicate}`,
     `</${HIDDEN_CONTEXT_TAG}>`,
   ].join("\n");
 }

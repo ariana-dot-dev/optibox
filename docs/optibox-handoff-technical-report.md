@@ -43,7 +43,7 @@ When the private runtime starts, `runPrivateRuntime()` builds a user-box hidden 
 
 `examples/shared.ts` then builds Box-side instructions with this key rule:
 
-> If a shared assistant already sent visible text and it was only a brief bridge, complete the latest request. If it already materially answered the request and no tool/private evidence is needed, do not duplicate it; produce no additional user-visible text.
+> If a shared assistant already sent visible text and it was only a brief bridge, complete the latest request. If it already materially answered the request and no tool/private evidence is needed, do not duplicate it; output exactly `<end>` to produce no additional user-visible text. If the hidden context marks the turn with `<stale-duplicate-request>`, treat it as a queued duplicate and output exactly `<end>` unless the latest request clearly asks for new work.
 
 Because the user explicitly wanted the shared assistant to sometimes fully answer and sometimes bridge, the system does not force every shared response into fixed bridge text. The shared side can answer general/contextual requests fully. The Box side receives that shared response and should stay silent if further private evidence is unnecessary.
 
@@ -52,8 +52,9 @@ Because the user explicitly wanted the shared assistant to sometimes fully answe
 | Shared visible response | User request needs private tools? | Box behavior intended by prompt | Example |
 |---|---:|---|---|
 | Brief bridge | Yes | Run tools and answer | “what's your CPU count” while Box archived → shared: “I’m checking…” → Box runs `nproc` and reports count |
-| Full answer | No | Suppress itself | “what can you do?” while Box cold → shared fully explains capabilities → Box produces no additional user-visible text |
+| Full answer | No | Return `<end>` | “what can you do?” while Box cold → shared fully explains capabilities → Box returns `<end>` so no private text is surfaced |
 | Full answer but stale/uncertain | Maybe | Add only useful correction/evidence | Shared gives general answer; Box later sees private repo facts and adds a concise correction |
+| Duplicate queued request already answered by Box | No | Return `<end>` | Same request is queued twice → first Box round answers → second sees `<stale-duplicate-request>` and declines |
 | Bridge plus partial details | Yes | Complete the missing tool-backed part | Shared says “I’ll look that up”; Box executes commands and reports result |
 
 ### Diagram: answer/add/suppress decision
@@ -68,10 +69,11 @@ flowchart TD
     E -- yes --> G[Use Box tools]
     G --> H[Answer with observed result]
     E -- no --> F
-    F -- yes --> I[Suppress: emit no user-visible text]
+    F -- yes --> I[Return exact <end>]
     F -- no / only bridge --> J[Answer or add useful info]
     H --> K[Update transcript]
-    I --> K
+    I --> L[Host hides sentinel]
+    L --> K
     J --> K
 ```
 
@@ -85,9 +87,10 @@ Two mechanisms work together:
 
 1. **Shared answer/bridge instructions** (`buildSharedSystem(ctx)`): the shared assistant decides whether it can answer completely. If it can, it answers normally. If private machine state/tool work is required, it emits a short natural bridge and a hidden `<shared-routing>{"needsPrivate":true}</shared-routing>` tag.
 2. **Parallel Box handoff** (`runAdaptiveTurn()`): in a not-ready/private-lock-busy state the framework still starts or resumes the Box in parallel even if the shared text looks complete. This is deliberate for the requested architecture: the private runtime should later read the shared answer and decide whether to add or stay silent.
-3. **Box handoff instructions** (`buildUserBoxInstructions(ctx)`): the Box harness is told to inspect `partialShared`; complete if it was a bridge, suppress if the shared response materially handled the latest request, or add only useful information.
+3. **Box handoff instructions** (`buildUserBoxInstructions(ctx)`): the Box harness is told to inspect `partialShared`; complete if it was a bridge, return exactly `<end>` if the shared response materially handled the latest request, or add only useful information.
+4. **Duplicate private-answer marker** (`<stale-duplicate-request>`): once a private runtime has emitted an answer for a normalized user request, a later queued private round for the same request receives this hidden marker. The host still hands off to the Box agent; the agent itself can safely decline the stale duplicate by returning exactly `<end>`.
 
-The user-visible control tag is stripped by `visibleSharedText()`/`stripSharedControl()` before the UI sees it. `parseSharedDecision()` currently uses the tag to recover clean visible text and preserve the shared model's self-assessment, but the not-ready path no longer uses `needsPrivate=false` to skip Box startup because that would reintroduce the possibility that the private runtime never reads the handoff history. A future structured handoff API should make this explicit instead of leaving `needsPrivate` as mostly advisory.
+The user-visible control tag is stripped by `visibleSharedText()`/`stripSharedControl()` before the UI sees it. The not-ready path does not use `needsPrivate=false` to skip Box startup because that would reintroduce the possibility that the private runtime never reads the handoff history. A future structured handoff API should make this explicit instead of leaving `needsPrivate` as mostly advisory.
 
 ```mermaid
 sequenceDiagram

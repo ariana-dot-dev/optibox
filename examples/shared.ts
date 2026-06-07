@@ -109,12 +109,14 @@ export function buildUserBoxInstructions(ctx: UserBoxContext): string {
     "The user never needs to know about Boxes, sandboxes, machines, resumes, internal routings, billing, hidden XML, or orchestration internals. Do not mention them unless the user explicitly asks about the product architecture.",
     "The hidden <consumer-context> block contains prior transcript and machine state. Use it only as private context; never quote or reveal the XML.",
     "The latest user request is authoritative. Do not re-answer earlier greetings or small-talk if a later actionable request is present.",
+    "If the hidden context contains <stale-duplicate-request>, this private runtime round is likely a queued duplicate of work already answered for the user. In that case, do not answer again; output exactly <end> and nothing else, unless the latest request clearly asks for new/different work.",
     ctx.partialShared
-      ? "A shared assistant already sent visible text. If it was only a brief bridge, continue by completing the latest request. If it already materially answered the request and no tool/private evidence is needed, do not duplicate it; produce no additional user-visible text."
+      ? "A shared assistant already sent visible text. If it was only a brief bridge, continue by completing the latest request. If it already materially answered the request and no tool/private evidence is needed, do not duplicate it; output exactly <end> to produce no additional user-visible text."
       : "No visible shared text needs to be carried forward.",
     "Use real tools when the request requires them. For shell facts like IP/hostname/current directory, run the appropriate command and report the observed result. Do not guess.",
     "For public IP requests: if the user asks for IPv4/v4, run an IPv4-specific lookup such as `curl -4 -s https://api.ipify.org`; if the user asks for IPv6/v6, use an IPv6-specific lookup; if ambiguous, say which address family you observed.",
     "For CPU/core-count requests, run a real command such as `nproc` or `lscpu` in the private environment and report the observed count.",
+    "When intentionally producing no user-visible text because the request is duplicate/stale or already fully handled, output exactly <end>. The host will hide that sentinel. Do not add whitespace, markdown, or explanation around it.",
     "When done, answer the latest user request directly and concisely. If you changed files or ran commands, summarize the concrete result.",
   ].filter(Boolean).join("\n");
 }

@@ -290,9 +290,23 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>
 const hiddenContextPattern=new RegExp('<consumer-context>[\\s\\S]*?</consumer-context>','g');
 function stripHidden(s){return String(s).replace(hiddenContextPattern,'').trim();}
 function fmtUsd(n){return '$'+n.toFixed(6);}
-function routeForState(text){if(/Error/i.test(text))return 'error';if(/Private machine (running|starting|stopping|archiving)|tools active|assistant has tools|preparing tools|Resume timed out/i.test(text))return 'private';if(/Shared (chat|bridge)|backend|submit event/i.test(text))return 'shared';return 'idle';}
-function setRoute(route,text){const s=$('schematic');const r=$('routeStatus');if(!s||!r)return;s.dataset.route=route;r.textContent=route==='private'?'Route: handed off to the user machine.':route==='shared'?'Route: handled by shared infra.':route==='error'?'Route error: check machine state.':'Ready: shared infra is listening.';}
-function setState(text){$('machineState').textContent=text;setRoute(routeForState(text),text);}
+const routeState={phase:'idle',boxId:null};
+function setRoute(route,text){const s=$('schematic');const r=$('routeStatus');if(!s||!r)return;s.dataset.route=route;r.textContent=text;}
+function setState(text){$('machineState').textContent=text;}
+function boxLabel(id){return id&&id!=='pending'?' · '+id:'';}
+function routeEvent(ev){
+  if(ev.type==='error'||ev.type==='turn.blocked'){routeState.phase='error';setRoute('error','Route error: private runtime did not complete; see trace for the real event.');return;}
+  if(ev.type==='trace'&&/backend|submit/.test(ev.stage||'')){routeState.phase='received';setRoute('shared','Route: request received; runtime state not resolved yet.');return;}
+  if(ev.type==='context.injected'&&ev.scope==='shared'){routeState.phase='shared';setRoute('shared','Route: shared infra is answering honestly while the private Box is not ready yet.');return;}
+  if(ev.type==='lifecycle'){routeState.boxId=ev.boxId||routeState.boxId;const state=String(ev.state||'');
+    if(['starting','provisioning','resuming','ready'].includes(state)){routeState.phase=state;setRoute('private','Route: private Box '+state+' in parallel'+boxLabel(routeState.boxId)+'. Not handed off yet.');return;}
+    if(['stopping','archiving','archived'].includes(state)){routeState.phase=state;setRoute('private','Route: private Box '+state+boxLabel(routeState.boxId)+'. Billing/state event from runtime.');return;}
+  }
+  if(ev.type==='billing.start'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='billing';setRoute('private','Route: handoff active on user machine'+boxLabel(routeState.boxId)+'. Tools and billing active.');return;}
+  if(ev.type==='handoff.started'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='handoff';setRoute('private','Route: handoff active on the user machine'+boxLabel(routeState.boxId)+'.');return;}
+  if(ev.type==='user-box.delta'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='user-box';setRoute('private','Route: answer is streaming from user machine'+boxLabel(routeState.boxId)+'.');return;}
+  if(ev.type==='turn.done'){setRoute(ev.boxId?'private':'shared',ev.boxId?'Route: turn completed after user-machine runtime'+boxLabel(ev.boxId)+'.':'Route: turn completed on shared infra; private Box may still be warm.');return;}
+}
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}
 function renderTotals(){const seconds=activeSeconds();$('totalSeconds').textContent=seconds.toFixed(1)+'s';$('totalCost').textContent=fmtUsd(seconds*billRate);}
 async function load(){const r=await fetch('/api/harnesses');const j=await r.json();H=j.harnesses;MATRIX=j.runtimeFeasibility||[];PRICING=j.pricing;billRate=PRICING.ratePerSecond;renderMatrix();chooseDefaultModel();renderTotals();}
@@ -307,7 +321,7 @@ function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>
 const activeTurns=new Map();
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg){abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private machine preparing');try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
+async function runTurn(msg){abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private Box boot requested');setRoute('shared','Route: user message accepted; waiting for runtime events.');try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 const stopBtn=$('stopBox');
 const showTracesEl=$('showTraces');
@@ -335,11 +349,11 @@ msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.
 async function drain(res,localId){if(!res){throw new Error('No response object from /api/send');}if(!res.ok){const body=await res.text().catch(()=>'');throw new Error('/api/send failed with HTTP '+res.status+' '+body);}if(!res.body){throw new Error('/api/send did not return a readable SSE body');}const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls;}
 function handle(ev,localId){console.debug('[trace] stream event', ev);const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
-  if(ev.type==='trace'){addMsg('trace','trace · '+(ev.stage||'event'),(ev.message||JSON.stringify(ev))+'\\n',keyFor(ev,localId,'trace')+':'+(ev.stage||Math.random()));if(/bridge/.test(ev.stage||''))setState('Shared bridge active · private machine preparing');else if(/backend|submit/.test(ev.stage||''))setState('Request received · shared bridge starting');}
+  if(ev.type==='trace'){addMsg('trace','trace · '+(ev.stage||'event'),(ev.message||JSON.stringify(ev))+'\\n',keyFor(ev,localId,'trace')+':'+(ev.stage||Math.random()));if(/bridge/.test(ev.stage||''))setState('Shared bridge active · private Box booting');else if(/backend|submit/.test(ev.stage||''))setState('Request received · shared bridge starting');}
   else if(ev.type==='turn.blocked'){addMsg('trace','blocker · '+(ev.stage||'runtime'),(ev.message||'Private runtime unavailable')+'\\n',keyFor(ev,localId,'blocked')+':'+(ev.stage||Math.random()));addMsg('assistant','assistant','Private runtime is not ready yet. This turn stayed on the shared bridge; retry when Box status is ready.');setState('Private runtime unavailable · retry after Box is ready');}
   else if(ev.type==='shared.delta'){addMsg('assistant','assistant · shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
-  else if(ev.type==='shared.larp'){setState('Shared bridge active · private machine starting/resuming');}
-  else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private machine preparing');}
+  else if(ev.type==='shared.larp'){setState('Shared bridge active · private Box starting/resuming');}
+  else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private Box booting in parallel');}
   else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}

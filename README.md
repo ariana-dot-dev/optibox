@@ -78,24 +78,26 @@ The shared side is restricted and fast. The Box side has the user's private runt
 ## Message flow
 
 1. The user sends a message with a selected harness/provider/model.
-2. Optibox checks the user's Box state for that user/conversation.
-3. If the Box is warm, Optibox routes directly to the selected in-Box harness.
-4. If the Box is not ready, the shared assistant streams a restricted answer or bridge while Optibox starts or resumes the Box.
-5. The shared assistant emits a hidden routing decision: continue privately, or suppress handoff if the shared answer was enough.
-6. When private work is needed and the Box is ready, the harness receives the hidden conversation context, machine state, and any shared text already shown to the user.
-7. The harness runs inside the Box with provider keys and tools, streams `user-box.delta` output, and may emit tool telemetry.
-8. After the turn, Optibox can keep the Box briefly warm for follow-ups, then stop/archive it to pause billing.
+2. Optibox immediately requests start/resume/warm-up for that user's private Box, even for a first-turn greeting.
+3. In parallel, Optibox resolves the exact Box state for route labeling and hidden context.
+4. If the Box is already warm and no private lock is busy, Optibox routes directly to the selected in-Box harness.
+5. If the Box is not ready, the shared assistant streams a restricted answer or bridge while the private Box boot/resume continues in parallel.
+6. The shared assistant emits a hidden routing decision: continue privately, or suppress the private/tool answer if the shared answer was enough. This decision never prevents the private Box from being started for the conversation.
+7. When private work is needed and the Box is ready, the harness receives the hidden conversation context, machine state, and any shared text already shown to the user.
+8. The harness runs inside the Box with provider keys and tools, streams `user-box.delta` output, and may emit tool telemetry.
+9. After the turn, Optibox can keep the Box briefly warm for follow-ups, then stop/archive it to pause billing.
 
 ## State machine
 
 ```mermaid
 stateDiagram-v2
   [*] --> SharedReady
-  SharedReady --> CheckBox: user message
+  SharedReady --> EagerBox: user message immediately requests private Box
+  EagerBox --> CheckBox: resolve exact runtime state
   CheckBox --> DirectBox: Box ready + no private lock
   CheckBox --> SharedFirst: Box missing/provisioning/archived/busy
   SharedFirst --> SharedAnswer: restricted shared stream
-  SharedFirst --> BoxStarting: start/resume in parallel
+  EagerBox --> BoxStarting: start/resume in parallel
   SharedAnswer --> Done: shared says no private work
   SharedAnswer --> HandoffPending: shared says private work needed
   BoxStarting --> BoxReady

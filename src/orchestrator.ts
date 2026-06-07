@@ -1205,12 +1205,35 @@ export class ConsumerBoxAgentOrchestrator {
         yield ev;
       }
     };
+    let emittedUserTextLength = 0;
+    const isCurrentPrivateRound = () => this.isPrivateRoundCurrent(key, round);
+    const emitAvailableUserText = function* (): Iterable<ConsumerTurnEvent> {
+      // Preserve the routing state machine: never surface stale private-round
+      // output. For the active round, withhold only while the whole response can
+      // still become the exact <end> sentinel; otherwise forward each harness
+      // chunk immediately instead of waiting for completion.
+      if (!isCurrentPrivateRound()) return;
+      if (PRIVATE_END_SENTINEL.startsWith(userText)) return;
+      if (userText.length <= emittedUserTextLength) return;
+      const delta = userText.slice(emittedUserTextLength);
+      emittedUserTextLength = userText.length;
+      if (delta) {
+        yield {
+          type: "user-box.delta",
+          text: delta,
+          boxId: box.id,
+          harness: harness.name,
+          model: input.selection.model,
+        };
+      }
+    };
     while (true) {
       const n = await itc.next();
       yield* flushExecEvents();
       if (n.done) break;
       const text = String(n.value ?? "");
       userText += text;
+      yield* emitAvailableUserText();
     }
     yield* flushExecEvents();
     if (!this.isPrivateRoundCurrent(key, round)) {
@@ -1226,7 +1249,7 @@ export class ConsumerBoxAgentOrchestrator {
       yield { type: "turn.done", boxId: box.id, harness: harness.name, model: input.selection.model, route: "shared" };
       return;
     }
-    if (userText === "<end>") {
+    if (userText === PRIVATE_END_SENTINEL) {
       yield {
         type: "trace",
         stage: "user-box.response.end",
@@ -1245,15 +1268,7 @@ export class ConsumerBoxAgentOrchestrator {
       };
       return;
     }
-    if (userText) {
-      yield {
-        type: "user-box.delta",
-        text: userText,
-        boxId: box.id,
-        harness: harness.name,
-        model: input.selection.model,
-      };
-    }
+    yield* emitAvailableUserText();
     if (!userText.trim() && sawToolUse && lastToolStdout) {
       const fallback = buildToolResultFallback(input.message, lastToolStdout);
       userText += fallback;
@@ -1489,6 +1504,8 @@ function sharedNeedsPrivate(rawSharedText: string, message: string): boolean {
   }
   return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
 }
+
+const PRIVATE_END_SENTINEL = "<end>";
 
 function requestFingerprint(message: string): string {
   return String(message ?? "")

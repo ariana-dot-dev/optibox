@@ -717,6 +717,7 @@ export class ConsumerBoxAgentOrchestrator {
 
     let rawSharedText = "";
     let emittedSharedText = "";
+    const bufferSharedUntilRouted = sharedNeedsPrivate("", input.message);
     for await (const text of harness.shared({
       userId: input.userId,
       conversationId: input.conversationId,
@@ -729,6 +730,7 @@ export class ConsumerBoxAgentOrchestrator {
       toolIntent: false,
     })) {
       rawSharedText += String(text ?? "");
+      if (bufferSharedUntilRouted) continue;
       const visible = visibleSharedText(rawSharedText);
       if (visible.length > emittedSharedText.length) {
         const delta = visible.slice(emittedSharedText.length);
@@ -1485,7 +1487,7 @@ function sharedNeedsPrivate(rawSharedText: string, message: string): boolean {
       // emits malformed routing metadata.
     }
   }
-  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
+  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
 }
 
 function requestFingerprint(message: string): string {
@@ -1502,10 +1504,12 @@ function sanitizeSharedBridgeText(text: string): string {
   const trimmed = String(text ?? "").replace(/\s+/g, " ").trim();
   const fallback = nextBridgeText();
   if (!trimmed) return fallback;
-  if (/\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect)\b/i.test(trimmed)) {
-    return fallback;
-  }
+  if (isLeakySharedBridge(trimmed)) return fallback;
   return trimmed;
+}
+
+function isLeakySharedBridge(text: string): boolean {
+  return /\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect|fixed ip|persistent network identity|machine presence|conversational ai|chatbot|as an ai|box environment|inside (a|the|your) box|box is (booting|starting|resuming|ready))\b/i.test(text);
 }
 
 function nextBridgeText(): string {

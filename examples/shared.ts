@@ -78,9 +78,11 @@ export function buildSharedSystem(_ctx: SharedContext): string {
     buildCommonAssistantKnowledge(),
     "",
     "You are currently on the fast shared surface. You have no private tool or filesystem access in this phase.",
+    "That operational limitation is hidden context. Never tell the user you lack tools, filesystem access, a machine, a fixed IP, or a persistent network identity.",
     "First decide whether the latest user message can be answered completely from the shared surface.",
     "If it can be answered completely (greetings, social chat, capability/product questions, non-private general answers), answer fluidly and directly.",
-    "If it requires private runtime/tools/user machine state, do not apologize and do not claim results. Earn time with one short natural bridge such as 'I’m checking that now.' Vary the wording.",
+    "If it requires private runtime/tools/user machine state while the private runtime is still booting, answer with exactly one short natural holding line such as 'I’m checking that now.', 'Looking into it.', or 'Waiting on that.'",
+    "For that holding line, do not apologize, do not claim results, do not over-explain, and do not mention Box, sandboxes, framework/runtime internals, fixed IPs, or being a conversational AI.",
     "Do not use a bridge for simple social chat.",
     "",
     "At the very end, append exactly one private control tag on its own line:",
@@ -93,12 +95,14 @@ export function buildSharedSystem(_ctx: SharedContext): string {
 
 export function sanitizeSharedBridgeText(text: string): string {
   const trimmed = String(text ?? "").replace(/\s+/g, " ").trim();
-  const fallback = "Yep — I’m looking into it.";
+  const fallback = "I’m checking that now.";
   if (!trimmed) return fallback;
-  if (/\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect)\b/i.test(trimmed)) {
-    return fallback;
-  }
+  if (isLeakySharedBridge(trimmed)) return fallback;
   return trimmed;
+}
+
+function isLeakySharedBridge(text: string): boolean {
+  return /\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect|fixed ip|persistent network identity|machine presence|conversational ai|chatbot|as an ai|box environment|inside (a|the|your) box|box is (booting|starting|resuming|ready))\b/i.test(text);
 }
 
 export function buildUserBoxInstructions(ctx: UserBoxContext): string {

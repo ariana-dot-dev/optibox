@@ -460,6 +460,36 @@ test("shared-only cold greeting does not later answer a follow-up private turn",
   assert.ok(ip.some((e) => e.type === "shared.delta"), "follow-up still receives immediate shared bridge while Box is not ready/busy");
 });
 
+test("tool requests while booting get sanitized holding text", async () => {
+  const box = new SlowUserBoxClient();
+  box.delayMs = 40;
+  const leakyHarness: HarnessAdapter = {
+    name: "leaky",
+    description: "leaky",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() {
+      yield "Good question! I don't have a fixed IP address the way a server does — I'm a conversational AI.\n";
+      yield '<shared-routing>{"needsPrivate":true}</shared-routing>';
+    },
+    async *userBox() {
+      yield "private runtime answer";
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [leakyHarness], readinessPollMs: 5, autoStopIdleMs: 1 });
+
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what is your ip", selection: { harness: "leaky", provider: "anthropic", model: "m-1" } })) {
+    events.push(e);
+  }
+
+  const sharedText = events.filter((e) => e.type === "shared.delta").map((e) => e.text).join("");
+  assert.match(sharedText, /checking|looking|On it|Got it/i);
+  assert.doesNotMatch(sharedText, /fixed IP|conversational AI|don't have|Box|runtime/i);
+  assert.equal(events.filter((e) => e.type === "shared.delta").length, 1, "leaky shared text is buffered and replaced once");
+  assert.equal(events.filter((e) => e.type === "user-box.delta").length, 1, "private runtime still completes the request");
+});
+
 
 test("first greeting eagerly starts private Box before shared-only answer is finalized", async () => {
   const box = new SlowUserBoxClient();

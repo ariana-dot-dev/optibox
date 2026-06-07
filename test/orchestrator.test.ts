@@ -283,10 +283,12 @@ test("hidden context envelope carries transcript + machine state, strips cleanly
     ],
     machine: { location: "user-box", tools: true, boxId: "box-9" },
     partialShared: "spinning up your sandbox",
+    staleDuplicateRequest: true,
   });
   assert.match(hidden, /<machine-state location="user-box" tools="true" boxId="box-9"\/>/);
   assert.match(hidden, /make proof1.txt/);
   assert.match(hidden, /<partial-shared-response/);
+  assert.match(hidden, /<stale-duplicate-request action="output-exact-end">/);
   // wrapped text is stripped entirely from anything user-visible
   assert.equal(stripHiddenContext(`before ${hidden} after`), "before  after".trim());
 });
@@ -519,6 +521,41 @@ test("only exact private Box <end> sentinel suppresses private output", async ()
   const newline: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "newline", message: "newline", selection: { harness: "exact-end-only", provider: "anthropic", model: "m-1" } })) newline.push(e);
   assert.equal(newline.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "<end>\n", "non-exact sentinel text is surfaced");
+});
+
+test("duplicate queued Box round is marked stale so the private agent can return <end>", async () => {
+  const box = new SlowUserBoxClient();
+  box.delayMs = 5;
+  const harness: HarnessAdapter = {
+    name: "duplicate-aware",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() {
+      yield `I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+    },
+    async *userBox({ hiddenContext }) {
+      if (hiddenContext.includes("<stale-duplicate-request")) {
+        yield "<end>";
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 20));
+      yield "ANSWER_ONCE";
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
+
+  const first: any[] = [];
+  const second: any[] = [];
+  const input = { userId: "u", conversationId: "c", message: "What is my public IP?", selection: { harness: "duplicate-aware", provider: "anthropic", model: "m-1" } };
+  const d1 = (async () => { for await (const e of orchestrator.runTurn(input)) first.push(e); })();
+  const d2 = (async () => { for await (const e of orchestrator.runTurn(input)) second.push(e); })();
+  await Promise.all([d1, d2]);
+
+  const all = [...first, ...second];
+  assert.equal(all.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "ANSWER_ONCE", "only the first queued private round answers");
+  assert.equal(all.filter((e) => e.type === "trace" && e.stage === "user-box.response.end").length, 1, "duplicate private round is declined with the exact end sentinel");
+  assert.equal(all.filter((e) => e.type === "handoff.started").length, 2, "both queued rounds still reach the Box agent; host routing does not suppress the second answer itself");
+  assert.ok(all.some((e) => e.type === "context.injected" && e.scope === "user-box" && e.hidden.includes("<stale-duplicate-request")), "duplicate round is explicitly marked in hidden context");
 });
 
 test("not-ready turns answer from shared first while private runtime starts in parallel", async () => {

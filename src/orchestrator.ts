@@ -151,6 +151,8 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly boxLocks = new Map<string, Promise<void>>();
   /** Monotonic per-conversation counter. Delayed auto-stop only fires if no newer user turn bumped this value. */
   private readonly turnSequences = new Map<string, number>();
+  /** Per-conversation normalized user requests that already produced a private-runtime answer. */
+  private readonly answeredRequestFingerprints = new Map<string, Set<string>>();
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -848,6 +850,24 @@ export class ConsumerBoxAgentOrchestrator {
     this.transcripts.set(key, [...current, message]);
   }
 
+  private hasAnsweredEquivalentRequest(key: string, message: string): boolean {
+    const fingerprint = requestFingerprint(message);
+    return Boolean(
+      fingerprint && this.answeredRequestFingerprints.get(key)?.has(fingerprint),
+    );
+  }
+
+  private markAnsweredRequest(key: string, message: string): void {
+    const fingerprint = requestFingerprint(message);
+    if (!fingerprint) return;
+    let answered = this.answeredRequestFingerprints.get(key);
+    if (!answered) {
+      answered = new Set<string>();
+      this.answeredRequestFingerprints.set(key, answered);
+    }
+    answered.add(fingerprint);
+  }
+
   private bumpTurnSequence(key: string): number {
     const next = (this.turnSequences.get(key) ?? 0) + 1;
     this.turnSequences.set(key, next);
@@ -888,6 +908,19 @@ export class ConsumerBoxAgentOrchestrator {
     route: "direct" | "bridge",
   ): AsyncIterable<ConsumerTurnEvent> {
     const recap = this.lastRecap(transcript);
+    const staleDuplicateRequest = this.hasAnsweredEquivalentRequest(key, input.message);
+    const userBoxTranscript = staleDuplicateRequest
+      ? [
+          ...transcript,
+          {
+            role: "system" as const,
+            content:
+              "The latest user request appears to be a stale queued duplicate of a request already answered by the private runtime. The private agent may decline this duplicate by returning exactly <end>.",
+            mode: "handoff" as const,
+            at: new Date().toISOString(),
+          },
+        ]
+      : transcript;
     const userMachine: MachineState = {
       location: "user-box",
       tools: true,
@@ -895,9 +928,10 @@ export class ConsumerBoxAgentOrchestrator {
       status: "live",
     };
     const userHidden = buildHiddenContext({
-      transcript,
+      transcript: userBoxTranscript,
       machine: userMachine,
       partialShared,
+      staleDuplicateRequest,
     });
     yield {
       type: "context.injected",
@@ -922,7 +956,7 @@ export class ConsumerBoxAgentOrchestrator {
       boxId: box.id,
       recap,
       latestUserMessage: input.message,
-      transcript,
+      transcript: userBoxTranscript,
       selection: input.selection,
       capabilities,
       hiddenContext: userHidden,
@@ -1001,6 +1035,7 @@ export class ConsumerBoxAgentOrchestrator {
       };
       transcript.push(assistantMessage);
       this.appendTranscript(key, assistantMessage);
+      this.markAnsweredRequest(key, input.message);
     }
     yield {
       type: "turn.done",
@@ -1197,6 +1232,16 @@ function stripSharedControl(text: string): string {
     .replace(SHARED_ROUTING_RE, "")
     .replace(/\s+\n/g, "\n")
     .trim();
+}
+
+function requestFingerprint(message: string): string {
+  return String(message ?? "")
+    .toLowerCase()
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function sanitizeSharedBridgeText(text: string): string {

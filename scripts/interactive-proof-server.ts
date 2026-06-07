@@ -38,7 +38,7 @@ const orchestrator = new ConsumerBoxAgentOrchestrator({
   readinessPollMs: 2000,
   handoffTimeoutMs: 120_000,
   resumeTimeoutMs: 60_000,
-  autoStopIdleMs: 60_000,
+  autoStopIdleMs: 10_000,
 });
 
 function keyAvailable(provider: string): boolean {
@@ -246,7 +246,7 @@ function html() {
 *{box-sizing:border-box}html,body{height:100%;margin:0}body{min-height:100dvh;background:#fff}body.hide-traces .msg.trace{display:none}
 .shell{height:100dvh;max-width:1180px;margin:0 auto;display:grid;grid-template-columns:minmax(380px,560px) 330px;gap:24px;align-items:stretch;padding:0 24px}.app{height:100dvh;min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e0e0e0;border-right:1px solid #e0e0e0}
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e0e0e0;padding:calc(14px + env(safe-area-inset-top)) 16px 14px;display:grid;gap:12px}
-.counters{display:grid;grid-template-columns:1fr 1fr;gap:8px}.counter{border:1px solid #e0e0e0;background:#f6f6f6;padding:11px 12px;min-width:0}.label{display:block;color:#555;letter-spacing:.01em;font-size:12px;font-weight:400}.value{display:block;margin-top:3px;font:400 21px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:1px solid #111;background:#111;color:#fff;padding:10px 13px;font-size:13px;font-weight:400;text-align:center}
+.counters{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.counter{border:1px solid #e0e0e0;background:#f6f6f6;padding:11px 12px;min-width:0}.label{display:block;color:#555;letter-spacing:.01em;font-size:12px;font-weight:400}.value{display:block;margin-top:3px;font:400 21px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:1px solid #111;background:#111;color:#fff;padding:10px 13px;font-size:13px;font-weight:400;text-align:center}
 .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.controls button,.traceToggle{min-height:36px;background:#fff;color:#111;border:1px solid #d9d9d9;padding:0 12px;font-weight:400;font-size:12px;display:inline-flex;align-items:center;gap:7px;cursor:pointer}.traceToggle input{accent-color:#111}
 .chat{flex:1;overflow:auto;padding:18px 16px 20px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#555;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;font-weight:400;border:1px solid transparent}.msg.user{align-self:flex-end;background:#111;color:#fff}.msg.assistant{align-self:flex-start;background:#f6f6f6;color:#111;border-color:#e0e0e0}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed #d9d9d9;color:#555;font-size:12px;max-width:92%;padding:8px 10px}.tag{display:block;margin-bottom:4px;color:#555;letter-spacing:.01em;font-size:10px;font-weight:400}.msg.user .tag{color:#d9d9d9}.msg.trace .tag{color:#777}
 .composer{position:relative;display:block;padding:12px 16px calc(14px + env(safe-area-inset-bottom));border-top:1px solid #e0e0e0;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}textarea{width:100%;min-height:58px;max-height:140px;resize:none;border:1px solid #d9d9d9;background:#fff;color:#111;padding:13px 92px 13px 13px;font:inherit;font-weight:400;outline:none;display:block}textarea:focus{border-color:#111}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}#send{position:absolute;right:16px;bottom:calc(14px + env(safe-area-inset-bottom));height:42px;min-height:42px;background:#fc4b55;color:#fff;border:1px solid #fc4b55}
@@ -259,6 +259,7 @@ function html() {
     <section class="counters" aria-label="totals">
       <div class="counter"><span class="label">total spent</span><span class="value" id="totalCost">$0.000000</span></div>
       <div class="counter"><span class="label">machine time</span><span class="value" id="totalSeconds">0.0s</span></div>
+      <div class="counter"><span class="label">auto-stop</span><span class="value" id="autoStopTimer">idle</span></div>
     </section>
     <div class="state" id="machineState">Shared bridge ready · private machine stopped</div>
     <div class="controls"><button id="stopBox" type="button">Pause Box now</button><label class="traceToggle"><input id="showTraces" type="checkbox"/> Show traces</label></div>
@@ -285,6 +286,7 @@ function html() {
 <script>
 let H=[]; let MATRIX=[]; let PRICING=null; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser=(new URLSearchParams(location.search).get('userId')||'user-a'), selectedConversation=(new URLSearchParams(location.search).get('conversationId')||'conv-1');
 let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
+let autoStopInterval=null, autoStopDeadline=0, autoStopBoxId=null;
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 const hiddenContextPattern=new RegExp('<consumer-context>[\\s\\S]*?</consumer-context>','g');
@@ -293,8 +295,13 @@ function fmtUsd(n){return '$'+n.toFixed(6);}
 const routeState={phase:'idle',boxId:null,billing:false,finalRoute:null};
 function setRoute(route,text){const s=$('schematic');const r=$('routeStatus');if(!s||!r)return;s.dataset.route=route;r.textContent=text;}
 function setState(text){$('machineState').textContent=text;}
+function fmtAutoStopRemaining(ms){return Math.max(0,Math.ceil(ms/1000))+'s';}
+function clearAutoStopTimer(label){autoStopDeadline=0;autoStopBoxId=null;if(autoStopInterval){clearInterval(autoStopInterval);autoStopInterval=null;}$('autoStopTimer').textContent=label||'idle';}
+function renderAutoStopTimer(){if(!autoStopDeadline){$('autoStopTimer').textContent='idle';return;}const remaining=Math.max(0,autoStopDeadline-Date.now());$('autoStopTimer').textContent=fmtAutoStopRemaining(remaining);if(remaining<=0&&autoStopInterval){clearInterval(autoStopInterval);autoStopInterval=null;}}
+function startAutoStopTimer(ev){autoStopDeadline=ev.deadlineEpochMs||(Date.now()+Math.max(0,ev.remainingMs||0));autoStopBoxId=ev.boxId||autoStopBoxId;renderAutoStopTimer();if(autoStopInterval)clearInterval(autoStopInterval);autoStopInterval=setInterval(renderAutoStopTimer,200);}
+function describeAutoStop(ev){const remaining=fmtAutoStopRemaining(ev.remainingMs||0);if(ev.phase==='started'||ev.phase==='tick')return 'Assistant done · user idle · Box auto-stops in '+remaining;if(ev.phase==='stopping')return 'Auto-stop countdown reached 0s · stopping Box now';if(ev.phase==='canceled')return 'Auto-stop timer reset · new message is using the Box';return ev.note||'Auto-stop timer updated';}
 function boxLabel(id){return id&&id!=='pending'?' · '+id:'';}
-function resetRouteForTurn(){routeState.phase='accepted';routeState.boxId=null;routeState.billing=false;routeState.finalRoute=null;setRoute('shared','Route: message accepted; checking Box state and opening the shared bridge now.');}
+function resetRouteForTurn(){clearAutoStopTimer('paused');routeState.phase='accepted';routeState.boxId=null;routeState.billing=false;routeState.finalRoute=null;setRoute('shared','Route: message accepted; checking Box state and opening the shared bridge now.');}
 function routeIsPrivate(){return Boolean(routeState.boxId)||['billing','starting','provisioning','provisioned','cloning','resuming','ready','idle','running','handoff','runtime-proof','tools','user-box'].includes(routeState.phase);}
 function routeEvent(ev){
   if(ev.type==='stream.end')return;
@@ -315,6 +322,7 @@ function routeEvent(ev){
   if(ev.type==='exec'||ev.type==='harness.tool'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='tools';setRoute('private','Route: private Box runtime is using tools'+boxLabel(routeState.boxId)+'.');return;}
   if(ev.type==='user-box.delta'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='user-box';setRoute('private','Route: user-machine answer is streaming'+boxLabel(routeState.boxId)+'.');return;}
   if(ev.type==='billing.stop'){routeState.boxId=ev.boxId||routeState.boxId;routeState.billing=false;setRoute('private','Route: billing paused for private Box'+boxLabel(routeState.boxId)+'.');return;}
+  if(ev.type==='autostop.timer'){routeState.boxId=ev.boxId||routeState.boxId;if(ev.phase==='canceled'){setRoute('private','Route: auto-stop reset because a newer message arrived; countdown restarts after the active answer.');}else if(ev.phase==='stopping'){setRoute('private','Route: visible auto-stop countdown reached zero; stopping private Box'+boxLabel(routeState.boxId)+'.');}else{setRoute('private','Route: assistant finished and user is idle; auto-stop in '+fmtAutoStopRemaining(ev.remainingMs||0)+boxLabel(routeState.boxId)+'.');}return;}
   if(ev.type==='turn.done'){routeState.boxId=ev.boxId||routeState.boxId;routeState.finalRoute=ev.route||null;const route=ev.route||((ev.boxId||routeState.phase==='user-box'||routeState.phase==='handoff')?'user-box':'shared');const routeLabel=route==='bridge'?'private Box bridge':route==='direct'?'warm private Box':route==='user-box'?'user-machine':route;setRoute(route==='shared'?'shared':'private',route==='shared'?'Route: turn completed on shared infra; no stale private waiting state.':'Route: turn completed via '+routeLabel+' runtime'+boxLabel(routeState.boxId)+'.');return;}
 }
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}
@@ -327,11 +335,11 @@ let showTraces=false;
 function syncTraceVisibility(){document.body.classList.toggle('hide-traces',!showTraces);}
 function addMsg(cls,tag,text,key){const c=$('chat');$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML='<div class="tag">'+esc(tag)+'</div><div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');body.textContent=stripHidden(body.textContent+text);c.scrollTop=c.scrollHeight;return el;}
 function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date.now();if(!timer)timer=setInterval(renderTotals,100);}setState('Private machine running · tools active · billing live');renderTotals();}
-function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;}if(timer){clearInterval(timer);timer=null;}setState('Private machine stopped · billing paused');renderTotals();}
+function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;}if(timer){clearInterval(timer);timer=null;}clearAutoStopTimer('stopped');setState('Private machine stopped · billing paused');renderTotals();}
 const activeTurns=new Map();
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg){abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private Box boot requested');resetRouteForTurn();try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
+async function runTurn(msg){clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private Box boot requested');resetRouteForTurn();try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 const stopBtn=$('stopBox');
 const showTracesEl=$('showTraces');
@@ -372,7 +380,8 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);routeEvent
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');const detail=ev.phase==='tool_use'?((ev.toolName||'tool')+(ev.command?': '+ev.command:'')):(ev.isError?'tool result error':'tool result')+(ev.stdout?': '+ev.stdout.trim():'');addMsg('trace','tool event · user machine',detail+'\\n',keyFor(ev,localId,'tool')+':'+ev.phase+':'+(ev.command||ev.stdout||Math.random()));}
   else if(ev.type==='user-box.delta'){addMsg('assistant','assistant · user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);}
-  else if(ev.type==='turn.done'){setState('Turn complete · private machine may keep warm briefly');}
+  else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');}
   else if(ev.type==='error'){addMsg('assistant','assistant','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 load();
 </script></body></html>`;

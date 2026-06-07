@@ -190,10 +190,23 @@ test("new turn inside idle window cancels pending auto-stop and reuses warm Box"
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run follow up", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
   await d1;
 
+  const firstDoneIndex = first.findIndex((e) => e.type === "turn.done");
+  const firstTimerStartIndex = first.findIndex((e) => e.type === "autostop.timer" && e.phase === "started");
+  const firstTimerCanceledIndex = first.findIndex((e) => e.type === "autostop.timer" && e.phase === "canceled");
+  assert.ok(firstDoneIndex >= 0, "first response finished");
+  assert.ok(firstTimerStartIndex > firstDoneIndex, "idle countdown starts only after the private response is done");
+  assert.ok(firstTimerCanceledIndex > firstTimerStartIndex, "new user message visibly cancels/resets the first countdown");
   assert.ok(!first.some((e) => e.type === "billing.stop"), "first pending stop was cancelled by the newer turn");
+
   assert.equal(second.find((e) => e.type === "turn.done")?.boxId, boxId, "new turn reused the still-warm Box");
   assert.ok(second.some((e) => e.type === "lifecycle" && /already warm/.test(e.note || "")), "second turn went direct while Box was warm");
-  assert.ok(second.some((e) => e.type === "billing.stop"), "newest turn stops after its own idle window");
+  const secondDoneIndex = second.findIndex((e) => e.type === "turn.done");
+  const secondTimerStartIndex = second.findIndex((e) => e.type === "autostop.timer" && e.phase === "started");
+  const secondTimerStopIndex = second.findIndex((e) => e.type === "autostop.timer" && e.phase === "stopping");
+  const secondBillingStopIndex = second.findIndex((e) => e.type === "billing.stop");
+  assert.ok(secondTimerStartIndex > secondDoneIndex, "new countdown starts after the follow-up response finishes");
+  assert.ok(secondTimerStopIndex > secondTimerStartIndex, "visible countdown reaches stopping before Box stop lifecycle");
+  assert.ok(secondBillingStopIndex > secondTimerStopIndex, "billing stops promptly after visible countdown reaches zero");
   assert.equal((await box.get(boxId)).state, "archived");
 });
 

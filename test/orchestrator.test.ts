@@ -324,9 +324,9 @@ test("runHarness extracts real Claude stream-json text deltas without duplicatin
   const box = new StreamingLogBoxClient(snapshots);
   const toolEvents: any[] = [];
   const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (event) => toolEvents.push(event) });
-  const chunks: string[] = [];
+  const chunks: any[] = [];
   for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json", pollMs: 1 })) chunks.push(chunk);
-  assert.deepEqual(chunks, ["Hel", "lo"]);
+  assert.deepEqual(chunks.map((c: any) => c.text), ["Hel", "lo"]);
   assert.ok(toolEvents.some((e) => e.phase === "tool_use" && e.command === "curl -4 -s https://api.ipify.org"));
   assert.ok(toolEvents.some((e) => e.phase === "tool_result" && e.stdout === "78.47.150.66"));
 });
@@ -338,9 +338,9 @@ test("runHarness forwards Codex JSON final message only when token deltas are no
   ];
   const box = new StreamingLogBoxClient(snapshots);
   const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1 });
-  const chunks: string[] = [];
+  const chunks: any[] = [];
   for await (const chunk of caps.runHarness({ argv: ["codex", "exec", "--json", "hi"], outputMode: "codex-json", pollMs: 1 })) chunks.push(chunk);
-  assert.deepEqual(chunks, ["Done."]);
+  assert.deepEqual(chunks.map((c: any) => c.text), ["Done."]);
 });
 
 // A user box that takes time to provision: lets a follow-up message genuinely
@@ -873,10 +873,56 @@ test("OpenCode JSON parser streams documented text events and tool events", asyn
   const box = new StreamingLogBoxClient(snapshots);
   const toolEvents: any[] = [];
   const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (event) => toolEvents.push(event) });
-  const chunks: string[] = [];
+  const chunks: any[] = [];
   for await (const chunk of caps.runHarness({ argv: ["opencode", "run", "--format", "json", "hi"], outputMode: "opencode-json", pollMs: 1 })) chunks.push(chunk);
-  assert.deepEqual(chunks, ["Hel", "lo"]);
+  assert.deepEqual(chunks.map((c: any) => c.text), ["Hel", "lo"]);
   assert.ok(toolEvents.some((e) => e.toolName === "bash" && e.command === "nproc"));
+});
+
+
+test("Box harness preserves native assistant message boundaries and token chunks", async () => {
+  const snapshots = [
+    `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-one" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-one" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-two" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Sec" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-one" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-two" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Sec" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "ond" } } })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1 });
+  const chunks: any[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json", pollMs: 1 })) chunks.push(chunk);
+  assert.deepEqual(chunks.map((c) => [c.messageId, c.text]), [
+    ["msg-one", "Hel"],
+    ["msg-one", "lo"],
+    ["msg-two", "Sec"],
+    ["msg-two", "ond"],
+  ]);
+});
+
+test("orchestrator streams Box chunks immediately instead of buffering whole message", async () => {
+  const box = new FakeBoxClient();
+  const harness: HarnessAdapter = {
+    name: "chunked-box",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() { yield `Checking.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *userBox() {
+      yield { messageId: "first", text: "Hel" };
+      await new Promise((r) => setTimeout(r, 15));
+      yield { messageId: "first", text: "lo" };
+      yield { messageId: "second", text: "Sec" };
+      await new Promise((r) => setTimeout(r, 15));
+      yield { messageId: "second", text: "ond" };
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const selection = { harness: "chunked-box", provider: "anthropic", model: "m-1" };
+  const seen: any[] = [];
+  const started = Date.now();
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run chunk proof", selection })) {
+    if (e.type === "user-box.delta") seen.push({ text: e.text, messageId: e.messageId, at: Date.now() - started });
+  }
+  assert.deepEqual(seen.map((e) => [e.messageId, e.text]), [["first", "Hel"], ["first", "lo"], ["second", "Sec"], ["second", "ond"]]);
+  assert.ok(seen[0].at < 15, `first chunk should be emitted before the full message is available, saw ${seen[0].at}ms`);
 });
 
 test("transcript flow: shared chatter around one Box request does not duplicate or delay first Box answer", async () => {

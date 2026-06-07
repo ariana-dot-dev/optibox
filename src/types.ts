@@ -78,6 +78,17 @@ export interface HarnessRunSpec {
   pollMs?: number;
 }
 
+/** User-visible text emitted by a harness, with optional native assistant-message identity. */
+export interface HarnessTextChunk {
+  text: string;
+  /** Stable within one harness invocation. Chunks with different ids must render as separate assistant messages. */
+  messageId?: string;
+  /** Monotonic fallback when the native runtime exposes message boundaries without ids. */
+  messageIndex?: number;
+}
+
+export type HarnessOutputChunk = string | HarnessTextChunk;
+
 /** Real tool telemetry emitted by a harness' native streaming/event output. */
 export interface HarnessToolEvent {
   phase: "tool_use" | "tool_result";
@@ -105,7 +116,7 @@ export interface UserBoxCapabilities {
   readonly mode: "user-box-full";
   boxId: string;
   /** Run the developer's real external harness inside the Box, streaming stdout. */
-  runHarness(spec: HarnessRunSpec): AsyncIterable<string>;
+  runHarness(spec: HarnessRunSpec): AsyncIterable<HarnessOutputChunk>;
   /** Low-level Box substrate primitives also available to adapters. */
   command(command: string, opts?: { cwd?: string; env?: Record<string, string>; timeoutMs?: number }): Promise<CommandResult>;
   readFile(path: string): Promise<string>;
@@ -166,7 +177,7 @@ export interface HarnessAdapter {
   /** Restricted, fast first response. Real LLM allowed but NO Box actions. */
   shared(ctx: SharedContext): AsyncIterable<string>;
   /** Full continuation: runs the REAL external harness inside the user Box. */
-  userBox(ctx: UserBoxContext): AsyncIterable<string>;
+  userBox(ctx: UserBoxContext): AsyncIterable<HarnessOutputChunk>;
 }
 
 export interface SessionStore {

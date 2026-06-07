@@ -184,3 +184,75 @@ test("interactive demo client sends exactly one /api/send after page load", asyn
     "combined enter",
   ]);
 });
+
+test("interactive demo client renders distinct Box assistant messages by native message id", async () => {
+  const script = extractClientScript(readFileSync("scripts/interactive-proof-server.ts", "utf8"));
+  const elements = new Map<string, FakeElement>();
+  const getElement = (id: string) => {
+    let el = elements.get(id);
+    if (!el) {
+      el = new FakeElement(id);
+      elements.set(id, el);
+    }
+    return el;
+  };
+  for (const id of [
+    "composer", "msg", "send", "stopBox", "showTraces", "chat", "empty",
+    "schematic", "routeStatus", "machineState", "totalSeconds", "totalCost", "autoStopTimer", "matrix",
+  ]) getElement(id);
+
+  let now = 2_000_000;
+  const context = vm.createContext({
+    console: { ...console, debug() {} },
+    AbortController,
+    TextDecoder,
+    TextEncoder,
+    URLSearchParams,
+    location: { search: "" },
+    setInterval,
+    clearInterval,
+    document: {
+      body: new FakeElement("body"),
+      getElementById: getElement,
+      createElement: () => new FakeElement(),
+    },
+    globalThis: { crypto: { randomUUID: () => "turn-ui-proof" } },
+    Date: Object.assign(class extends Date { static now() { now += 1000; return now; } }, Date),
+    fetch: async (url: string, init?: any) => {
+      if (url === "/api/harnesses") {
+        return {
+          ok: true,
+          json: async () => ({
+            harnesses: [{ name: "claude", models: [{ provider: "anthropic", model: "claude-sonnet", keyAvailable: true }] }],
+            runtimeFeasibility: [],
+            pricing: { ratePerSecond: 0.001 },
+          }),
+        };
+      }
+      if (url === "/api/send") {
+        JSON.parse(init.body);
+        return { ok: true, body: makeReadableSse([
+          { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-1", text: "Hel" },
+          { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-1", text: "lo" },
+          { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-2", text: "Sec" },
+          { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-2", text: "ond" },
+          { type: "stream.end" },
+        ]) };
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    },
+  });
+
+  vm.runInContext(script, context);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const msg = getElement("msg");
+  msg.value = "prove box messages";
+  getElement("composer").dispatch("submit");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const assistants = getElement("chat").children.filter((el) => el.className.includes("assistant"));
+  assert.equal(assistants.length, 2, "two native Box assistant messages should create two bubbles");
+  assert.deepEqual(assistants.map((el) => el.textContent), ["Hello", "Second"]);
+});

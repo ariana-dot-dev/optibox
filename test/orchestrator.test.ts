@@ -453,9 +453,14 @@ test("first greeting eagerly starts private Box before shared-only answer is fin
 
   const bootIdx = events.findIndex((e) => e.type === "trace" && e.stage === "box.boot.start");
   const lifecycleIdx = events.findIndex((e) => e.type === "lifecycle" && ["starting", "provisioning", "resuming", "ready"].includes(e.state));
+  const boot = events[bootIdx];
+  const billingIdx = events.findIndex((e) => e.type === "billing.start");
   const sharedIdx = events.findIndex((e) => e.type === "shared.delta");
   assert.ok(lifecycleIdx >= 0, "runtime emits a real lifecycle event for the eager Box start");
   assert.ok(bootIdx >= 0 && bootIdx < sharedIdx, "private Box start is requested before the shared greeting streams");
+  assert.ok(boot?.boxId && boot.boxId !== "pending", "boot.start is emitted only after a real Box id exists");
+  assert.ok(/accepted|exists/.test(boot?.message || ""), "boot.start describes a confirmed Box API state, not an intent");
+  assert.ok(billingIdx >= 0 && billingIdx < sharedIdx, "eager prepare starts visible per-user billing even if the private answer is later suppressed");
   assert.equal(events.filter((e) => e.type === "user-box.delta").length, 0, "shared-only greeting is not mislabeled as a private/tool answer");
   assert.equal(events.find((e) => e.type === "turn.done")?.route, "shared", "final route label remains honest for a shared-only answer");
   assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "one private user Box was started for the first greeting");

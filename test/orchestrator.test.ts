@@ -439,6 +439,28 @@ test("shared-only cold greeting does not later answer a follow-up private turn",
   assert.ok(ip.some((e) => e.type === "shared.delta"), "follow-up still receives immediate shared bridge while Box is not ready/busy");
 });
 
+
+test("first greeting eagerly starts private Box before shared-only answer is finalized", async () => {
+  const box = new SlowUserBoxClient();
+  box.delayMs = 60;
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 100_000 });
+
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
+    events.push(e);
+    if (e.type === "turn.done") break;
+  }
+
+  const bootIdx = events.findIndex((e) => e.type === "trace" && e.stage === "box.boot.start");
+  const lifecycleIdx = events.findIndex((e) => e.type === "lifecycle" && ["starting", "provisioning", "resuming", "ready"].includes(e.state));
+  const sharedIdx = events.findIndex((e) => e.type === "shared.delta");
+  assert.ok(lifecycleIdx >= 0, "runtime emits a real lifecycle event for the eager Box start");
+  assert.ok(bootIdx >= 0 && bootIdx < sharedIdx, "private Box start is requested before the shared greeting streams");
+  assert.equal(events.filter((e) => e.type === "user-box.delta").length, 0, "shared-only greeting is not mislabeled as a private/tool answer");
+  assert.equal(events.find((e) => e.type === "turn.done")?.route, "shared", "final route label remains honest for a shared-only answer");
+  assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "one private user Box was started for the first greeting");
+});
+
 test("not-ready turns answer from shared first while private runtime starts in parallel", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 60;
@@ -584,6 +606,10 @@ test("send emits immediate trace and bridge before slow Box status resolves", as
 test("interactive proof UI has no global message queue and can abort stale shared streams", async () => {
   const html = await import("node:fs/promises").then((fs) => fs.readFile("scripts/interactive-proof-server.ts", "utf8"));
   assert.match(html, /activeTurns=new Map/);
+  assert.match(html, /function routeEvent\(ev\)/);
+  assert.doesNotMatch(html, /function routeForState/);
+  assert.doesNotMatch(html, /Route: handed off to the user machine\./);
+  assert.match(html, /Not handed off yet/);
   assert.match(html, /abortInterruptibleSharedTurns/);
   assert.match(html, /submit event fired/);
   assert.match(html, /backend.request.received/);

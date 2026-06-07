@@ -487,10 +487,32 @@ export class ConsumerBoxAgentOrchestrator {
     yield {
       type: "trace",
       stage: "shared.reasoning.start",
-      message: "shared assistant is ready to respond if the private runtime is not immediately available; waiting for precise status before injecting hidden machine state",
+      message: "shared assistant is ready to respond if the private runtime is not immediately available; private Box boot/resume is being requested eagerly",
       harness: harness.name,
       model: input.selection.model,
     };
+
+    const recoveryEvents: ConsumerTurnEventBody[] = [];
+    let privateStartedStatus: UserBoxStatus | undefined;
+    const privateReady = (async () => {
+      const release = await this.acquireLock(this.boxLocks, key);
+      try {
+        const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
+        privateStartedStatus = latestStatus;
+        const box = latestStatus.kind === "ready"
+          ? latestStatus.box
+          : await this.ensureUserBoxWithRecovery(
+              input.userId,
+              input.conversationId,
+              latestStatus,
+              (event) => recoveryEvents.push(event),
+            );
+        return { box, status: latestStatus, release };
+      } catch (error) {
+        release();
+        throw error;
+      }
+    })();
 
     let resolvedStatus = await statusPromise;
     yield {
@@ -502,14 +524,38 @@ export class ConsumerBoxAgentOrchestrator {
       ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
     };
 
+    const bootStatus = privateStartedStatus ?? resolvedStatus;
+    const bootState = bootStatus.kind === "ready"
+      ? "ready"
+      : bootStatus.kind === "archived" || bootStatus.kind === "archiving"
+        ? "resuming"
+        : "starting";
+    yield {
+      type: "lifecycle",
+      state: bootState,
+      boxId: "boxId" in bootStatus ? bootStatus.boxId : "pending",
+      note: bootState === "ready"
+        ? "private Box was already warm when this turn arrived"
+        : bootState === "resuming"
+          ? "private Box resume requested eagerly in parallel with the shared response"
+          : "private Box start requested eagerly in parallel with the shared response",
+    };
+    yield {
+      type: "trace",
+      stage: "box.boot.start",
+      message: "private Box boot/resume/recovery was requested immediately for this user message",
+      harness: harness.name,
+      model: input.selection.model,
+      ...("boxId" in bootStatus ? { boxId: bootStatus.boxId } : {}),
+    };
+
     // True fast path: if the private runtime is known warm and no stop/turn has
     // the private lock, route directly. This preserves the adaptive behavior
     // that avoids unnecessary shared bridge text for a ready Box.
     if (resolvedStatus.kind === "ready" && !lockBusyAtSubmit) {
-      const release = await this.acquireLock(this.boxLocks, key);
+      const privateResult = await privateReady;
       try {
-        const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
-        if (latestStatus.kind === "ready") {
+        if (privateResult.status.kind === "ready") {
           yield {
             type: "shared.larp",
             harness: harness.name,
@@ -520,16 +566,16 @@ export class ConsumerBoxAgentOrchestrator {
             input,
             key,
             harness,
-            latestStatus.box,
+            privateResult.box,
             transcript,
             "",
-            latestStatus,
+            privateResult.status,
           );
           return;
         }
-        resolvedStatus = latestStatus;
+        resolvedStatus = privateResult.status;
       } finally {
-        release();
+        privateResult.release();
       }
     }
 
@@ -564,35 +610,6 @@ export class ConsumerBoxAgentOrchestrator {
         bridgeStatus === "resuming"
           ? "private environment is resuming; shared assistant is covering latency"
           : "private environment is starting; shared assistant is covering latency",
-    };
-
-    const recoveryEvents: ConsumerTurnEventBody[] = [];
-    const privateReady = (async () => {
-      const release = await this.acquireLock(this.boxLocks, key);
-      try {
-        const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
-        const box = latestStatus.kind === "ready"
-          ? latestStatus.box
-          : await this.ensureUserBoxWithRecovery(
-              input.userId,
-              input.conversationId,
-              latestStatus,
-              (event) => recoveryEvents.push(event),
-            );
-        return { box, status: latestStatus, release };
-      } catch (error) {
-        release();
-        throw error;
-      }
-    })();
-
-    yield {
-      type: "trace",
-      stage: "box.boot.start",
-      message: "private Box boot/resume/recovery started in parallel with shared response",
-      harness: harness.name,
-      model: input.selection.model,
-      ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
     };
 
     let rawSharedText = "";

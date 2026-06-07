@@ -137,6 +137,23 @@ interface UserBoxBootAck {
   box: BoxInfo;
 }
 
+type PrivateRoundState = "needed" | "active" | "answered" | "suppressed" | "stale";
+
+interface PrivateRequestRound {
+  id: string;
+  fingerprint: string;
+  message: string;
+  state: PrivateRoundState;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface ConversationPrivateRequestState {
+  active?: PrivateRequestRound;
+  answeredFingerprints: Set<string>;
+  rounds: Map<string, PrivateRequestRound>;
+}
+
 export class ConsumerBoxAgentOrchestrator {
   private readonly sessions;
   private readonly recapper;
@@ -149,10 +166,12 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly userBoxStarts = new Map<string, Promise<BoxInfo>>();
   /** Per-conversation FIFO mutex for private Box work. */
   private readonly boxLocks = new Map<string, Promise<void>>();
-  /** Monotonic per-conversation counter. Delayed auto-stop only fires if no newer user turn bumped this value. */
+  /** Monotonic per-conversation submit counter for tracing/order-sensitive bookkeeping. */
   private readonly turnSequences = new Map<string, number>();
-  /** Per-conversation normalized user requests that already produced a private-runtime answer. */
-  private readonly answeredRequestFingerprints = new Map<string, Set<string>>();
+  /** Monotonic per-conversation private-work counter. Shared-only/suppressed chatter must not cancel private idle stops. */
+  private readonly privateActivitySequences = new Map<string, number>();
+  /** Single authoritative per-conversation Box-request state machine. */
+  private readonly privateRequests = new Map<string, ConversationPrivateRequestState>();
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -451,7 +470,7 @@ export class ConsumerBoxAgentOrchestrator {
   async *runTurn(input: ConsumerTurnInput): AsyncIterable<ConsumerTurnEvent> {
     const key = `${input.userId}:${input.conversationId}`;
     const turnId = randomUUID();
-    const turnSequence = this.bumpTurnSequence(key);
+    this.bumpTurnSequence(key);
     // Do not await the remote Box status before emitting. A slow Box API check
     // made the preview look like Send did nothing because no SSE bytes were
     // flushed until userBoxStatus resolved. Status still runs immediately.
@@ -479,16 +498,18 @@ export class ConsumerBoxAgentOrchestrator {
       if (
         ev.type === "handoff.started" ||
         ev.type === "user-box.delta" ||
+        ev.type === "billing.start" ||
         (ev.type === "turn.done" && Boolean(ev.boxId))
       ) usedPrivateBox = true;
       yield { ...ev, turnId };
     }
 
-    // Keep the Box warm briefly after the answer. If another user turn arrives
-    // during this window, it bumps turnSequences[key], this stop is skipped,
-    // and the next turn can reuse the warm Box immediately.
+    // Keep the Box warm briefly after private work/billing. Only another
+    // private-producing turn bumps privateActivitySequences[key]; shared-only
+    // chatter must not cancel the original request's idle stop.
     if (usedPrivateBox) {
-      for await (const ev of this.stopAfterIdle(input, key, turnSequence))
+      const privateSequence = this.bumpPrivateActivitySequence(key);
+      for await (const ev of this.stopAfterIdle(input, key, privateSequence))
         yield { ...ev, turnId };
     }
   }
@@ -522,6 +543,9 @@ export class ConsumerBoxAgentOrchestrator {
       model: input.selection.model,
     };
 
+    const activeAtSubmit = this.activePrivateRound(key);
+    const candidateRound = activeAtSubmit ? undefined : this.reservePrivateRound(key, input.message);
+    const roundBlockedAtSubmit = Boolean(activeAtSubmit || candidateRound?.state === "stale");
     const recoveryEvents: ConsumerTurnEventBody[] = [];
     let settleBootAck!: (ack: UserBoxBootAck) => void;
     let rejectBootAck!: (error: unknown) => void;
@@ -531,26 +555,28 @@ export class ConsumerBoxAgentOrchestrator {
       rejectBootAck = reject;
     });
     void bootAckPromise.catch(() => undefined);
-    const privateReady = (async () => {
-      const release = await this.acquireLock(this.boxLocks, key);
-      try {
-        const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
-        const box = latestStatus.kind === "ready"
-          ? (settleBootAck({ action: "already-ready", box: latestStatus.box }), latestStatus.box)
-          : await this.ensureUserBoxWithRecovery(
-              input.userId,
-              input.conversationId,
-              latestStatus,
-              (event) => recoveryEvents.push(event),
-              settleBootAck,
-            );
-        return { box, status: latestStatus, release };
-      } catch (error) {
-        release();
-        rejectBootAck(error);
-        throw error;
-      }
-    })();
+    const privateReady = roundBlockedAtSubmit
+      ? undefined
+      : (async () => {
+          const release = await this.acquireLock(this.boxLocks, key);
+          try {
+            const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
+            const box = latestStatus.kind === "ready"
+              ? (settleBootAck({ action: "already-ready", box: latestStatus.box }), latestStatus.box)
+              : await this.ensureUserBoxWithRecovery(
+                  input.userId,
+                  input.conversationId,
+                  latestStatus,
+                  (event) => recoveryEvents.push(event),
+                  settleBootAck,
+                );
+            return { box, status: latestStatus, release };
+          } catch (error) {
+            release();
+            rejectBootAck(error);
+            throw error;
+          }
+        })();
 
     let resolvedStatus = await statusPromise;
     yield {
@@ -562,11 +588,15 @@ export class ConsumerBoxAgentOrchestrator {
       ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
     };
 
-    if (lockBusyAtSubmit) {
+    if (roundBlockedAtSubmit || lockBusyAtSubmit) {
       yield {
         type: "trace",
-        stage: "box.boot.queued",
-        message: "private Box boot/resume is queued behind an active private runtime or stop; no Box API start/resume has been confirmed for this turn yet",
+        stage: activeAtSubmit ? "private-round.active" : candidateRound?.state === "stale" ? "private-round.stale" : "box.boot.queued",
+        message: activeAtSubmit
+          ? `private round ${activeAtSubmit.id} is already active for this conversation; this shared turn will not enqueue another Box round`
+          : candidateRound?.state === "stale"
+            ? "this request was already answered by the private runtime; no Box round will be queued"
+            : "private Box boot/resume is queued behind an active private runtime or stop; no Box API start/resume has been confirmed for this turn yet",
         harness: harness.name,
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
@@ -592,7 +622,7 @@ export class ConsumerBoxAgentOrchestrator {
     // True fast path: if the private runtime is known warm and no stop/turn has
     // the private lock, route directly. This preserves the adaptive behavior
     // that avoids unnecessary shared bridge text for a ready Box.
-    if (resolvedStatus.kind === "ready" && !lockBusyAtSubmit) {
+    if (resolvedStatus.kind === "ready" && !lockBusyAtSubmit && !activeAtSubmit && privateReady && candidateRound) {
       const privateResult = await privateReady;
       try {
         if (privateResult.status.kind === "ready") {
@@ -602,6 +632,20 @@ export class ConsumerBoxAgentOrchestrator {
             toolIntent: true,
             note: "private environment already warm; skipping shared bridge and continuing directly",
           };
+          const round = candidateRound;
+          if (round.state === "stale") {
+            yield {
+              type: "trace",
+              stage: "private-round.suppressed",
+              message: "private Box output suppressed because this request is stale or already answered",
+              harness: harness.name,
+              model: input.selection.model,
+              boxId: privateResult.box.id,
+            };
+            yield { type: "turn.done", boxId: privateResult.box.id, harness: harness.name, model: input.selection.model, route: "shared" };
+            return;
+          }
+          this.markPrivateRound(key, round, "active");
           yield* this.runPrivateRuntime(
             input,
             key,
@@ -610,6 +654,7 @@ export class ConsumerBoxAgentOrchestrator {
             transcript,
             "",
             privateResult.status,
+            round,
           );
           return;
         }
@@ -692,10 +737,46 @@ export class ConsumerBoxAgentOrchestrator {
       this.appendTranscript(key, sharedMessage);
     }
 
+    const needsPrivate = sharedNeedsPrivate(rawSharedText, input.message);
+    if (!needsPrivate) {
+      if (candidateRound) this.markPrivateRound(key, candidateRound, "suppressed");
+      this.discardPreparedPrivateRuntime(privateReady);
+      yield {
+        type: "trace",
+        stage: "private-round.suppressed",
+        message: "authoritative request state marked this turn suppressed because the shared answer did not require a private Box round",
+        harness: harness.name,
+        model: input.selection.model,
+        ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+      };
+      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+      return;
+    }
+
+    const round = candidateRound;
+    if (!round || round.state === "stale" || activeAtSubmit || !privateReady) {
+      if (round) this.markPrivateRound(key, round, "stale");
+      this.discardPreparedPrivateRuntime(privateReady);
+      yield {
+        type: "trace",
+        stage: "private-round.suppressed",
+        message: activeAtSubmit
+          ? `private round ${activeAtSubmit.id} is already active; not enqueueing another Box round for this shared-side message`
+          : "private Box output suppressed because this request is stale or already answered",
+        harness: harness.name,
+        model: input.selection.model,
+        ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+      };
+      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+      return;
+    }
+    this.markPrivateRound(key, round, "active");
+
     let privateResult: { box: BoxInfo; status: UserBoxStatus; release: () => void };
     try {
       privateResult = await privateReady;
     } catch (error) {
+      this.markPrivateRound(key, round, "suppressed");
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
       yield {
         type: "turn.blocked",
@@ -726,6 +807,7 @@ export class ConsumerBoxAgentOrchestrator {
         transcript,
         sharedText,
         privateResult.status,
+        round,
       );
     } finally {
       privateResult.release();
@@ -740,6 +822,7 @@ export class ConsumerBoxAgentOrchestrator {
     transcript: TranscriptMessage[],
     sharedText: string,
     resolvedStatus: UserBoxStatus,
+    round: PrivateRequestRound,
   ): AsyncIterable<ConsumerTurnEvent> {
     yield {
       type: "trace",
@@ -807,6 +890,7 @@ export class ConsumerBoxAgentOrchestrator {
       transcript,
       sharedText,
       resolvedStatus.kind === "ready" ? "direct" : "bridge",
+      round,
     );
   }
 
@@ -850,27 +934,73 @@ export class ConsumerBoxAgentOrchestrator {
     this.transcripts.set(key, [...current, message]);
   }
 
-  private hasAnsweredEquivalentRequest(key: string, message: string): boolean {
-    const fingerprint = requestFingerprint(message);
-    return Boolean(
-      fingerprint && this.answeredRequestFingerprints.get(key)?.has(fingerprint),
-    );
+  private requestState(key: string): ConversationPrivateRequestState {
+    let state = this.privateRequests.get(key);
+    if (!state) {
+      state = { answeredFingerprints: new Set<string>(), rounds: new Map<string, PrivateRequestRound>() };
+      this.privateRequests.set(key, state);
+    }
+    return state;
   }
 
-  private markAnsweredRequest(key: string, message: string): void {
-    const fingerprint = requestFingerprint(message);
-    if (!fingerprint) return;
-    let answered = this.answeredRequestFingerprints.get(key);
-    if (!answered) {
-      answered = new Set<string>();
-      this.answeredRequestFingerprints.set(key, answered);
+  private activePrivateRound(key: string): PrivateRequestRound | undefined {
+    const active = this.privateRequests.get(key)?.active;
+    return active && (active.state === "needed" || active.state === "active") ? active : undefined;
+  }
+
+  private reservePrivateRound(key: string, message: string): PrivateRequestRound {
+    const state = this.requestState(key);
+    const fingerprint = requestFingerprint(message) || randomUUID();
+    const now = Date.now();
+    const existingActive = this.activePrivateRound(key);
+    const round: PrivateRequestRound = {
+      id: randomUUID(),
+      fingerprint,
+      message,
+      state: existingActive || state.answeredFingerprints.has(fingerprint) ? "stale" : "needed",
+      createdAt: now,
+      updatedAt: now,
+    };
+    state.rounds.set(round.id, round);
+    if (round.state === "needed") state.active = round;
+    return round;
+  }
+
+  private markPrivateRound(key: string, round: PrivateRequestRound, state: PrivateRoundState): void {
+    const conversation = this.requestState(key);
+    round.state = state;
+    round.updatedAt = Date.now();
+    conversation.rounds.set(round.id, round);
+    if (state === "answered") {
+      conversation.answeredFingerprints.add(round.fingerprint);
+      if (conversation.active?.id === round.id) delete conversation.active;
     }
-    answered.add(fingerprint);
+    if (state === "suppressed" || state === "stale") {
+      if (conversation.active?.id === round.id) delete conversation.active;
+    }
+  }
+
+  private isPrivateRoundCurrent(key: string, round: PrivateRequestRound): boolean {
+    const active = this.privateRequests.get(key)?.active;
+    return Boolean(active && active.id === round.id && active.state === "active");
+  }
+
+  private discardPreparedPrivateRuntime(
+    prepared?: Promise<{ box: BoxInfo; status: UserBoxStatus; release: () => void }>,
+  ): void {
+    if (!prepared) return;
+    void prepared.then((result) => result.release()).catch(() => undefined);
   }
 
   private bumpTurnSequence(key: string): number {
     const next = (this.turnSequences.get(key) ?? 0) + 1;
     this.turnSequences.set(key, next);
+    return next;
+  }
+
+  private bumpPrivateActivitySequence(key: string): number {
+    const next = (this.privateActivitySequences.get(key) ?? 0) + 1;
+    this.privateActivitySequences.set(key, next);
     return next;
   }
 
@@ -881,11 +1011,11 @@ export class ConsumerBoxAgentOrchestrator {
   ): AsyncIterable<ConsumerTurnEvent> {
     const delayMs = this.options.autoStopIdleMs ?? 5000;
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
-    if (this.turnSequences.get(key) !== turnSequence) return;
+    if (this.privateActivitySequences.get(key) !== turnSequence) return;
 
     const release = await this.acquireLock(this.boxLocks, key);
     try {
-      if (this.turnSequences.get(key) !== turnSequence) return;
+      if (this.privateActivitySequences.get(key) !== turnSequence) return;
       yield* this.stopUserBoxLocked(input.userId, input.conversationId);
     } finally {
       release();
@@ -906,9 +1036,10 @@ export class ConsumerBoxAgentOrchestrator {
     transcript: TranscriptMessage[],
     partialShared: string,
     route: "direct" | "bridge",
+    round: PrivateRequestRound,
   ): AsyncIterable<ConsumerTurnEvent> {
     const recap = this.lastRecap(transcript);
-    const staleDuplicateRequest = this.hasAnsweredEquivalentRequest(key, input.message);
+    const staleDuplicateRequest = round.state === "stale";
     const userBoxTranscript = staleDuplicateRequest
       ? [
           ...transcript,
@@ -986,6 +1117,19 @@ export class ConsumerBoxAgentOrchestrator {
       userText += text;
     }
     yield* flushExecEvents();
+    if (!this.isPrivateRoundCurrent(key, round)) {
+      this.markPrivateRound(key, round, "stale");
+      yield {
+        type: "trace",
+        stage: "private-round.output.suppressed",
+        message: `private Box output for round ${round.id} was stale and was deterministically suppressed`,
+        harness: harness.name,
+        model: input.selection.model,
+        boxId: box.id,
+      };
+      yield { type: "turn.done", boxId: box.id, harness: harness.name, model: input.selection.model, route: "shared" };
+      return;
+    }
     if (userText === "<end>") {
       yield {
         type: "trace",
@@ -995,6 +1139,7 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
         boxId: box.id,
       };
+      this.markPrivateRound(key, round, "suppressed");
       yield {
         type: "turn.done",
         boxId: box.id,
@@ -1035,8 +1180,9 @@ export class ConsumerBoxAgentOrchestrator {
       };
       transcript.push(assistantMessage);
       this.appendTranscript(key, assistantMessage);
-      this.markAnsweredRequest(key, input.message);
+      this.markPrivateRound(key, round, "answered");
     }
+    if (!userText) this.markPrivateRound(key, round, "suppressed");
     yield {
       type: "turn.done",
       boxId: box.id,
@@ -1232,6 +1378,20 @@ function stripSharedControl(text: string): string {
     .replace(SHARED_ROUTING_RE, "")
     .replace(/\s+\n/g, "\n")
     .trim();
+}
+
+function sharedNeedsPrivate(rawSharedText: string, message: string): boolean {
+  const match = SHARED_ROUTING_RE.exec(String(rawSharedText ?? ""));
+  if (match?.[1]) {
+    try {
+      const parsed = JSON.parse(match[1]) as { needsPrivate?: unknown };
+      if (typeof parsed.needsPrivate === "boolean") return parsed.needsPrivate;
+    } catch {
+      // Fall back to the deterministic message heuristic below if a harness
+      // emits malformed routing metadata.
+    }
+  }
+  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
 }
 
 function requestFingerprint(message: string): string {

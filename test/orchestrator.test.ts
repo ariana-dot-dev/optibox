@@ -880,6 +880,74 @@ test("OpenCode JSON parser streams documented text events and tool events", asyn
 });
 
 
+
+test("realCliHarness uses one phase-aware prompt builder for shared and user-box policies", async () => {
+  const { buildHarnessPromptBundle } = await import("../examples/shared.js");
+  const base = {
+    userId: "u",
+    conversationId: "c",
+    transcript: [],
+    selection: { harness: "h", provider: "anthropic", model: "m-1" },
+    hiddenContext: "<consumer-context></consumer-context>",
+  };
+  const sharedBundle = buildHarnessPromptBundle({
+    ...base,
+    message: "hello",
+    capabilities: createRestrictedSharedCapabilities(),
+    machine: { location: "shared-box", tools: false, status: "prewarming" },
+    toolIntent: false,
+  }, { phase: "shared", toolsAllowed: false, runtime: "shared-infra" });
+  const userBundle = buildHarnessPromptBundle({
+    ...base,
+    boxId: "box-1",
+    recap: "",
+    latestUserMessage: "hello",
+    capabilities: createUserBoxCapabilities(new FakeBoxClient(), "box-1"),
+    machine: { location: "user-box", tools: true, status: "live", boxId: "box-1" },
+    partialShared: "",
+  }, { phase: "user-box", toolsAllowed: true, runtime: "user-box" });
+
+  assert.match(sharedBundle.prompt, /<latest-user-request>hello<\/latest-user-request>/);
+  assert.match(userBundle.prompt, /<latest-user-request>hello<\/latest-user-request>/);
+  assert.match(sharedBundle.instructions, /private tools disabled by framework policy/);
+  assert.match(userBundle.instructions, /private tool-enabled environment/);
+  assert.equal(sharedBundle.policy.toolsAllowed, false);
+  assert.equal(userBundle.policy.toolsAllowed, true);
+});
+
+test("realCliHarness shared path can run the adapter-provided shared infra harness instead of provider fallback", async () => {
+  const { realCliHarness } = await import("../examples/shared.js");
+  const calls: any[] = [];
+  const harness = realCliHarness({
+    name: "unified-proof",
+    description: "proof",
+    bin: "proof",
+    models: [{ provider: "anthropic", model: "m-1" }],
+    buildArgv: () => ["proof"],
+    async *runSharedInfra(input) {
+      calls.push(input);
+      yield { text: `policy:${input.policy.runtime}:${String(input.policy.toolsAllowed)}:` };
+      yield { text: input.latestUserMessage };
+    },
+  });
+  const chunks: string[] = [];
+  for await (const chunk of harness.shared({
+    userId: "u",
+    conversationId: "c",
+    message: "hi from shared",
+    transcript: [],
+    selection: { harness: "unified-proof", provider: "anthropic", model: "m-1" },
+    capabilities: createRestrictedSharedCapabilities(),
+    hiddenContext: "<consumer-context></consumer-context>",
+    machine: { location: "shared-box", tools: false, status: "prewarming" },
+    toolIntent: false,
+  })) chunks.push(chunk);
+
+  assert.equal(chunks.join(""), "policy:shared-infra:false:hi from shared");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].prompt, /<latest-user-request>hi from shared<\/latest-user-request>/);
+});
+
 test("Box harness preserves native assistant message boundaries and token chunks", async () => {
   const snapshots = [
     `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-one" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n`,

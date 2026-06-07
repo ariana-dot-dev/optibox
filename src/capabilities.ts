@@ -1,4 +1,8 @@
-import type { BoxClient, CommandResult, HarnessOutputMode, HarnessRunSpec, HarnessToolEvent, SafeSharedCapabilities, UserBoxCapabilities } from "./types.js";
+import { spawn } from "node:child_process";
+import { mkdtemp, mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import type { BoxClient, CommandResult, HarnessOutputMode, HarnessRunSpec, HarnessRuntime, HarnessTextChunk, HarnessToolEvent, SafeSharedCapabilities, UserBoxCapabilities } from "./types.js";
 
 class CapabilityDeniedError extends Error {
   constructor(action: string) {
@@ -36,16 +40,19 @@ interface HarnessOutputParser {
   mode: HarnessOutputMode;
   lineBuffer: string;
   emittedText: string;
+  activeMessageId?: string;
+  activeMessageIndex: number;
+  emittedByMessage: Map<string, string>;
   onToolEvent?: (event: HarnessToolEvent) => void;
 }
 
 function createHarnessOutputParser(mode: HarnessOutputMode, onToolEvent?: (event: HarnessToolEvent) => void): HarnessOutputParser {
-  return { mode, lineBuffer: "", emittedText: "", ...(onToolEvent ? { onToolEvent } : {}) };
+  return { mode, lineBuffer: "", emittedText: "", activeMessageIndex: 0, emittedByMessage: new Map(), ...(onToolEvent ? { onToolEvent } : {}) };
 }
 
-function* parseHarnessOutput(rawDelta: string, parser: HarnessOutputParser): Iterable<string> {
+function* parseHarnessOutput(rawDelta: string, parser: HarnessOutputParser): Iterable<HarnessTextChunk> {
   if (parser.mode === "raw-stdout") {
-    yield rawDelta;
+    yield { text: rawDelta, messageId: "stdout-0", messageIndex: 0 };
     return;
   }
   parser.lineBuffer += rawDelta;
@@ -57,34 +64,33 @@ function* parseHarnessOutput(rawDelta: string, parser: HarnessOutputParser): Ite
   }
 }
 
-function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): string {
+function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): HarnessTextChunk | undefined {
   const trimmed = line.trim();
-  if (!trimmed.startsWith("{")) return "";
+  if (!trimmed.startsWith("{")) return undefined;
   let j: any;
-  try { j = JSON.parse(trimmed); } catch { return ""; }
+  try { j = JSON.parse(trimmed); } catch { return undefined; }
 
   if (parser.mode === "claude-stream-json") {
     emitClaudeToolEvent(j, parser);
+    noteMessageBoundary(j, parser);
     const delta = j.type === "stream_event" && j.event?.type === "content_block_delta" && j.event.delta?.type === "text_delta"
       ? j.event.delta.text
       : undefined;
     if (typeof delta === "string") {
-      parser.emittedText += delta;
-      return delta;
+      return emitChunk(delta, parser);
     }
     if (!parser.emittedText && j.type === "result" && typeof j.result === "string") {
-      parser.emittedText = j.result;
-      return j.result;
+      return emitChunk(j.result, parser);
     }
-    return "";
+    return undefined;
   }
 
   if (parser.mode === "opencode-json" || parser.mode === "pi-json") {
     emitGenericToolEvent(j, parser);
+    noteMessageBoundary(j, parser);
     const ev = j.assistantMessageEvent;
     if (j.type === "message_update" && ev?.type === "text_delta" && typeof ev.delta === "string") {
-      parser.emittedText += ev.delta;
-      return ev.delta;
+      return emitChunk(ev.delta, parser);
     }
     // OpenCode's documented JSON mode emits raw JSON events such as `text` and
     // `tool_use`; Pi RPC/JSON variants commonly emit message_update deltas.
@@ -92,23 +98,24 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): string
       : j.type === "text" && typeof j.part?.text === "string" ? j.part.text
       : typeof j.delta === "string" ? j.delta
       : "";
-    if (directText) return emitNewSuffix(parser.emittedText + directText, parser);
+    if (directText) return emitChunk(directText, parser);
     const full = j.type === "message_end" && extractAssistantMessageText(j.message);
     return emitNewSuffix(String(full || ""), parser);
   }
 
   if (parser.mode === "codex-json") {
+    noteMessageBoundary(j, parser);
     const delta = typeof j.delta === "string" ? j.delta
       : typeof j.delta?.text === "string" ? j.delta.text
       : typeof j.item?.delta === "string" ? j.item.delta
       : typeof j.item?.delta?.text === "string" ? j.item.delta.text
       : "";
-    if (delta) { parser.emittedText += delta; return delta; }
+    if (delta) return emitChunk(delta, parser);
     const full = j.type === "item.completed" && j.item?.type === "agent_message" && typeof j.item.text === "string" ? j.item.text : "";
     return emitNewSuffix(full, parser);
   }
 
-  return "";
+  return undefined;
 }
 
 function emitClaudeToolEvent(j: any, parser: HarnessOutputParser): void {
@@ -152,16 +159,51 @@ function emitGenericToolEvent(j: any, parser: HarnessOutputParser): void {
   }
 }
 
-function emitNewSuffix(fullText: string, parser: HarnessOutputParser): string {
-  if (!fullText) return "";
-  if (fullText.startsWith(parser.emittedText)) {
-    const next = fullText.slice(parser.emittedText.length);
-    parser.emittedText = fullText;
-    return next;
+function emitChunk(text: string, parser: HarnessOutputParser): HarnessTextChunk | undefined {
+  if (!text) return undefined;
+  const messageId = currentMessageId(parser);
+  const previous = parser.emittedByMessage.get(messageId) ?? "";
+  parser.emittedByMessage.set(messageId, previous + text);
+  parser.emittedText += text;
+  return { text, messageId, messageIndex: parser.activeMessageIndex };
+}
+
+function emitNewSuffix(fullText: string, parser: HarnessOutputParser): HarnessTextChunk | undefined {
+  if (!fullText) return undefined;
+  const messageId = currentMessageId(parser);
+  const previous = parser.emittedByMessage.get(messageId) ?? "";
+  if (fullText.startsWith(previous)) {
+    const next = fullText.slice(previous.length);
+    return emitChunk(next, parser);
   }
-  if (parser.emittedText && parser.emittedText.includes(fullText)) return "";
-  parser.emittedText += fullText;
-  return fullText;
+  if (previous && previous.includes(fullText)) return undefined;
+  return emitChunk(fullText, parser);
+}
+
+function currentMessageId(parser: HarnessOutputParser): string {
+  if (!parser.activeMessageId) {
+    parser.activeMessageId = `assistant-${parser.activeMessageIndex}`;
+  }
+  return parser.activeMessageId;
+}
+
+function setActiveMessage(parser: HarnessOutputParser, rawId?: unknown): void {
+  const id = typeof rawId === "string" && rawId ? rawId : `assistant-${parser.activeMessageIndex + 1}`;
+  if (parser.activeMessageId === id) return;
+  parser.activeMessageIndex += 1;
+  parser.activeMessageId = id;
+}
+
+function noteMessageBoundary(j: any, parser: HarnessOutputParser): void {
+  const event = j.event ?? j;
+  const explicitId = j.message?.id ?? event.message?.id ?? event.message_id ?? event.messageId ?? j.message_id ?? j.messageId ?? j.item?.id;
+  if (event.type === "message_start" || j.type === "message_start") {
+    setActiveMessage(parser, explicitId);
+    return;
+  }
+  if (explicitId && explicitId !== parser.activeMessageId && (j.type === "message_update" || j.type === "message_end" || j.type === "item.completed")) {
+    setActiveMessage(parser, explicitId);
+  }
 }
 
 function extractAssistantMessageText(message: any): string {
@@ -206,7 +248,7 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     return box.command(boxId, input);
   }
 
-  async function* runHarness(spec: HarnessRunSpec): AsyncIterable<string> {
+  async function* runHarness(spec: HarnessRunSpec): AsyncIterable<HarnessTextChunk> {
     options.onExec?.({ kind: "harness", argv: spec.argv });
     const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const workdir = spec.cwd ?? "cba-work";
@@ -251,18 +293,112 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
       // process gone but no exit marker -> stop polling
       if (pid) {
         const alive = (await box.command(boxId, { command: `kill -0 ${pid} 2>/dev/null && echo up || echo down`, timeoutMs: 15_000 })).stdout.trim();
-        if (alive === "down") { if (visible.length > offset) yield visible.slice(offset); return; }
+        if (alive === "down") { if (visible.length > offset) yield { text: visible.slice(offset), messageId: "stdout-0", messageIndex: 0 }; return; }
       }
     }
-    yield `\n[runHarness timed out after ${Math.round(timeoutMs / 1000)}s]`;
+    yield { text: `\n[runHarness timed out after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 };
   }
 
   return {
     mode: "user-box-full",
+    location: "user-box",
     boxId,
     runHarness,
     command,
     readFile: (path: string) => box.readFile(boxId, path),
     writeFile: (path: string, content: string) => box.writeFile(boxId, path, content),
   };
+}
+
+export interface SharedInfraCapabilityOptions {
+  /** Provider LLM keys exposed to the shared harness process (in addition to the host env). */
+  providerEnv?: Record<string, string>;
+  /** Called every time a real shared harness/command is launched (audit/proof). */
+  onExec?: (info: { kind: "command" | "harness"; argv?: string[]; command?: string }) => void;
+  /** Called when the harness' own stream reports a native tool call/result. */
+  onHarnessEvent?: (event: HarnessToolEvent) => void;
+  /** Override the process spawner (tests). Must match node:child_process spawn. */
+  spawn?: typeof spawn;
+}
+
+/**
+ * Shared-infra runtime. Runs the EXACT SAME external harness binary as the user
+ * Box, but as a local process on the always-on shared machine. The harness is
+ * launched with tools structurally disabled (the adapter passes the harness'
+ * native no-tool flags), so this runtime never needs — and never grants — the
+ * user's private machine. Multiple sessions can run in parallel in the same
+ * working directory because each turn gets its own temp workspace.
+ *
+ * This is the structural counterpart to {@link createUserBoxCapabilities}: same
+ * stdout parser, same chunk/message semantics, different execution location and
+ * tool policy. There is no separate "shared" LLM client and no provider fallback.
+ */
+export function createSharedInfraCapabilities(options: SharedInfraCapabilityOptions = {}): HarnessRuntime {
+  const providerEnv = options.providerEnv ?? {};
+  const spawnFn = options.spawn ?? spawn;
+
+  function baseEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
+    return { ...process.env, ...providerEnv, ...(extra ?? {}) };
+  }
+
+  async function command(cmd: string, opts: { cwd?: string; env?: Record<string, string>; timeoutMs?: number } = {}): Promise<CommandResult> {
+    options.onExec?.({ kind: "command", command: cmd });
+    return await new Promise<CommandResult>((resolve, reject) => {
+      const child = spawnFn("bash", ["-lc", cmd], { cwd: opts.cwd, env: baseEnv(opts.env), stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      const timer = opts.timeoutMs ? setTimeout(() => { child.kill("SIGKILL"); }, opts.timeoutMs) : undefined;
+      child.stdout?.on("data", (d) => { stdout += String(d); });
+      child.stderr?.on("data", (d) => { stderr += String(d); });
+      child.on("error", (err) => { if (timer) clearTimeout(timer); reject(err); });
+      child.on("close", (code) => { if (timer) clearTimeout(timer); resolve({ exitCode: code ?? 0, stdout, stderr }); });
+    });
+  }
+
+  async function* runHarness(spec: HarnessRunSpec): AsyncIterable<HarnessTextChunk> {
+    options.onExec?.({ kind: "harness", argv: spec.argv });
+    const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent);
+    const bin = spec.argv[0] ?? "";
+    const args = spec.argv.slice(1);
+    const child = spawnFn(bin, args, { cwd: spec.cwd, env: baseEnv(spec.env), stdio: ["ignore", "pipe", "pipe"] });
+    const timeoutMs = spec.timeoutMs ?? 240_000;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    child.stderr?.on("data", () => { /* surfaced via exit if non-zero; harness owns its own error text */ });
+    try {
+      if (child.stdout) {
+        for await (const buf of child.stdout) {
+          for (const chunk of parseHarnessOutput(String(buf), parser)) yield chunk;
+        }
+      }
+      // Flush any trailing partial JSON line the harness emitted without a newline.
+      if (parser.mode !== "raw-stdout" && parser.lineBuffer.trim()) {
+        const text = parseHarnessJsonLine(parser.lineBuffer.replace(/\r$/, ""), parser);
+        parser.lineBuffer = "";
+        if (text) yield text;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise<void>((resolve) => { child.on("close", () => resolve()); if (child.exitCode !== null) resolve(); });
+    if (timedOut) yield { text: `\n[shared harness timed out after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 };
+  }
+
+  async function writeFile(path: string, content: string): Promise<void> {
+    await mkdir(dirname(path), { recursive: true });
+    await fsWriteFile(path, content, "utf8");
+  }
+
+  return {
+    location: "shared-infra",
+    runHarness,
+    command,
+    readFile: (path: string) => fsReadFile(path, "utf8"),
+    writeFile,
+  };
+}
+
+/** Create a private temp working directory on shared infra (parallel-safe). */
+export async function makeSharedWorkdir(prefix = "optibox-shared-"): Promise<string> {
+  return await mkdtemp(join(tmpdir(), prefix));
 }

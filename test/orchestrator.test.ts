@@ -324,9 +324,9 @@ test("runHarness extracts real Claude stream-json text deltas without duplicatin
   const box = new StreamingLogBoxClient(snapshots);
   const toolEvents: any[] = [];
   const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (event) => toolEvents.push(event) });
-  const chunks: string[] = [];
+  const chunks: any[] = [];
   for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json", pollMs: 1 })) chunks.push(chunk);
-  assert.deepEqual(chunks, ["Hel", "lo"]);
+  assert.deepEqual(chunks.map((c: any) => c.text), ["Hel", "lo"]);
   assert.ok(toolEvents.some((e) => e.phase === "tool_use" && e.command === "curl -4 -s https://api.ipify.org"));
   assert.ok(toolEvents.some((e) => e.phase === "tool_result" && e.stdout === "78.47.150.66"));
 });
@@ -338,9 +338,9 @@ test("runHarness forwards Codex JSON final message only when token deltas are no
   ];
   const box = new StreamingLogBoxClient(snapshots);
   const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1 });
-  const chunks: string[] = [];
+  const chunks: any[] = [];
   for await (const chunk of caps.runHarness({ argv: ["codex", "exec", "--json", "hi"], outputMode: "codex-json", pollMs: 1 })) chunks.push(chunk);
-  assert.deepEqual(chunks, ["Done."]);
+  assert.deepEqual(chunks.map((c: any) => c.text), ["Done."]);
 });
 
 // A user box that takes time to provision: lets a follow-up message genuinely
@@ -855,6 +855,31 @@ test("codebase daemon example is executable and self-contained", async () => {
   assert.match(stdout, /Example codebase daemon observed \d+ CPU cores/);
   assert.match(stdout, /Runtime selection: anthropic\/claude-sonnet-4-6/);
 });
+
+test("codebase daemon --no-tools never reads host machine facts", async () => {
+  const child = spawn(process.execPath, [
+    "dist/examples/codebase-daemon/agentDaemon.js",
+    "--stream",
+    "--no-tools",
+    "--provider",
+    "anthropic",
+    "--model",
+    "claude-sonnet-4-6",
+    "--cwd",
+    "/tmp",
+    "--system-prompt-file",
+    "/tmp/CONSUMER_AGENT_SYSTEM.md",
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+  child.stdin.end("<latest-user-request>Check my CPU count.</latest-user-request>");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+  assert.equal(code, 0, stderr);
+  assert.doesNotMatch(stdout, /CPU cores/, "no-tools mode must not read os.cpus()");
+  assert.match(stdout, /no-tools mode/);
+});
 test("runtime feasibility matrix covers required harnesses", async () => {
   const { RUNTIME_FEASIBILITY } = await import("../src/runtimeMatrix.js");
   for (const harness of ["claude-agent-sdk", "codebase-daemon", "pi", "hermes", "opencode"]) {
@@ -873,10 +898,295 @@ test("OpenCode JSON parser streams documented text events and tool events", asyn
   const box = new StreamingLogBoxClient(snapshots);
   const toolEvents: any[] = [];
   const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (event) => toolEvents.push(event) });
-  const chunks: string[] = [];
+  const chunks: any[] = [];
   for await (const chunk of caps.runHarness({ argv: ["opencode", "run", "--format", "json", "hi"], outputMode: "opencode-json", pollMs: 1 })) chunks.push(chunk);
-  assert.deepEqual(chunks, ["Hel", "lo"]);
+  assert.deepEqual(chunks.map((c: any) => c.text), ["Hel", "lo"]);
   assert.ok(toolEvents.some((e) => e.toolName === "bash" && e.command === "nproc"));
+});
+
+
+
+test("realCliHarness uses one phase-aware prompt builder for shared and user-box policies", async () => {
+  const { buildHarnessPromptBundle } = await import("../examples/shared.js");
+  const base = {
+    userId: "u",
+    conversationId: "c",
+    transcript: [],
+    selection: { harness: "h", provider: "anthropic", model: "m-1" },
+    hiddenContext: "<consumer-context></consumer-context>",
+  };
+  const sharedBundle = buildHarnessPromptBundle({
+    ...base,
+    message: "hello",
+    capabilities: createRestrictedSharedCapabilities(),
+    machine: { location: "shared-box", tools: false, status: "prewarming" },
+    toolIntent: false,
+  }, { phase: "shared", toolsAllowed: false, runtime: "shared-infra" });
+  const userBundle = buildHarnessPromptBundle({
+    ...base,
+    boxId: "box-1",
+    recap: "",
+    latestUserMessage: "hello",
+    capabilities: createUserBoxCapabilities(new FakeBoxClient(), "box-1"),
+    machine: { location: "user-box", tools: true, status: "live", boxId: "box-1" },
+    partialShared: "",
+  }, { phase: "user-box", toolsAllowed: true, runtime: "user-box" });
+
+  assert.match(sharedBundle.prompt, /<latest-user-request>hello<\/latest-user-request>/);
+  assert.match(userBundle.prompt, /<latest-user-request>hello<\/latest-user-request>/);
+  assert.match(sharedBundle.instructions, /private tools disabled by framework policy/);
+  assert.match(userBundle.instructions, /private tool-enabled environment/);
+  assert.equal(sharedBundle.policy.toolsAllowed, false);
+  assert.equal(userBundle.policy.toolsAllowed, true);
+});
+
+// A HarnessRuntime test double that captures the argv/env the harness is
+// launched with and emits a canned stream-json reply. Used to prove the shared
+// surface runs the SAME harness code as the Box, only with tools disabled.
+class CapturingRuntime {
+  readonly location: "shared-infra" | "user-box";
+  commands: string[] = [];
+  lastArgv: string[] = [];
+  lastEnv: Record<string, string> | undefined;
+  constructor(location: "shared-infra" | "user-box") { this.location = location; }
+  async command(cmd: string): Promise<CommandResult> {
+    this.commands.push(cmd);
+    if (/^mktemp -d \/tmp\/consumer-agent-/.test(cmd)) {
+      return { exitCode: 0, stdout: "/tmp/consumer-agent-test-xyz\n", stderr: "" };
+    }
+    return { exitCode: 0, stdout: "ok\n", stderr: "" };
+  }
+  async *runHarness(spec: { argv: string[]; env?: Record<string, string> }) {
+    this.lastArgv = spec.argv;
+    this.lastEnv = spec.env;
+    yield { text: "ok", messageId: "assistant-0", messageIndex: 0 };
+  }
+  async readFile(): Promise<string> { return ""; }
+  async writeFile(): Promise<void> {}
+}
+
+function sharedCtx(message: string) {
+  return {
+    userId: "u",
+    conversationId: "c",
+    message,
+    transcript: [],
+    selection: { harness: "unified-proof", provider: "anthropic", model: "m-1" },
+    capabilities: createRestrictedSharedCapabilities(),
+    hiddenContext: "<consumer-context></consumer-context>",
+    machine: { location: "shared-box" as const, tools: false, status: "prewarming" as const },
+    toolIntent: false,
+  };
+}
+
+test("realCliHarness runs the SAME harness binary on shared infra with tools structurally disabled (no provider fallback)", async () => {
+  const { realCliHarness } = await import("../examples/shared.js");
+  const sharedRuntime = new CapturingRuntime("shared-infra");
+  const harness = realCliHarness({
+    name: "unified-proof",
+    description: "proof",
+    bin: "proof",
+    models: [{ provider: "anthropic", model: "m-1" }],
+    outputMode: "claude-stream-json",
+    buildArgv: ({ prompt, toolsAllowed }) => ["proof", prompt, ...(toolsAllowed ? ["--go"] : ["--no-tools"])],
+  }, { createSharedRuntime: () => sharedRuntime as any });
+
+  const chunks: string[] = [];
+  for await (const chunk of harness.shared(sharedCtx("hi from shared"))) chunks.push(chunk);
+
+  // The shared surface launched the real harness argv (not a provider API) with
+  // the structural no-tool flag, and streamed the harness' own stdout text.
+  assert.equal(chunks.join(""), "ok");
+  assert.equal(sharedRuntime.lastArgv[0], "proof");
+  assert.ok(sharedRuntime.lastArgv.includes("--no-tools"), "shared run passes the structural no-tool flag");
+  assert.ok(!sharedRuntime.lastArgv.includes("--go"), "shared run does not enable tools");
+  assert.match(String(sharedRuntime.lastArgv[1]), /<latest-user-request>hi from shared<\/latest-user-request>/);
+});
+
+test("realCliHarness shared runtime must report shared-infra location", async () => {
+  const { realCliHarness } = await import("../examples/shared.js");
+  const wrongRuntime = new CapturingRuntime("user-box");
+  const harness = realCliHarness({
+    name: "unified-proof",
+    description: "proof",
+    bin: "proof",
+    models: [{ provider: "anthropic", model: "m-1" }],
+    buildArgv: () => ["proof"],
+  }, { createSharedRuntime: () => wrongRuntime as any });
+  await assert.rejects(async () => {
+    for await (const _ of harness.shared(sharedCtx("hi"))) { /* drain */ }
+  }, /shared runtime must report location 'shared-infra'/);
+});
+
+test("no provider fallback module remains", async () => {
+  const idx: any = await import("../src/index.js");
+  assert.equal(idx.streamSharedAnswer, undefined, "streamSharedAnswer export must be gone");
+  const { readFile } = await import("node:fs/promises");
+  // import.meta.url is dist/test/orchestrator.test.js, so ../../src is the real source tree.
+  await assert.rejects(() => readFile(new URL("../../src/providerClient.ts", import.meta.url), "utf8"), "providerClient.ts source must be deleted");
+  await assert.rejects(() => readFile(new URL("../src/providerClient.js", import.meta.url), "utf8"), "providerClient.js build artifact must be gone");
+});
+
+test("every adapter structurally disables tools when toolsAllowed is false", async () => {
+  const baseInput = {
+    prompt: "<latest-user-request>hi</latest-user-request>",
+    model: "m-1",
+    provider: "anthropic",
+    cwd: "/tmp/consumer-agent-test-xyz",
+    systemInstructionPath: "/tmp/consumer-agent-test-xyz/CONSUMER_AGENT_SYSTEM.md",
+  };
+  const cases: Array<{ mod: string; provider?: string; assertNoTools: (argv: string[], env?: Record<string, string>) => void; assertTools: (argv: string[], env?: Record<string, string>) => void }> = [
+    {
+      mod: "../examples/claude-sdk/adapter.js",
+      assertNoTools: (argv) => assert.ok(joinedHas(argv, "--tools", ""), "claude --tools ''"),
+      assertTools: (argv) => assert.ok(argv.includes("--dangerously-skip-permissions") && !argv.includes("--tools"), "claude tools on"),
+    },
+    {
+      mod: "../examples/openclaude/adapter.js",
+      assertNoTools: (argv) => assert.ok(joinedHas(argv, "--tools", ""), "openclaude --tools ''"),
+      assertTools: (argv) => assert.ok(argv.includes("--dangerously-skip-permissions") && !argv.includes("--tools"), "openclaude tools on"),
+    },
+    {
+      mod: "../examples/codex-sdk/adapter.js",
+      provider: "openai",
+      assertNoTools: (argv) => {
+        assert.ok(joinedHas(argv, "-s", "read-only"), "codex read-only sandbox");
+        assert.ok(argv.includes("features.shell_tool=false"), "codex shell_tool=false");
+        assert.ok(argv.includes('web_search="disabled"'), "codex web_search disabled");
+        assert.ok(!argv.includes("--dangerously-bypass-approvals-and-sandbox"), "codex not bypassed");
+      },
+      assertTools: (argv) => {
+        assert.ok(argv.includes("--dangerously-bypass-approvals-and-sandbox"), "codex tools on");
+        assert.ok(!argv.includes("features.shell_tool=false"), "codex shell tool present");
+      },
+    },
+    {
+      mod: "../examples/pi/adapter.js",
+      assertNoTools: (argv) => assert.ok(argv.includes("--no-tools"), "pi --no-tools"),
+      assertTools: (argv) => assert.ok(!argv.includes("--no-tools"), "pi tools on"),
+    },
+    {
+      mod: "../examples/codebase-daemon/adapter.js",
+      assertNoTools: (argv) => assert.ok(argv.includes("--no-tools"), "daemon --no-tools positional"),
+      assertTools: (argv) => assert.ok(!argv.includes("--no-tools"), "daemon tools on"),
+    },
+    {
+      mod: "../examples/opencode/adapter.js",
+      provider: "openai",
+      assertNoTools: (_argv, env) => {
+        assert.ok(env?.OPENCODE_CONFIG_CONTENT, "opencode no-tool env present");
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "deny" } });
+      },
+      assertTools: (_argv, env) => assert.equal(env, undefined, "opencode tools on -> no override env"),
+    },
+    {
+      mod: "../examples/hermes/adapter.js",
+      provider: "openrouter",
+      assertNoTools: (_argv, env) => {
+        assert.ok(env?.OPENCODE_CONFIG_CONTENT, "hermes no-tool env present");
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "deny" } });
+      },
+      assertTools: (_argv, env) => assert.equal(env, undefined, "hermes tools on -> no override env"),
+    },
+  ];
+
+  for (const c of cases) {
+    const { spec }: any = await import(c.mod);
+    assert.ok(spec, `${c.mod} exports spec`);
+    assert.equal(typeof spec.buildArgv, "function", `${c.mod} has buildArgv`);
+    assert.equal(spec.runSharedInfra, undefined, `${c.mod} has no provider-fallback runSharedInfra hook`);
+    const input = { ...baseInput, provider: c.provider ?? baseInput.provider };
+    const noToolArgv = spec.buildArgv({ ...input, toolsAllowed: false });
+    const toolArgv = spec.buildArgv({ ...input, toolsAllowed: true });
+    const noToolEnv = spec.buildEnv?.({ provider: input.provider, model: input.model, toolsAllowed: false });
+    const toolEnv = spec.buildEnv?.({ provider: input.provider, model: input.model, toolsAllowed: true });
+    c.assertNoTools(noToolArgv, noToolEnv);
+    c.assertTools(toolArgv, toolEnv);
+  }
+});
+
+function joinedHas(argv: string[], flag: string, value: string): boolean {
+  for (let i = 0; i < argv.length - 1; i++) {
+    if (argv[i] === flag && argv[i + 1] === value) return true;
+  }
+  return false;
+}
+
+test("shared-infra runtime streams the same harness stdout with separate message ids", async () => {
+  const { createSharedInfraCapabilities } = await import("../src/index.js");
+  const lines = [
+    `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-a" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-b" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Bye" } } })}\n`,
+  ];
+  const fakeSpawn = ((_bin: string, _args: string[]) => {
+    async function* gen() { for (const l of lines) { yield Buffer.from(l); await new Promise((r) => setTimeout(r, 1)); } }
+    const child: any = {
+      stdout: gen(),
+      stderr: { on() {} },
+      exitCode: 0,
+      kill() {},
+      on(event: string, cb: () => void) { if (event === "close") setTimeout(cb, 0); return child; },
+    };
+    return child;
+  }) as unknown as typeof spawn;
+
+  const runtime = createSharedInfraCapabilities({ spawn: fakeSpawn });
+  assert.equal(runtime.location, "shared-infra");
+  const chunks: any[] = [];
+  for await (const chunk of runtime.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json" })) chunks.push(chunk);
+  assert.deepEqual(chunks.map((c) => [c.messageId, c.text]), [
+    ["msg-a", "Hel"],
+    ["msg-a", "lo"],
+    ["msg-b", "Bye"],
+  ]);
+});
+
+test("Box harness preserves native assistant message boundaries and token chunks", async () => {
+  const snapshots = [
+    `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-one" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-one" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-two" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Sec" } } })}\n`,
+    `${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-one" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "message_start", message: { id: "msg-two" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Sec" } } })}\n${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "ond" } } })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1 });
+  const chunks: any[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json", pollMs: 1 })) chunks.push(chunk);
+  assert.deepEqual(chunks.map((c) => [c.messageId, c.text]), [
+    ["msg-one", "Hel"],
+    ["msg-one", "lo"],
+    ["msg-two", "Sec"],
+    ["msg-two", "ond"],
+  ]);
+});
+
+test("orchestrator streams Box chunks immediately instead of buffering whole message", async () => {
+  const box = new FakeBoxClient();
+  const harness: HarnessAdapter = {
+    name: "chunked-box",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() { yield `Checking.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *userBox() {
+      yield { messageId: "first", text: "Hel" };
+      await new Promise((r) => setTimeout(r, 15));
+      yield { messageId: "first", text: "lo" };
+      yield { messageId: "second", text: "Sec" };
+      await new Promise((r) => setTimeout(r, 15));
+      yield { messageId: "second", text: "ond" };
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const selection = { harness: "chunked-box", provider: "anthropic", model: "m-1" };
+  const seen: any[] = [];
+  const started = Date.now();
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run chunk proof", selection })) {
+    if (e.type === "user-box.delta") seen.push({ text: e.text, messageId: e.messageId, at: Date.now() - started });
+  }
+  assert.deepEqual(seen.map((e) => [e.messageId, e.text]), [["first", "Hel"], ["first", "lo"], ["second", "Sec"], ["second", "ond"]]);
+  assert.ok(seen[0].at < 15, `first chunk should be emitted before the full message is available, saw ${seen[0].at}ms`);
 });
 
 test("transcript flow: shared chatter around one Box request does not duplicate or delay first Box answer", async () => {

@@ -8,6 +8,7 @@ interface Args {
   model: string;
   cwd: string;
   systemPromptFile: string;
+  noTools: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -17,10 +18,12 @@ function parseArgs(argv: string[]): Args {
     model: "unknown-model",
     cwd: process.cwd(),
     systemPromptFile: "",
+    noTools: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--stream") args.stream = true;
+    else if (arg === "--no-tools") args.noTools = true;
     else if (arg === "--provider") args.provider = argv[++i] ?? args.provider;
     else if (arg === "--model") args.model = argv[++i] ?? args.model;
     else if (arg === "--cwd") args.cwd = argv[++i] ?? args.cwd;
@@ -82,7 +85,15 @@ async function main(): Promise<void> {
 
   const lower = latest.toLowerCase();
   let answer: string;
-  if (/\b(cpu|core|cores|nproc)\b/.test(lower)) {
+  const needsMachine = /\b(cpu|core|cores|nproc|pwd|cwd|directory|where am i)\b/.test(lower);
+  if (args.noTools) {
+    // Structural no-tool mode: the daemon is launched with zero machine tools,
+    // so it must not read host facts (os.cpus, cwd). It answers text-only and
+    // defers any machine-specific request instead of fabricating a result.
+    answer = needsMachine
+      ? "Example codebase daemon (no-tools mode): I’m checking that now.\n"
+      : `Example codebase daemon (no-tools mode) received: ${latest || "(empty request)"}.\n`;
+  } else if (/\b(cpu|core|cores|nproc)\b/.test(lower)) {
     answer = `Example codebase daemon observed ${os.cpus().length} CPU cores.\n`;
   } else if (/\b(pwd|cwd|directory|where am i)\b/.test(lower)) {
     answer = `Example codebase daemon is using Optibox workspace ${args.cwd}.\n`;

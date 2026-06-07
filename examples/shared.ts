@@ -1,13 +1,5 @@
-import { streamSharedAnswer } from "../src/providerClient.js";
-import type { HarnessAdapter, HarnessOutputMode, ModelOption, SharedContext, UserBoxCapabilities, UserBoxContext } from "../src/index.js";
-
-/** Resolve the LLM API key for a provider from the host environment. */
-export function providerKey(provider: string): string | undefined {
-  if (provider === "anthropic") return process.env.ANTHROPIC_API_KEY;
-  if (provider === "openai") return process.env.OPENAI_API_KEY_SCOPED ?? process.env.OPENAI_API_KEY;
-  if (provider === "openrouter") return process.env.OPENROUTER_API_KEY;
-  return undefined;
-}
+import { createSharedInfraCapabilities } from "../src/capabilities.js";
+import type { HarnessAdapter, HarnessOutputChunk, HarnessOutputMode, HarnessRuntime, ModelOption, SharedContext, UserBoxContext } from "../src/index.js";
 
 /** Provider->envvar pairs to inject into the Box so the harness can call the LLM. */
 export function providerEnvForBox(): Record<string, string> {
@@ -27,11 +19,49 @@ export type InstructionDelivery =
   | "claude-append-system-prompt-file"
   | "workspace-agents-md";
 
+export type HarnessPhase = "shared" | "user-box";
+
+export interface HarnessPhasePolicy {
+  phase: HarnessPhase;
+  /** Whether the framework intentionally exposes private/user-machine tools to this harness run. */
+  toolsAllowed: boolean;
+  /** Where the harness process/model call executes. */
+  runtime: "shared-infra" | "user-box";
+}
+
+export interface HarnessPromptBundle {
+  policy: HarnessPhasePolicy;
+  instructions: string;
+  prompt: string;
+}
+
+export interface BuildArgvInput {
+  prompt: string;
+  model: string;
+  provider: string;
+  cwd: string;
+  systemInstructionPath: string;
+  /**
+   * Whether the framework intends this run to have private/user-machine tools.
+   * When false, buildArgv MUST add the harness' own STRUCTURAL no-tool flags so
+   * the model is given zero side-effecting tools (verified per harness in
+   * docs/shared-vs-box-harness-gap-report.md). This is the single parameter that
+   * differs between the shared and Box runs of the same harness.
+   */
+  toolsAllowed: boolean;
+}
+
+export interface BuildEnvInput {
+  provider: string;
+  model: string;
+  toolsAllowed: boolean;
+}
+
 export interface RealCliHarnessSpec {
   name: string;
   description: string;
   models: ModelOption[];
-  /** Binary to check for; if missing, run installCmd in the Box first. */
+  /** Binary to check for; if missing, run installCmd first. */
   bin: string;
   installCmd?: string;
   /**
@@ -42,24 +72,47 @@ export interface RealCliHarnessSpec {
   instructionDelivery?: InstructionDelivery;
   /** How to extract assistant text from the harness stdout stream. */
   outputMode?: HarnessOutputMode;
-  /** Build the argv that runs the real harness for one turn inside the Box. */
-  buildArgv: (input: {
-    prompt: string;
-    model: string;
-    provider: string;
-    cwd: string;
-    systemInstructionPath: string;
-  }) => string[];
-  /** Optional one-time setup inside the Box before the harness runs (e.g. auth files). */
-  prepare?: (caps: UserBoxCapabilities) => Promise<void>;
+  /**
+   * Build the argv that runs the real harness for one turn. The SAME builder is
+   * used for shared infra and the user Box; only `toolsAllowed` differs.
+   */
+  buildArgv: (input: BuildArgvInput) => string[];
+  /**
+   * Optional env builder. Used by harnesses whose structural tool policy is
+   * expressed through config/env rather than argv (e.g. OpenCode's
+   * OPENCODE_CONFIG_CONTENT permission map).
+   */
+  buildEnv?: (input: BuildEnvInput) => Record<string, string> | undefined;
+  /** Optional one-time setup before the harness runs (e.g. auth files). */
+  prepare?: (runtime: HarnessRuntime) => Promise<void>;
   /** Override the env vars this harness requires (defaults to the provider key vars). */
   requiredEnv?: string[];
+}
+
+export interface RealCliHarnessDeps {
+  /**
+   * Factory for the shared-infra runtime that runs the no-tool harness locally.
+   * Defaults to {@link createSharedInfraCapabilities}. Injectable for tests.
+   */
+  createSharedRuntime?: () => HarnessRuntime;
 }
 
 function providerRequiredEnv(provider: string): string {
   if (provider === "anthropic") return "ANTHROPIC_API_KEY";
   if (provider === "openrouter") return "OPENROUTER_API_KEY";
   return "OPENAI_API_KEY";
+}
+
+/**
+ * Structural no-tool config for OpenCode (and OpenCode-backed harnesses like
+ * Hermes). OpenCode's permission system is framework-enforced; `"*": "deny"`
+ * blocks every tool (bash/edit/read/webfetch/...). Injected via the documented
+ * OPENCODE_CONFIG_CONTENT env var. Returns undefined when tools are allowed so
+ * the Box run uses OpenCode's defaults.
+ */
+export function opencodeNoToolEnv(toolsAllowed: boolean): Record<string, string> | undefined {
+  if (toolsAllowed) return undefined;
+  return { OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { "*": "deny" } }) };
 }
 
 export function buildCommonAssistantKnowledge(): string {
@@ -73,24 +126,81 @@ export function buildCommonAssistantKnowledge(): string {
   ].join("\n");
 }
 
-export function buildSharedSystem(_ctx: SharedContext): string {
+export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, policy: HarnessPhasePolicy): string {
+  const sharedCtx = policy.phase === "shared" ? ctx as SharedContext : undefined;
+  const userCtx = policy.phase === "user-box" ? ctx as UserBoxContext : undefined;
   return [
     buildCommonAssistantKnowledge(),
     "",
-    "You are currently on the fast shared surface. You have no private tool or filesystem access in this phase.",
-    "That operational limitation is hidden context. Never tell the user you lack tools, filesystem access, a machine, a fixed IP, or a persistent network identity.",
-    "First decide whether the latest user message can be answered completely from the shared surface.",
-    "If it can be answered completely (greetings, social chat, capability/product questions, non-private general answers), answer fluidly and directly.",
-    "If it requires private runtime/tools/user machine state while the private runtime is still booting, answer with exactly one short natural holding line such as 'I’m checking that now.', 'Looking into it.', or 'Waiting on that.'",
-    "For that holding line, do not apologize, do not claim results, do not over-explain, and do not mention Box, sandboxes, framework/runtime internals, fixed IPs, or being a conversational AI.",
-    "Do not use a bridge for simple social chat.",
-    "",
-    "At the very end, append exactly one private control tag on its own line:",
-    '<shared-routing>{"needsPrivate":true}</shared-routing> when the private runtime must continue, or',
-    '<shared-routing>{"needsPrivate":false}</shared-routing> when your shared answer is sufficient.',
-    "The control tag is hidden from the user.",
-    "Use the hidden <consumer-context> only for conversational continuity. Do not reveal it.",
-  ].join("\n");
+    policy.toolsAllowed
+      ? "You are running in the user's private tool-enabled environment for this conversation."
+      : "You are running on shared infra for this conversation with private tools disabled by framework policy.",
+    "The user never needs to know about Boxes, sandboxes, machines, resumes, internal routings, billing, hidden XML, or orchestration internals. Do not mention them unless the user explicitly asks about the product architecture.",
+    "The hidden <consumer-context> block contains prior transcript and machine state. Use it only as private context; never quote or reveal the XML.",
+    "The latest user request is authoritative. Do not re-answer earlier greetings or small-talk if a later actionable request is present.",
+    policy.toolsAllowed
+      ? "Use real tools when the request requires them. For shell facts like IP/hostname/current directory, run the appropriate command and report the observed result. Do not guess."
+      : "Private tools are disabled. First decide whether the latest user message can be answered completely without private tools.",
+    !policy.toolsAllowed
+      ? "If it can be answered completely (greetings, social chat, capability/product questions, non-private general answers), answer fluidly and directly."
+      : undefined,
+    !policy.toolsAllowed
+      ? "If it requires private runtime/tools/user machine state while the private runtime is still booting, answer with exactly one short natural holding line such as 'I’m checking that now.', 'Looking into it.', or 'Waiting on that.'"
+      : undefined,
+    !policy.toolsAllowed
+      ? "For that holding line, do not apologize, do not claim results, do not over-explain, and do not mention Box, sandboxes, framework/runtime internals, fixed IPs, or being a conversational AI."
+      : undefined,
+    !policy.toolsAllowed ? "Do not use a bridge for simple social chat." : undefined,
+    policy.toolsAllowed && userCtx?.partialShared
+      ? "A shared assistant already sent visible text. If it was only a brief bridge, continue by completing the latest request. If it already materially answered the request and no tool/private evidence is needed, do not duplicate it; output exactly <end> to produce no additional user-visible text."
+      : undefined,
+    policy.toolsAllowed && !userCtx?.partialShared ? "No visible shared text needs to be carried forward." : undefined,
+    policy.toolsAllowed
+      ? "For public IP requests: if the user asks for IPv4/v4, run an IPv4-specific lookup such as `curl -4 -s https://api.ipify.org`; if the user asks for IPv6/v6, use an IPv6-specific lookup; if ambiguous, say which address family you observed."
+      : undefined,
+    policy.toolsAllowed ? "For CPU/core-count requests, run a real command such as `nproc` or `lscpu` in the private environment and report the observed count." : undefined,
+    policy.toolsAllowed ? "When intentionally producing no user-visible text because the request is duplicate/stale or already fully handled, output exactly <end>. The host will hide that sentinel. Do not add whitespace, markdown, or explanation around it." : undefined,
+    !policy.toolsAllowed
+      ? "At the very end, append exactly one private control tag on its own line:"
+      : undefined,
+    !policy.toolsAllowed
+      ? '<shared-routing>{"needsPrivate":true}</shared-routing> when the private runtime must continue, or'
+      : undefined,
+    !policy.toolsAllowed
+      ? '<shared-routing>{"needsPrivate":false}</shared-routing> when your shared answer is sufficient.'
+      : undefined,
+    !policy.toolsAllowed ? "The control tag is hidden from the user." : undefined,
+    sharedCtx?.toolIntent && !policy.toolsAllowed ? "The latest request appears to need private tools; use the short holding-line behavior unless it can genuinely be answered without tools." : undefined,
+    "When done, answer the latest user request directly and concisely. If you changed files or ran commands, summarize the concrete result.",
+  ].filter(Boolean).join("\n");
+}
+
+export function buildHarnessPromptBundle(ctx: SharedContext | UserBoxContext, policy: HarnessPhasePolicy): HarnessPromptBundle {
+  const instructions = buildHarnessInstructions(ctx, policy);
+  const latestUserMessage = policy.phase === "shared" ? (ctx as SharedContext).message : (ctx as UserBoxContext).latestUserMessage;
+  return {
+    policy,
+    instructions,
+    prompt: [
+      "<consumer-agent-system-instructions>",
+      instructions,
+      "</consumer-agent-system-instructions>",
+      "",
+      ctx.hiddenContext,
+      "",
+      `<latest-user-request>${escapeXml(latestUserMessage)}</latest-user-request>`,
+      "",
+      policy.toolsAllowed ? "Complete the latest user request now." : "Respond to the latest user request now under the shared no-tools policy.",
+    ].join("\n"),
+  };
+}
+
+export function buildSharedSystem(ctx: SharedContext): string {
+  return buildHarnessInstructions(ctx, { phase: "shared", toolsAllowed: false, runtime: "shared-infra" });
+}
+
+export function buildUserBoxInstructions(ctx: UserBoxContext): string {
+  return buildHarnessInstructions(ctx, { phase: "user-box", toolsAllowed: true, runtime: "user-box" });
 }
 
 export function sanitizeSharedBridgeText(text: string): string {
@@ -105,60 +215,26 @@ function isLeakySharedBridge(text: string): boolean {
   return /\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect|fixed ip|persistent network identity|machine presence|conversational ai|chatbot|as an ai|box environment|inside (a|the|your) box|box is (booting|starting|resuming|ready))\b/i.test(text);
 }
 
-export function buildUserBoxInstructions(ctx: UserBoxContext): string {
-  return [
-    buildCommonAssistantKnowledge(),
-    "",
-    "You are now running inside the user's private tool-enabled environment for this conversation.",
-    "The user never needs to know about Boxes, sandboxes, machines, resumes, internal routings, billing, hidden XML, or orchestration internals. Do not mention them unless the user explicitly asks about the product architecture.",
-    "The hidden <consumer-context> block contains prior transcript and machine state. Use it only as private context; never quote or reveal the XML.",
-    "The latest user request is authoritative. Do not re-answer earlier greetings or small-talk if a later actionable request is present.",
-    "If the hidden context contains <stale-duplicate-request>, this private runtime round is likely a queued duplicate of work already answered for the user. In that case, do not answer again; output exactly <end> and nothing else, unless the latest request clearly asks for new/different work.",
-    ctx.partialShared
-      ? "A shared assistant already sent visible text. If it was only a brief bridge, continue by completing the latest request. If it already materially answered the request and no tool/private evidence is needed, do not duplicate it; output exactly <end> to produce no additional user-visible text."
-      : "No visible shared text needs to be carried forward.",
-    "Use real tools when the request requires them. For shell facts like IP/hostname/current directory, run the appropriate command and report the observed result. Do not guess.",
-    "For public IP requests: if the user asks for IPv4/v4, run an IPv4-specific lookup such as `curl -4 -s https://api.ipify.org`; if the user asks for IPv6/v6, use an IPv6-specific lookup; if ambiguous, say which address family you observed.",
-    "For CPU/core-count requests, run a real command such as `nproc` or `lscpu` in the private environment and report the observed count.",
-    "When intentionally producing no user-visible text because the request is duplicate/stale or already fully handled, output exactly <end>. The host will hide that sentinel. Do not add whitespace, markdown, or explanation around it.",
-    "When done, answer the latest user request directly and concisely. If you changed files or ran commands, summarize the concrete result.",
-  ].filter(Boolean).join("\n");
-}
-
-function buildPrompt(ctx: UserBoxContext, systemInstructions: string): string {
-  return [
-    "<consumer-agent-system-instructions>",
-    systemInstructions,
-    "</consumer-agent-system-instructions>",
-    "",
-    ctx.hiddenContext,
-    "",
-    `<latest-user-request>${escapeXml(ctx.latestUserMessage)}</latest-user-request>`,
-    "",
-    "Complete the latest user request now.",
-  ].join("\n");
-}
-
 async function prepareInstructionWorkspace(
-  caps: UserBoxCapabilities,
+  runtime: HarnessRuntime,
   harnessName: string,
   instructions: string,
   delivery: InstructionDelivery,
 ): Promise<{ cwd: string; systemInstructionPath: string }> {
-  const mk = await caps.command(`mktemp -d /tmp/consumer-agent-${sanitizeShell(harnessName)}-XXXXXX`);
+  const mk = await runtime.command(`mktemp -d /tmp/consumer-agent-${sanitizeShell(harnessName)}-XXXXXX`);
   const cwd = mk.stdout.trim();
   if (!cwd.startsWith("/tmp/consumer-agent-")) throw new Error(`Unexpected mktemp output: ${cwd}`);
   const systemInstructionPath = `${cwd}/CONSUMER_AGENT_SYSTEM.md`;
-  await writeBoxFileByCommand(caps, systemInstructionPath, instructions + "\n");
+  await writeRuntimeFileByCommand(runtime, systemInstructionPath, instructions + "\n");
   if (delivery === "workspace-agents-md") {
-    await writeBoxFileByCommand(caps, `${cwd}/AGENTS.md`, instructions + "\n");
+    await writeRuntimeFileByCommand(runtime, `${cwd}/AGENTS.md`, instructions + "\n");
   }
   return { cwd, systemInstructionPath };
 }
 
-async function writeBoxFileByCommand(caps: UserBoxCapabilities, path: string, content: string): Promise<void> {
+async function writeRuntimeFileByCommand(runtime: HarnessRuntime, path: string, content: string): Promise<void> {
   const encoded = Buffer.from(content, "utf8").toString("base64");
-  await caps.command(`mkdir -p ${shellQuote(path.replace(/\/[^/]+$/, ""))} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)}`);
+  await runtime.command(`mkdir -p ${shellQuote(path.replace(/\/[^/]+$/, ""))} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)}`);
 }
 
 function sanitizeShell(s: string): string {
@@ -174,45 +250,77 @@ function escapeXml(s: string): string {
 }
 
 /**
- * Build a HarnessAdapter that:
- *  - shared(): uses a real restricted LLM call with system instructions;
- *  - userBox(): injects hidden/system instructions through the harness-native
- *    control surface where available, then runs the real CLI inside the Box.
+ * Run ONE harness turn on a given runtime under a given phase policy. This is
+ * the single code path shared by the always-on (shared infra) surface and the
+ * per-user (Box) surface. The only differences are which runtime executes the
+ * binary and whether tools are structurally enabled — exactly the user's mental
+ * model: "the same harness, with a parameter that says don't use tools."
  */
-export function realCliHarness(spec: RealCliHarnessSpec): HarnessAdapter {
+async function* runHarnessTurn(
+  spec: RealCliHarnessSpec,
+  runtime: HarnessRuntime,
+  ctx: SharedContext | UserBoxContext,
+  policy: HarnessPhasePolicy,
+): AsyncIterable<HarnessOutputChunk> {
+  if (spec.installCmd) {
+    const check = await runtime.command(`command -v ${spec.bin} >/dev/null 2>&1 && echo ok || echo missing`);
+    if (check.stdout.trim() !== "ok") {
+      if (runtime.location === "user-box") {
+        yield { text: `[${spec.name}] installing harness in private environment…\n`, messageId: "install", messageIndex: 0 };
+      }
+      await runtime.command(spec.installCmd, { timeoutMs: 180_000 });
+    }
+  }
+  if (spec.prepare) await spec.prepare(runtime);
+
+  const bundle = buildHarnessPromptBundle(ctx, policy);
+  const delivery = spec.instructionDelivery ?? "prompt-xml";
+  const { cwd, systemInstructionPath } = await prepareInstructionWorkspace(runtime, spec.name, bundle.instructions, delivery);
+  const argv = spec.buildArgv({
+    prompt: bundle.prompt,
+    model: ctx.selection.model,
+    provider: ctx.selection.provider,
+    cwd,
+    systemInstructionPath,
+    toolsAllowed: policy.toolsAllowed,
+  });
+  const env = spec.buildEnv?.({ provider: ctx.selection.provider, model: ctx.selection.model, toolsAllowed: policy.toolsAllowed });
+  yield* runtime.runHarness({
+    argv,
+    cwd,
+    ...(env ? { env } : {}),
+    ...(spec.outputMode ? { outputMode: spec.outputMode } : {}),
+    pollMs: 150,
+  });
+}
+
+/**
+ * Build a HarnessAdapter around ONE harness implementation.
+ *
+ * There is no provider fallback and no separate shared LLM client. The shared
+ * (always-on) surface runs the exact same harness binary as the Box, locally on
+ * shared infra, with tools STRUCTURALLY disabled by the harness' own no-tool
+ * flags/config. The Box surface runs it with tools enabled. The prompt builder,
+ * stdout parser, and streaming/message semantics are identical for both.
+ */
+export function realCliHarness(spec: RealCliHarnessSpec, deps: RealCliHarnessDeps = {}): HarnessAdapter {
+  const createSharedRuntime = deps.createSharedRuntime ?? (() => createSharedInfraCapabilities());
   return {
     name: spec.name,
     description: spec.description,
     requiredEnv: spec.requiredEnv ?? [...new Set(spec.models.map((m) => providerRequiredEnv(m.provider)))],
     models: spec.models,
     async *shared(ctx: SharedContext) {
-      const key = providerKey(ctx.selection.provider);
-      if (!key) throw new Error(`Missing ${providerRequiredEnv(ctx.selection.provider)} for shared ${ctx.selection.provider} response`);
-      yield* streamSharedAnswer({
-        provider: ctx.selection.provider,
-        model: ctx.selection.model,
-        system: buildSharedSystem(ctx),
-        user: `${ctx.hiddenContext}\n\n<latest-user-message>${escapeXml(ctx.message)}</latest-user-message>`,
-        apiKey: key,
-        maxTokens: 220,
-      });
+      const runtime = createSharedRuntime();
+      if (runtime.location !== "shared-infra") throw new Error("shared runtime must report location 'shared-infra'");
+      const policy: HarnessPhasePolicy = { phase: "shared", toolsAllowed: false, runtime: "shared-infra" };
+      for await (const chunk of runHarnessTurn(spec, runtime, ctx, policy)) {
+        yield typeof chunk === "string" ? chunk : chunk.text;
+      }
     },
     async *userBox(ctx: UserBoxContext) {
-      const { capabilities, selection } = ctx;
-      if (spec.installCmd) {
-        const check = await capabilities.command(`command -v ${spec.bin} >/dev/null 2>&1 && echo ok || echo missing`);
-        if (check.stdout.trim() !== "ok") {
-          yield `[${spec.name}] installing harness in private environment…\n`;
-          await capabilities.command(spec.installCmd, { timeoutMs: 180_000 });
-        }
-      }
-      if (spec.prepare) await spec.prepare(capabilities);
-      const instructions = buildUserBoxInstructions(ctx);
-      const delivery = spec.instructionDelivery ?? "prompt-xml";
-      const { cwd, systemInstructionPath } = await prepareInstructionWorkspace(capabilities, spec.name, instructions, delivery);
-      const prompt = buildPrompt(ctx, instructions);
-      const argv = spec.buildArgv({ prompt, model: selection.model, provider: selection.provider, cwd, systemInstructionPath });
-      yield* capabilities.runHarness({ argv, cwd, ...(spec.outputMode ? { outputMode: spec.outputMode } : {}), pollMs: 150 });
+      const policy: HarnessPhasePolicy = { phase: "user-box", toolsAllowed: true, runtime: "user-box" };
+      yield* runHarnessTurn(spec, ctx.capabilities, ctx, policy);
     },
   };
 }

@@ -106,6 +106,9 @@ export type ConsumerTurnEventBody =
       boxId: string;
       harness: string;
       model: string;
+      /** Stable assistant-message key from the native harness stream. Different ids render as separate bubbles. */
+      messageId?: string;
+      messageIndex?: number;
     }
   | {
       type: "turn.done";
@@ -1193,6 +1196,7 @@ export class ConsumerBoxAgentOrchestrator {
     let userText = "";
     let lastToolStdout = "";
     let sawToolUse = false;
+    let heldEndCandidate = "";
     const itc = continued[Symbol.asyncIterator]();
     const flushExecEvents = function* (): Iterable<ConsumerTurnEvent> {
       while (execEvents.length) {
@@ -1205,37 +1209,48 @@ export class ConsumerBoxAgentOrchestrator {
         yield ev;
       }
     };
-    let emittedUserTextLength = 0;
+    const emitChunkEvent = function* (chunk: { text: string; messageId?: string; messageIndex?: number }): Iterable<ConsumerTurnEvent> {
+      if (!chunk.text || !isCurrentPrivateRound()) return;
+      yield {
+        type: "user-box.delta",
+        text: chunk.text,
+        boxId: box.id,
+        harness: harness.name,
+        model: input.selection.model,
+        ...(chunk.messageId ? { messageId: chunk.messageId } : {}),
+        ...(chunk.messageIndex !== undefined ? { messageIndex: chunk.messageIndex } : {}),
+      };
+    };
     const isCurrentPrivateRound = () => this.isPrivateRoundCurrent(key, round);
-    const emitAvailableUserText = function* (): Iterable<ConsumerTurnEvent> {
-      // Preserve the routing state machine: never surface stale private-round
-      // output. For the active round, withhold only while the whole response can
-      // still become the exact <end> sentinel; otherwise forward each harness
-      // chunk immediately instead of waiting for completion.
-      if (!isCurrentPrivateRound()) return;
-      if (PRIVATE_END_SENTINEL.startsWith(userText)) return;
-      if (userText.length <= emittedUserTextLength) return;
-      const delta = userText.slice(emittedUserTextLength);
-      emittedUserTextLength = userText.length;
-      if (delta) {
-        yield {
-          type: "user-box.delta",
-          text: delta,
-          boxId: box.id,
-          harness: harness.name,
-          model: input.selection.model,
-        };
+    const emitPrivateChunk = function* (value: unknown): Iterable<ConsumerTurnEvent> {
+      const chunk = normalizeHarnessChunk(value);
+      if (!chunk.text) return;
+      userText += chunk.text;
+
+      // Preserve exact <end> suppression without buffering ordinary answers:
+      // hold only prefixes that can still become the sentinel, then release them
+      // as real streamed chunks as soon as they are proven to be normal text.
+      if ((heldEndCandidate + chunk.text).startsWith(PRIVATE_END_SENTINEL)) {
+        heldEndCandidate += chunk.text;
+        return;
       }
+      if (heldEndCandidate) {
+        const held = heldEndCandidate;
+        heldEndCandidate = "";
+        yield* emitChunkEvent({ text: held, ...(chunk.messageId ? { messageId: chunk.messageId } : {}), ...(chunk.messageIndex !== undefined ? { messageIndex: chunk.messageIndex } : {}) });
+      }
+      yield* emitChunkEvent(chunk);
     };
     while (true) {
       const n = await itc.next();
       yield* flushExecEvents();
       if (n.done) break;
-      const text = String(n.value ?? "");
-      userText += text;
-      yield* emitAvailableUserText();
+      yield* emitPrivateChunk(n.value);
     }
     yield* flushExecEvents();
+    if (heldEndCandidate && heldEndCandidate !== PRIVATE_END_SENTINEL) {
+      yield* emitChunkEvent({ text: heldEndCandidate, messageId: "assistant-0", messageIndex: 0 });
+    }
     if (!this.isPrivateRoundCurrent(key, round)) {
       this.markPrivateRound(key, round, "stale");
       yield {
@@ -1268,7 +1283,6 @@ export class ConsumerBoxAgentOrchestrator {
       };
       return;
     }
-    yield* emitAvailableUserText();
     if (!userText.trim() && sawToolUse && lastToolStdout) {
       const fallback = buildToolResultFallback(input.message, lastToolStdout);
       userText += fallback;
@@ -1278,6 +1292,8 @@ export class ConsumerBoxAgentOrchestrator {
         boxId: box.id,
         harness: harness.name,
         model: input.selection.model,
+        messageId: "fallback-0",
+        messageIndex: 0,
       };
     }
     if (userText) {
@@ -1474,6 +1490,17 @@ export class ConsumerBoxAgentOrchestrator {
   }
 }
 
+
+function normalizeHarnessChunk(value: unknown): { text: string; messageId?: string; messageIndex?: number } {
+  if (typeof value === "object" && value !== null && "text" in value) {
+    const chunk = value as { text?: unknown; messageId?: unknown; messageIndex?: unknown };
+    const out: { text: string; messageId?: string; messageIndex?: number } = { text: String(chunk.text ?? "") };
+    if (typeof chunk.messageId === "string" && chunk.messageId) out.messageId = chunk.messageId;
+    if (typeof chunk.messageIndex === "number" && Number.isFinite(chunk.messageIndex)) out.messageIndex = chunk.messageIndex;
+    return out;
+  }
+  return { text: String(value ?? ""), messageId: "assistant-0", messageIndex: 0 };
+}
 
 const SHARED_ROUTING_RE = /<shared-routing>\s*({[\s\S]*?})\s*<\/shared-routing>/i;
 

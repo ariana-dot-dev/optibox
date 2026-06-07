@@ -5,5 +5,4 @@ export * from "./capabilities.js";
 export * from "./orchestrator.js";
 export * from "./recap.js";
 export * from "./store.js";
-export * from "./providerClient.js";
 export * from "./runtimeMatrix.js";

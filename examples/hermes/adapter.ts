@@ -1,9 +1,9 @@
-import { realCliHarness } from "../shared.js";
+import { realCliHarness, opencodeNoToolEnv, type RealCliHarnessSpec } from "../shared.js";
 
 // Hermes is reached through OpenCode's OpenRouter provider. OpenCode consumes
 // AGENTS.md project rules, so Hermes receives our phase rules through that
 // harness-native rule mechanism plus the hidden XML prompt body.
-export const harness = realCliHarness({
+export const spec: RealCliHarnessSpec = {
   name: "hermes",
   description: "Hermes (Nous Research) model via OpenCode inside the user Box.",
   bin: "opencode",
@@ -15,4 +15,9 @@ export const harness = realCliHarness({
   ],
   outputMode: "opencode-json",
   buildArgv: ({ prompt, model }) => ["opencode", "run", "--format", "json", "--model", `openrouter/${model}`, prompt],
-});
+  // Hermes runs through OpenCode, so it inherits OpenCode's structural no-tool
+  // mode: an inline OPENCODE_CONFIG_CONTENT permission map that denies all tools.
+  buildEnv: ({ toolsAllowed }) => opencodeNoToolEnv(toolsAllowed),
+};
+
+export const harness = realCliHarness(spec);

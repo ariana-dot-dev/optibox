@@ -498,6 +498,44 @@ test("shared routing can structurally suppress unnecessary private Box output", 
   assert.equal(events.filter((e) => e.type === "user-box.delta").length, 0, "private answer is not surfaced when the round is suppressed");
 });
 
+
+test("private Box answer chunks stream before final completion", async () => {
+  const box = new FakeBoxClient();
+  const harness: HarnessAdapter = {
+    name: "chunky",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() {
+      yield `I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+    },
+    async *userBox() {
+      yield "Hel";
+      await new Promise((r) => setTimeout(r, 25));
+      yield "lo";
+      await new Promise((r) => setTimeout(r, 25));
+      yield " world";
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
+
+  const events: any[] = [];
+  const deltaTimes: number[] = [];
+  let doneTime = 0;
+  const started = Date.now();
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "stream it", selection: { harness: "chunky", provider: "anthropic", model: "m-1" } })) {
+    events.push(e);
+    if (e.type === "user-box.delta") deltaTimes.push(Date.now() - started);
+    if (e.type === "turn.done") doneTime = Date.now() - started;
+  }
+
+  const deltas = events.filter((e) => e.type === "user-box.delta").map((e) => e.text);
+  assert.deepEqual(deltas, ["Hel", "lo", " world"], "Box output is forwarded incrementally, not coalesced into one blob");
+  assert.equal(deltas.join(""), "Hello world");
+  assert.ok(deltaTimes.length >= 3);
+  assert.ok(deltaTimes[0]! < doneTime, "first Box chunk arrives before final completion");
+  assert.ok(events.findIndex((e) => e.type === "user-box.delta") < events.findIndex((e) => e.type === "turn.done"), "delta precedes done event");
+});
+
 test("only exact private Box <end> sentinel suppresses private output", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 5;

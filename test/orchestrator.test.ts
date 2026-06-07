@@ -103,7 +103,11 @@ function probeHarness(name: string): HarnessAdapter {
         yield `shared:${name}:I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
       }
     },
-    async *userBox({ capabilities, recap, hiddenContext, machine, partialShared }) {
+    async *userBox({ capabilities, recap, hiddenContext, machine, partialShared, latestUserMessage }) {
+      if (/^(hello|hi|hey)\b|capab|surprise/i.test(latestUserMessage)) {
+        yield "<end>";
+        return;
+      }
       const r = await capabilities.command(`echo ${name}`);
       await capabilities.writeFile("notes.txt", "ok");
       yield `box:${name}:${r.stdout}:recapHas(${/one/.test(recap)}):hiddenHas(${/one/.test(hiddenContext)}):tools(${machine.tools}):partial(${partialShared.length > 0})`;
@@ -433,7 +437,8 @@ test("shared-only cold greeting does not later answer a follow-up private turn",
   })();
   await Promise.all([dg, di]);
 
-  assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "handoff.suppressed"), "shared-only greeting prepares Box but suppresses private answer");
+  assert.ok(greeting.some((e) => e.type === "handoff.started"), "shared-only greeting still hands off to the private Box agent");
+  assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "user-box.response.end"), "only the private Box agent suppresses its answer by returning exactly <end>");
   assert.equal(greeting.filter((e) => e.type === "user-box.delta").length, 0, "greeting does not emit a private answer");
   assert.equal(ip.filter((e) => e.type === "user-box.delta").length, 1, "follow-up gets exactly one private answer");
   assert.ok(ip.some((e) => e.type === "shared.delta"), "follow-up still receives immediate shared bridge while Box is not ready/busy");
@@ -464,6 +469,56 @@ test("first greeting eagerly starts private Box before shared-only answer is fin
   assert.equal(events.filter((e) => e.type === "user-box.delta").length, 0, "shared-only greeting is not mislabeled as a private/tool answer");
   assert.equal(events.find((e) => e.type === "turn.done")?.route, "shared", "final route label remains honest for a shared-only answer");
   assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "one private user Box was started for the first greeting");
+});
+
+test("shared routing cannot suppress private Box answer unless Box returns exact end sentinel", async () => {
+  const box = new SlowUserBoxClient();
+  box.delayMs = 5;
+  const harness: HarnessAdapter = {
+    name: "no-shared-suppression",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() {
+      yield `shared says enough\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+    },
+    async *userBox() {
+      yield "PRIVATE_BOX_DECIDED_TO_ANSWER";
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
+
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "no-shared-suppression", provider: "anthropic", model: "m-1" } })) events.push(e);
+
+  assert.ok(!events.some((e) => e.type === "trace" && e.stage === "handoff.suppressed"), "shared/system side no longer has a sufficiency suppression trace");
+  assert.ok(events.some((e) => e.type === "handoff.started"), "private Box agent always receives the handoff");
+  assert.equal(events.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "PRIVATE_BOX_DECIDED_TO_ANSWER", "private answer is surfaced despite needsPrivate:false");
+});
+
+test("only exact private Box <end> sentinel suppresses private output", async () => {
+  const box = new SlowUserBoxClient();
+  box.delayMs = 5;
+  const harness: HarnessAdapter = {
+    name: "exact-end-only",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() {
+      yield `shared\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+    },
+    async *userBox({ latestUserMessage }) {
+      yield latestUserMessage.includes("newline") ? "<end>\n" : "<end>";
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
+
+  const exact: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "exact", message: "exact", selection: { harness: "exact-end-only", provider: "anthropic", model: "m-1" } })) exact.push(e);
+  assert.equal(exact.filter((e) => e.type === "user-box.delta").length, 0, "exact <end> emits no private text");
+  assert.ok(exact.some((e) => e.type === "trace" && e.stage === "user-box.response.end"));
+
+  const newline: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "newline", message: "newline", selection: { harness: "exact-end-only", provider: "anthropic", model: "m-1" } })) newline.push(e);
+  assert.equal(newline.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "<end>\n", "non-exact sentinel text is surfaced");
 });
 
 test("not-ready turns answer from shared first while private runtime starts in parallel", async () => {

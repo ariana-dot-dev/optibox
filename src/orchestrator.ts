@@ -672,8 +672,7 @@ export class ConsumerBoxAgentOrchestrator {
       }
     }
 
-    const sharedDecision = parseSharedDecision(rawSharedText, input.message);
-    let sharedText = sanitizeSharedBridgeText(sharedDecision.text || emittedSharedText);
+    const sharedText = sanitizeSharedBridgeText(stripSharedControl(rawSharedText) || emittedSharedText);
     if (!emittedSharedText && sharedText) {
       emittedSharedText = sharedText;
       yield { type: "shared.delta", text: sharedText, harness: harness.name, final: false };
@@ -696,18 +695,6 @@ export class ConsumerBoxAgentOrchestrator {
       privateResult = await privateReady;
     } catch (error) {
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
-      if (!sharedDecision.needsPrivate) {
-        yield {
-          type: "trace",
-          stage: "handoff.suppressed",
-          message: "shared answer was sufficient; private runtime startup failed but no private continuation was required",
-          harness: harness.name,
-          model: input.selection.model,
-          ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
-        };
-        yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
-        return;
-      }
       yield {
         type: "turn.blocked",
         stage: "box.runtime.unavailable",
@@ -729,18 +716,6 @@ export class ConsumerBoxAgentOrchestrator {
         }
       }
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
-      if (!sharedDecision.needsPrivate) {
-        yield {
-          type: "trace",
-          stage: "handoff.suppressed",
-          message: "shared answer was sufficient; private Box exists and is ready, so no duplicate private answer was needed",
-          harness: harness.name,
-          model: input.selection.model,
-          boxId: privateResult.box.id,
-        };
-        yield { type: "turn.done", boxId: privateResult.box.id, harness: harness.name, model: input.selection.model, route: "shared" };
-        return;
-      }
       yield* this.runPrivateRuntime(
         input,
         key,
@@ -975,15 +950,35 @@ export class ConsumerBoxAgentOrchestrator {
       if (n.done) break;
       const text = String(n.value ?? "");
       userText += text;
+    }
+    yield* flushExecEvents();
+    if (userText === "<end>") {
+      yield {
+        type: "trace",
+        stage: "user-box.response.end",
+        message: "private Box agent returned exactly <end>; no private answer will be surfaced",
+        harness: harness.name,
+        model: input.selection.model,
+        boxId: box.id,
+      };
+      yield {
+        type: "turn.done",
+        boxId: box.id,
+        harness: harness.name,
+        model: input.selection.model,
+        route: "shared",
+      };
+      return;
+    }
+    if (userText) {
       yield {
         type: "user-box.delta",
-        text,
+        text: userText,
         boxId: box.id,
         harness: harness.name,
         model: input.selection.model,
       };
     }
-    yield* flushExecEvents();
     if (!userText.trim() && sawToolUse && lastToolStdout) {
       const fallback = buildToolResultFallback(input.message, lastToolStdout);
       userText += fallback;
@@ -1188,33 +1183,7 @@ export class ConsumerBoxAgentOrchestrator {
 }
 
 
-interface ParsedSharedDecision {
-  needsPrivate: boolean;
-  text: string;
-}
-
 const SHARED_ROUTING_RE = /<shared-routing>\s*({[\s\S]*?})\s*<\/shared-routing>/i;
-
-function parseSharedDecision(text: string, message: string): ParsedSharedDecision {
-  const raw = String(text ?? "");
-  const match = raw.match(SHARED_ROUTING_RE);
-  const visible = stripSharedControl(raw);
-  if (match) {
-    try {
-      const parsed = JSON.parse(match[1]!);
-      return {
-        needsPrivate: Boolean(parsed.needsPrivate),
-        text: visible,
-      };
-    } catch {
-      // Fall through to conservative fallback below.
-    }
-  }
-  return {
-    needsPrivate: fallbackNeedsPrivate(message),
-    text: visible,
-  };
-}
 
 function visibleSharedText(text: string): string {
   const raw = String(text ?? "");
@@ -1228,13 +1197,6 @@ function stripSharedControl(text: string): string {
     .replace(SHARED_ROUTING_RE, "")
     .replace(/\s+\n/g, "\n")
     .trim();
-}
-
-function fallbackNeedsPrivate(message: string): boolean {
-  // Safety fallback for malformed/missing model routing metadata. The primary
-  // route is LLM-selected via <shared-routing>; this only prevents obviously
-  // tool-dependent requests from being stranded on the shared no-tools side.
-  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
 }
 
 function sanitizeSharedBridgeText(text: string): string {

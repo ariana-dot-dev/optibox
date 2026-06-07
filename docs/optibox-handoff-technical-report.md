@@ -1,7 +1,9 @@
 # Optibox Shared-First / Box Handoff Technical Report
 
 Date: 2026-06-06  
-Scope: Optibox demo/library code in this repository, especially `src/orchestrator.ts`, `examples/shared.ts`, `src/providerClient.ts`, `src/capabilities.ts`, `src/types.ts`, `src/runtimeMatrix.ts`, and `scripts/interactive-proof-server.ts`.
+Scope: Optibox demo/library code in this repository, especially `src/orchestrator.ts`, `examples/shared.ts`, `src/capabilities.ts`, `src/types.ts`, `src/runtimeMatrix.ts`, and `scripts/interactive-proof-server.ts`.
+
+> Update (2026-06-07): the provider fallback (`src/providerClient.ts` / `streamSharedAnswer`) has been **removed**. The shared surface now runs the same CLI harness as the Box, locally on shared infra, with the harness' own structural no-tool flags. See `docs/shared-vs-box-harness-gap-report.md` for the per-harness API evidence. Sections below that describe the old asymmetric provider-client behavior are retained only as historical context.
 
 ## Executive summary
 
@@ -23,7 +25,7 @@ During this report pass I found and corrected one mismatch: the shared hidden ma
 | Shared restricted surface | `createRestrictedSharedCapabilities()` in `src/capabilities.ts`; `HarnessAdapter.shared(ctx)` in `src/types.ts` |
 | Box/private surface | `createUserBoxCapabilities()` and `UserBoxCapabilities.runHarness()` in `src/capabilities.ts`; `HarnessAdapter.userBox(ctx)` in `src/types.ts` |
 | Default real CLI adapter | `realCliHarness()` in `examples/shared.ts` |
-| Shared LLM streaming | `streamSharedAnswer()` in `src/providerClient.ts` |
+| Shared harness streaming | `createSharedInfraCapabilities()` in `src/capabilities.ts` (same CLI harness as the Box, tools structurally disabled) |
 | Demo UI SSE | `sse()`, `/api/send`, and browser `drain()`/`handle()` in `scripts/interactive-proof-server.ts` |
 | Runtime streaming matrix | `RUNTIME_FEASIBILITY` in `src/runtimeMatrix.ts` |
 
@@ -368,13 +370,11 @@ sequenceDiagram
 
 ### Shared-machine streaming
 
-`src/providerClient.ts` uses provider streaming APIs for shared responses:
-
-| Provider | API used | Chunk extraction | Notes |
-|---|---|---|---|
-| Anthropic | `/v1/messages` with `stream: true` | SSE `content_block_delta` / `text_delta` | Token-like text deltas are yielded as provider sends them |
-| OpenAI | `/v1/chat/completions` with `stream: true` | `choices[0].delta.content` | Chat completions stream deltas |
-| OpenRouter | `/api/v1/chat/completions` with `stream: true` | `choices[0].delta.content` | Same delta style through OpenRouter |
+`createSharedInfraCapabilities()` in `src/capabilities.ts` runs the **same CLI
+harness binary as the Box** as a local `node:child_process` process on shared
+infra, with the harness' structural no-tool flags engaged. Its stdout is streamed
+through the identical `parseHarnessOutput` parser the Box uses, so shared and Box
+share message/chunk semantics exactly. There is no provider API call on this path.
 
 `visibleSharedText(rawSharedText)` strips hidden routing tags. This can buffer or withhold text around the control tag boundary, but normal bridge/answer text is yielded progressively as `shared.delta` events.
 
@@ -419,57 +419,44 @@ shared(ctx: SharedContext): AsyncIterable<string>
 userBox(ctx: UserBoxContext): AsyncIterable<string>
 ```
 
-So library users can provide one harness adapter that owns both sides. However, the default `realCliHarness()` is asymmetric:
+So library users provide one harness adapter that owns both sides, and the
+default `realCliHarness()` is now **symmetric**:
 
-- `shared()` uses a host-side provider client (`streamSharedAnswer`) and `buildSharedSystem(ctx)`.
-- `userBox()` runs the real CLI harness inside the private Box via `capabilities.runHarness()` and `buildUserBoxInstructions(ctx)`.
+- `shared()` runs the same CLI harness binary on shared infra via `createSharedInfraCapabilities()`, with `runHarnessTurn(spec, runtime, ctx, {toolsAllowed:false})`.
+- `userBox()` runs the same binary inside the private Box via `capabilities.runHarness()`, with `runHarnessTurn(spec, ctx.capabilities, ctx, {toolsAllowed:true})`.
 
-The selected provider/model is shared across both sides, and common product knowledge is shared through `buildCommonAssistantKnowledge()`, but the shared side is not currently the same exact CLI harness binary running in a restricted shared Box. It is a minimal host-side restricted LLM call.
+Both sides call the identical `runHarnessTurn`, identical `buildHarnessPromptBundle`,
+and identical `parseHarnessOutput`. The selected provider/model and common product
+knowledge are shared. The only difference is `toolsAllowed`, which selects the
+harness' own structural no-tool flags vs its tool-enabled flags through
+`spec.buildArgv`/`spec.buildEnv`. There is no provider fallback.
 
-### Desired architecture and gap
-
-The desired architecture is:
-
-- same user-customized harness/agent loop on both sides,
-- same base user-customized system prompt,
-- framework-owned additions differ by side:
-  - shared: tools disabled/limited, knows it may answer or bridge,
-  - Box: tools enabled, knows it may suppress/add on the first Box turn after shared handoff.
-
-Current code is close at the API boundary (`HarnessAdapter` can implement that), but the bundled demo/default adapter is not fully there. It is still partly hard-coded:
-
-- demo backend is Claude-only (`scripts/interactive-proof-server.ts` imports only `examples/claude-sdk/adapter.js` and requires `ANTHROPIC_API_KEY`),
-- default shared prompt is `buildSharedSystem()` rather than a first-class user-provided shared prompt composition pipeline,
-- shared capabilities deny machine tools structurally, but web search is a placeholder delegated string unless a custom adapter/capability is supplied,
-- Box duplicate suppression is prompt-mediated, not first-class structured policy.
+### Resolved gap
 
 ```mermaid
 flowchart TD
-    subgraph Current default realCliHarness
-      A[User selects provider/model] --> B[shared: host providerClient stream]
-      A --> C[userBox: CLI harness inside Box]
-      D[Common product knowledge] --> B
-      D --> C
-      E[Framework side prompt additions] --> B
-      F[Framework Box prompt additions] --> C
-    end
-
-    subgraph Ideal
-      G[User harness/agent loop] --> H[Shared instance: same loop, restricted tools]
-      G --> I[Box instance: same loop, full tools]
-      J[User base system prompt] --> H
-      J --> I
-      K[Framework shared policy] --> H
-      L[Framework Box handoff/suppress policy] --> I
-    end
+    G[User harness adapter spec] --> H[shared: same binary, tools structurally disabled]
+    G --> I[Box: same binary, tools enabled]
+    J[buildHarnessPromptBundle] --> H
+    J --> I
+    K[toolsAllowed=false -> buildArgv/buildEnv no-tool flags] --> H
+    L[toolsAllowed=true -> buildArgv/buildEnv tool flags] --> I
+    H --> P[parseHarnessOutput]
+    I --> P
 ```
+
+Remaining (separate) limitations not addressed by this change:
+
+- demo backend is Claude-only (`scripts/interactive-proof-server.ts` imports only `examples/claude-sdk/adapter.js` and requires `ANTHROPIC_API_KEY`),
+- shared capabilities' web search is a placeholder delegated string unless a custom capability is supplied,
+- Box duplicate suppression is prompt-mediated, not first-class structured policy.
 
 ## Customization map
 
 | Capability | Current API / implementation | Control level today | Gap / ideal |
 |---|---|---:|---|
 | System prompt | `buildSharedSystem()`, `buildUserBoxInstructions()`, custom `HarnessAdapter` | Medium for custom adapters; low for default helper | First-class prompt composer: user base prompt + framework side additions |
-| Shared agentic loop | `HarnessAdapter.shared(ctx)` | High if custom adapter; default helper is fixed provider call | Expose reusable default loop hooks instead of replacing whole method |
+| Shared agentic loop | `HarnessAdapter.shared(ctx)` → same `runHarnessTurn` as Box on shared infra | High; default helper runs the same CLI harness with tools structurally disabled | Expose reusable default loop hooks instead of replacing whole method |
 | Box agentic loop | `HarnessAdapter.userBox(ctx)` and `runHarness()` | High | Add structured handoff/suppression result contract |
 | Tools enable/disable | `SafeSharedCapabilities` denies machine actions; `UserBoxCapabilities` full tools | High structural split | More granular policies per tool/category and user approval rules |
 | Web search | `SafeSharedCapabilities.webSearch()` placeholder/delegated | Medium only via custom capability/adapter | First-class searchable tool policy and safety hooks |
@@ -479,7 +466,7 @@ flowchart TD
 | Context reminders | Hidden XML and recap injection | Medium | User-provided reminder composer and structured memory APIs |
 | Tool safety | Shared structural denial; Box gets full command/file primitives | Medium | Per-side allow/deny/audit policy DSL |
 | Streaming | `AsyncIterable<string>` on both methods; SSE relay | High conceptually | Declare streaming capability metadata per harness and UI labels automatically |
-| Shared/Box same harness | Possible with custom `HarnessAdapter`; default helper not exact same CLI | Medium | Built-in two-surface harness runner with same loop and policy-injected tools |
+| Shared/Box same harness | Default helper now runs the **exact same CLI harness** on both surfaces (`runHarnessTurn`); only `toolsAllowed` differs | High structural identity | Built-in two-surface harness runner with same loop and policy-injected tools — done |
 
 ## Current API shape
 

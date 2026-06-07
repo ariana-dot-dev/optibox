@@ -1,13 +1,5 @@
-import { streamSharedAnswer } from "../src/providerClient.js";
-import type { HarnessAdapter, HarnessOutputChunk, HarnessOutputMode, ModelOption, SharedContext, UserBoxCapabilities, UserBoxContext } from "../src/index.js";
-
-/** Resolve the LLM API key for a provider from the host environment. */
-export function providerKey(provider: string): string | undefined {
-  if (provider === "anthropic") return process.env.ANTHROPIC_API_KEY;
-  if (provider === "openai") return process.env.OPENAI_API_KEY_SCOPED ?? process.env.OPENAI_API_KEY;
-  if (provider === "openrouter") return process.env.OPENROUTER_API_KEY;
-  return undefined;
-}
+import { createSharedInfraCapabilities } from "../src/capabilities.js";
+import type { HarnessAdapter, HarnessOutputChunk, HarnessOutputMode, HarnessRuntime, ModelOption, SharedContext, UserBoxContext } from "../src/index.js";
 
 /** Provider->envvar pairs to inject into the Box so the harness can call the LLM. */
 export function providerEnvForBox(): Record<string, string> {
@@ -43,20 +35,33 @@ export interface HarnessPromptBundle {
   prompt: string;
 }
 
-export interface SharedInfraRunnerInput {
-  policy: HarnessPhasePolicy;
+export interface BuildArgvInput {
   prompt: string;
-  instructions: string;
-  selection: SharedContext["selection"];
-  hiddenContext: string;
-  latestUserMessage: string;
+  model: string;
+  provider: string;
+  cwd: string;
+  systemInstructionPath: string;
+  /**
+   * Whether the framework intends this run to have private/user-machine tools.
+   * When false, buildArgv MUST add the harness' own STRUCTURAL no-tool flags so
+   * the model is given zero side-effecting tools (verified per harness in
+   * docs/shared-vs-box-harness-gap-report.md). This is the single parameter that
+   * differs between the shared and Box runs of the same harness.
+   */
+  toolsAllowed: boolean;
+}
+
+export interface BuildEnvInput {
+  provider: string;
+  model: string;
+  toolsAllowed: boolean;
 }
 
 export interface RealCliHarnessSpec {
   name: string;
   description: string;
   models: ModelOption[];
-  /** Binary to check for; if missing, run installCmd in the Box first. */
+  /** Binary to check for; if missing, run installCmd first. */
   bin: string;
   installCmd?: string;
   /**
@@ -67,34 +72,47 @@ export interface RealCliHarnessSpec {
   instructionDelivery?: InstructionDelivery;
   /** How to extract assistant text from the harness stdout stream. */
   outputMode?: HarnessOutputMode;
-  /** Build the argv that runs the real harness for one turn inside the Box. */
-  buildArgv: (input: {
-    prompt: string;
-    model: string;
-    provider: string;
-    cwd: string;
-    systemInstructionPath: string;
-  }) => string[];
   /**
-   * Optional shared-infra execution hook for harnesses that can be run with a
-   * structural no-tool mode. When present, shared() and userBox() both use the
-   * same prompt/policy builder; only policy.toolsAllowed/runtime differ.
-   *
-   * If omitted, realCliHarness falls back to the direct provider LLM stream for
-   * shared infra because generic external CLIs cannot be assumed safe: many can
-   * read files or run shell unless the adapter proves a real no-tool mode.
+   * Build the argv that runs the real harness for one turn. The SAME builder is
+   * used for shared infra and the user Box; only `toolsAllowed` differs.
    */
-  runSharedInfra?: (input: SharedInfraRunnerInput) => AsyncIterable<HarnessOutputChunk>;
-  /** Optional one-time setup inside the Box before the harness runs (e.g. auth files). */
-  prepare?: (caps: UserBoxCapabilities) => Promise<void>;
+  buildArgv: (input: BuildArgvInput) => string[];
+  /**
+   * Optional env builder. Used by harnesses whose structural tool policy is
+   * expressed through config/env rather than argv (e.g. OpenCode's
+   * OPENCODE_CONFIG_CONTENT permission map).
+   */
+  buildEnv?: (input: BuildEnvInput) => Record<string, string> | undefined;
+  /** Optional one-time setup before the harness runs (e.g. auth files). */
+  prepare?: (runtime: HarnessRuntime) => Promise<void>;
   /** Override the env vars this harness requires (defaults to the provider key vars). */
   requiredEnv?: string[];
+}
+
+export interface RealCliHarnessDeps {
+  /**
+   * Factory for the shared-infra runtime that runs the no-tool harness locally.
+   * Defaults to {@link createSharedInfraCapabilities}. Injectable for tests.
+   */
+  createSharedRuntime?: () => HarnessRuntime;
 }
 
 function providerRequiredEnv(provider: string): string {
   if (provider === "anthropic") return "ANTHROPIC_API_KEY";
   if (provider === "openrouter") return "OPENROUTER_API_KEY";
   return "OPENAI_API_KEY";
+}
+
+/**
+ * Structural no-tool config for OpenCode (and OpenCode-backed harnesses like
+ * Hermes). OpenCode's permission system is framework-enforced; `"*": "deny"`
+ * blocks every tool (bash/edit/read/webfetch/...). Injected via the documented
+ * OPENCODE_CONFIG_CONTENT env var. Returns undefined when tools are allowed so
+ * the Box run uses OpenCode's defaults.
+ */
+export function opencodeNoToolEnv(toolsAllowed: boolean): Record<string, string> | undefined {
+  if (toolsAllowed) return undefined;
+  return { OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { "*": "deny" } }) };
 }
 
 export function buildCommonAssistantKnowledge(): string {
@@ -198,25 +216,25 @@ function isLeakySharedBridge(text: string): boolean {
 }
 
 async function prepareInstructionWorkspace(
-  caps: UserBoxCapabilities,
+  runtime: HarnessRuntime,
   harnessName: string,
   instructions: string,
   delivery: InstructionDelivery,
 ): Promise<{ cwd: string; systemInstructionPath: string }> {
-  const mk = await caps.command(`mktemp -d /tmp/consumer-agent-${sanitizeShell(harnessName)}-XXXXXX`);
+  const mk = await runtime.command(`mktemp -d /tmp/consumer-agent-${sanitizeShell(harnessName)}-XXXXXX`);
   const cwd = mk.stdout.trim();
   if (!cwd.startsWith("/tmp/consumer-agent-")) throw new Error(`Unexpected mktemp output: ${cwd}`);
   const systemInstructionPath = `${cwd}/CONSUMER_AGENT_SYSTEM.md`;
-  await writeBoxFileByCommand(caps, systemInstructionPath, instructions + "\n");
+  await writeRuntimeFileByCommand(runtime, systemInstructionPath, instructions + "\n");
   if (delivery === "workspace-agents-md") {
-    await writeBoxFileByCommand(caps, `${cwd}/AGENTS.md`, instructions + "\n");
+    await writeRuntimeFileByCommand(runtime, `${cwd}/AGENTS.md`, instructions + "\n");
   }
   return { cwd, systemInstructionPath };
 }
 
-async function writeBoxFileByCommand(caps: UserBoxCapabilities, path: string, content: string): Promise<void> {
+async function writeRuntimeFileByCommand(runtime: HarnessRuntime, path: string, content: string): Promise<void> {
   const encoded = Buffer.from(content, "utf8").toString("base64");
-  await caps.command(`mkdir -p ${shellQuote(path.replace(/\/[^/]+$/, ""))} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)}`);
+  await runtime.command(`mkdir -p ${shellQuote(path.replace(/\/[^/]+$/, ""))} && printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(path)}`);
 }
 
 function sanitizeShell(s: string): string {
@@ -231,65 +249,78 @@ function escapeXml(s: string): string {
   return s.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c] as string));
 }
 
-async function* runSharedProviderFallback(ctx: SharedContext, bundle: HarnessPromptBundle): AsyncIterable<string> {
-  const key = providerKey(ctx.selection.provider);
-  if (!key) throw new Error(`Missing ${providerRequiredEnv(ctx.selection.provider)} for shared ${ctx.selection.provider} response`);
-  yield* streamSharedAnswer({
-    provider: ctx.selection.provider,
+/**
+ * Run ONE harness turn on a given runtime under a given phase policy. This is
+ * the single code path shared by the always-on (shared infra) surface and the
+ * per-user (Box) surface. The only differences are which runtime executes the
+ * binary and whether tools are structurally enabled — exactly the user's mental
+ * model: "the same harness, with a parameter that says don't use tools."
+ */
+async function* runHarnessTurn(
+  spec: RealCliHarnessSpec,
+  runtime: HarnessRuntime,
+  ctx: SharedContext | UserBoxContext,
+  policy: HarnessPhasePolicy,
+): AsyncIterable<HarnessOutputChunk> {
+  if (spec.installCmd) {
+    const check = await runtime.command(`command -v ${spec.bin} >/dev/null 2>&1 && echo ok || echo missing`);
+    if (check.stdout.trim() !== "ok") {
+      if (runtime.location === "user-box") {
+        yield { text: `[${spec.name}] installing harness in private environment…\n`, messageId: "install", messageIndex: 0 };
+      }
+      await runtime.command(spec.installCmd, { timeoutMs: 180_000 });
+    }
+  }
+  if (spec.prepare) await spec.prepare(runtime);
+
+  const bundle = buildHarnessPromptBundle(ctx, policy);
+  const delivery = spec.instructionDelivery ?? "prompt-xml";
+  const { cwd, systemInstructionPath } = await prepareInstructionWorkspace(runtime, spec.name, bundle.instructions, delivery);
+  const argv = spec.buildArgv({
+    prompt: bundle.prompt,
     model: ctx.selection.model,
-    system: bundle.instructions,
-    user: bundle.prompt,
-    apiKey: key,
-    maxTokens: 220,
+    provider: ctx.selection.provider,
+    cwd,
+    systemInstructionPath,
+    toolsAllowed: policy.toolsAllowed,
+  });
+  const env = spec.buildEnv?.({ provider: ctx.selection.provider, model: ctx.selection.model, toolsAllowed: policy.toolsAllowed });
+  yield* runtime.runHarness({
+    argv,
+    cwd,
+    ...(env ? { env } : {}),
+    ...(spec.outputMode ? { outputMode: spec.outputMode } : {}),
+    pollMs: 150,
   });
 }
 
 /**
- * Build a HarnessAdapter around one phase-aware prompt/policy path.
+ * Build a HarnessAdapter around ONE harness implementation.
  *
- * Important: shared and Box execution are only truly identical for adapters that
- * provide runSharedInfra(), proving a structural no-tool mode on shared infra.
- * Without it we deliberately keep the safer provider fallback and document that
- * this is not exact harness identity rather than pretending otherwise.
+ * There is no provider fallback and no separate shared LLM client. The shared
+ * (always-on) surface runs the exact same harness binary as the Box, locally on
+ * shared infra, with tools STRUCTURALLY disabled by the harness' own no-tool
+ * flags/config. The Box surface runs it with tools enabled. The prompt builder,
+ * stdout parser, and streaming/message semantics are identical for both.
  */
-export function realCliHarness(spec: RealCliHarnessSpec): HarnessAdapter {
+export function realCliHarness(spec: RealCliHarnessSpec, deps: RealCliHarnessDeps = {}): HarnessAdapter {
+  const createSharedRuntime = deps.createSharedRuntime ?? (() => createSharedInfraCapabilities());
   return {
     name: spec.name,
     description: spec.description,
     requiredEnv: spec.requiredEnv ?? [...new Set(spec.models.map((m) => providerRequiredEnv(m.provider)))],
     models: spec.models,
     async *shared(ctx: SharedContext) {
-      const bundle = buildHarnessPromptBundle(ctx, { phase: "shared", toolsAllowed: false, runtime: "shared-infra" });
-      if (spec.runSharedInfra) {
-        for await (const chunk of spec.runSharedInfra({
-          policy: bundle.policy,
-          prompt: bundle.prompt,
-          instructions: bundle.instructions,
-          selection: ctx.selection,
-          hiddenContext: ctx.hiddenContext,
-          latestUserMessage: ctx.message,
-        })) {
-          yield typeof chunk === "string" ? chunk : chunk.text;
-        }
-        return;
+      const runtime = createSharedRuntime();
+      if (runtime.location !== "shared-infra") throw new Error("shared runtime must report location 'shared-infra'");
+      const policy: HarnessPhasePolicy = { phase: "shared", toolsAllowed: false, runtime: "shared-infra" };
+      for await (const chunk of runHarnessTurn(spec, runtime, ctx, policy)) {
+        yield typeof chunk === "string" ? chunk : chunk.text;
       }
-      yield* runSharedProviderFallback(ctx, bundle);
     },
     async *userBox(ctx: UserBoxContext) {
-      const { capabilities, selection } = ctx;
-      if (spec.installCmd) {
-        const check = await capabilities.command(`command -v ${spec.bin} >/dev/null 2>&1 && echo ok || echo missing`);
-        if (check.stdout.trim() !== "ok") {
-          yield { text: `[${spec.name}] installing harness in private environment…\n`, messageId: "install", messageIndex: 0 };
-          await capabilities.command(spec.installCmd, { timeoutMs: 180_000 });
-        }
-      }
-      if (spec.prepare) await spec.prepare(capabilities);
-      const bundle = buildHarnessPromptBundle(ctx, { phase: "user-box", toolsAllowed: true, runtime: "user-box" });
-      const delivery = spec.instructionDelivery ?? "prompt-xml";
-      const { cwd, systemInstructionPath } = await prepareInstructionWorkspace(capabilities, spec.name, bundle.instructions, delivery);
-      const argv = spec.buildArgv({ prompt: bundle.prompt, model: selection.model, provider: selection.provider, cwd, systemInstructionPath });
-      yield* capabilities.runHarness({ argv, cwd, ...(spec.outputMode ? { outputMode: spec.outputMode } : {}), pollMs: 150 });
+      const policy: HarnessPhasePolicy = { phase: "user-box", toolsAllowed: true, runtime: "user-box" };
+      yield* runHarnessTurn(spec, ctx.capabilities, ctx, policy);
     },
   };
 }

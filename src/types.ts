@@ -112,15 +112,29 @@ export interface SafeSharedCapabilities {
   controlComputer(action: string): Promise<never>;
 }
 
-export interface UserBoxCapabilities {
-  readonly mode: "user-box-full";
-  boxId: string;
-  /** Run the developer's real external harness inside the Box, streaming stdout. */
+/**
+ * The substrate that runs the developer's real external harness and streams its
+ * stdout. There is exactly ONE harness implementation; the only thing that
+ * changes between the always-on shared surface and the per-user private surface
+ * is which HarnessRuntime executes it (local shared infra vs the user Box) and
+ * whether tools are structurally enabled. See {@link createSharedInfraCapabilities}
+ * and {@link createUserBoxCapabilities}.
+ */
+export interface HarnessRuntime {
+  /** Where this runtime physically executes the harness process. */
+  readonly location: "shared-infra" | "user-box";
+  /** Run the developer's real external harness, streaming its native stdout. */
   runHarness(spec: HarnessRunSpec): AsyncIterable<HarnessOutputChunk>;
-  /** Low-level Box substrate primitives also available to adapters. */
+  /** Low-level substrate primitives also available to adapters. */
   command(command: string, opts?: { cwd?: string; env?: Record<string, string>; timeoutMs?: number }): Promise<CommandResult>;
   readFile(path: string): Promise<string>;
   writeFile(path: string, content: string): Promise<void>;
+}
+
+export interface UserBoxCapabilities extends HarnessRuntime {
+  readonly mode: "user-box-full";
+  readonly location: "user-box";
+  boxId: string;
 }
 
 export interface SharedContext {

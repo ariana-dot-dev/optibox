@@ -2,95 +2,76 @@
 
 Date: 2026-06-07
 
-## User expectation
+## Architecture: one harness, two surfaces, no fallback
 
-The expected architecture is **one harness implementation** with a phase/tool policy:
+There is **one harness implementation** per adapter. It runs on two surfaces with
+a single difference between them: whether tools are structurally enabled.
 
-- same harness code path
-- same prompt envelope shape
-- same streaming parser/event path
-- phase parameter changes only:
-  - system/developer prompt injected by the framework
-  - tools allowed vs denied
-  - runtime location (`shared-infra` vs `user-box`)
-  - harness-specific exposed tool set
+- same harness binary / code path
+- same prompt envelope (`buildHarnessPromptBundle`)
+- same stdout stream parser (`parseHarnessOutput` / `parseHarnessJsonLine`)
+- same chunk/message semantics (`messageId` + `messageIndex`)
+- the **only** per-surface differences:
+  - `toolsAllowed` (false on shared infra, true in the Box)
+  - runtime location (`shared-infra` local process vs `user-box`)
+  - the harness' own native tool set, exposed only when `toolsAllowed`
 
 ```mermaid
 flowchart LR
     U[User turn] --> O[Optibox orchestrator]
-    O --> P{Phase policy}
-    P -->|shared-infra, tools=false| H[Same harness implementation]
+    O --> P{HarnessPhasePolicy}
+    P -->|shared-infra, tools=false| H[Same harness binary]
     P -->|user-box, tools=true| H
-    H --> S[Same stream parser]
+    H --> S[Same stdout parser]
     S --> UI[Same UI message/chunk renderer]
 ```
 
-## What was different before this PR
+There is **no provider fallback** and **no separate shared LLM client**. The old
+`src/providerClient.ts` (`streamSharedAnswer`) has been deleted. The shared
+surface runs the exact same CLI harness as the Box — locally on shared infra —
+with the harness' own structural no-tool flags engaged.
 
-The previous `realCliHarness()` adapter had two meaningfully different paths:
+## How "the same code" is realized
 
-```mermaid
-flowchart TD
-    O[Orchestrator] --> Shared[shared(ctx)]
-    O --> Box[userBox(ctx)]
-    Shared --> API[providerClient streamSharedAnswer direct LLM API]
-    API --> SharedPrompt[shared-only prompt: latest-user-message]
-    Box --> CLI[external harness CLI inside Box]
-    CLI --> BoxPrompt[user-box prompt: latest-user-request + instruction file]
-    CLI --> Parser[Box stdout JSON/raw parser]
-```
+| Concern | Shared infra | User Box |
+|---|---|---|
+| Runtime | `createSharedInfraCapabilities()` — `node:child_process` spawn of the real binary, stdout streamed via async-iterable | `createUserBoxCapabilities()` — same binary launched in the Box, stdout tailed from a log |
+| Entry point | `realCliHarness.shared()` → `runHarnessTurn(spec, runtime, ctx, {toolsAllowed:false})` | `realCliHarness.userBox()` → `runHarnessTurn(spec, ctx.capabilities, ctx, {toolsAllowed:true})` |
+| Prompt | `buildHarnessPromptBundle()` (identical) | `buildHarnessPromptBundle()` (identical) |
+| Parser | `parseHarnessOutput` (identical) | `parseHarnessOutput` (identical) |
+| Tools | structural no-tool flags from `spec.buildArgv({toolsAllowed:false})` / `spec.buildEnv(...)` | native tools via `spec.buildArgv({toolsAllowed:true})` |
 
-Concrete differences:
+`runHarnessTurn` is the single shared code path. `toolsAllowed` is the one
+parameter that flows into `buildArgv`/`buildEnv` and changes the launched flags.
+Multiple sessions run in parallel safely because each turn gets its own
+`mktemp -d` workspace.
 
-| Area | Shared path before | Box path before | Why it was a gap |
+## Structural no-tool mechanism per harness (API evidence)
+
+Each adapter passes the harness' own **framework-enforced** no-tool switch when
+`toolsAllowed === false`. A prompt saying "don't use tools" is NOT used as the
+guarantee — the guarantee is the harness' native mechanism below.
+
+| Harness | `toolsAllowed:false` (shared) | `toolsAllowed:true` (Box) | Source |
 |---|---|---|---|
-| Execution code | Direct provider API via `streamSharedAnswer()` | Developer CLI harness in Box via `capabilities.runHarness()` | Not the same harness implementation. |
-| Prompt builder | `buildSharedSystem()` + ad-hoc user string | `buildUserBoxInstructions()` + `buildPrompt()` | Different envelope shape and latest-message tag. |
-| Tool policy | Prompt says no tools + restricted framework capabilities | Prompt says tools allowed + Box capabilities | Tool policy was not represented as a single explicit phase parameter. |
-| Stream parser | Provider SSE parser | Harness stdout JSON/raw parser | Message/chunk semantics could diverge. |
-| UI message identity | Shared bubble keyed by turn | Box bubble keyed by turn; fixed in this PR with `messageId` | Multi-message Box output collapsed before the previous fix. |
+| claude-agent-sdk | `--tools ""` (registers zero tools; init event reports `"tools":[]`) | `--dangerously-skip-permissions` | Claude Code CLI `--tools` option |
+| openclaude | `--tools ""` (Claude Code fork, same option) | `--dangerously-skip-permissions` | OpenClaude `src/main.tsx` documents `--tools <tools...>`, `""` disables all |
+| codex-sdk | `-s read-only` + `-c features.shell_tool=false` + `-c web_search="disabled"` | `--dangerously-bypass-approvals-and-sandbox` | Codex CLI config keys (verified accepted under `--strict-config`, codex-cli 0.137.0) |
+| pi | `--no-tools` | (omitted) | Pi `packages/coding-agent/docs/usage.md`: `--no-tools, -nt Disable all tools` |
+| codebase-daemon | `--no-tools` (daemon never reads `os.cpus`/cwd, defers machine requests) | (omitted) | Bundled `agentDaemon.ts` `--no-tools` contract |
+| opencode | `OPENCODE_CONFIG_CONTENT={"permission":{"*":"deny"}}` | (no override) | OpenCode permission system (framework-enforced) |
+| hermes | inherits OpenCode permission map (run via OpenCode/OpenRouter) | (no override) | Hermes reached through OpenCode provider |
 
-## What is fixed now
+Codex is the only harness without a single "zero tools" flag. It is handled
+honestly with a documented combination of config keys rather than a fake flag —
+this is structural (the model is never given the shell/web/write tools), not a
+prompt request. All other harnesses expose a single explicit switch.
 
-This PR adds a phase-aware harness prompt/policy layer:
+Every mechanism above is asserted in `test/orchestrator.test.ts`
+("every adapter structurally disables tools when toolsAllowed is false"), which
+calls each adapter's real `buildArgv`/`buildEnv` for both policies.
 
-- `HarnessPhasePolicy` explicitly carries `phase`, `toolsAllowed`, and `runtime`.
-- `buildHarnessPromptBundle()` builds the same prompt envelope shape for shared and Box phases.
-- `buildHarnessInstructions()` injects different policy instructions into the same builder rather than using two unrelated prompt builders.
-- `realCliHarness.shared()` can now use `runSharedInfra()` when an adapter supplies a structurally safe no-tool shared-infra runner.
-- If an adapter does **not** supply `runSharedInfra()`, the code intentionally keeps the safer provider fallback and documents that this is not true harness identity.
-
-```mermaid
-flowchart TD
-    O[Orchestrator] --> R[realCliHarness]
-    R --> B[buildHarnessPromptBundle]
-    B --> Policy{HarnessPhasePolicy}
-    Policy -->|shared, tools=false, shared-infra| SharedRunner{runSharedInfra available?}
-    SharedRunner -->|yes| SameHarness[Adapter-provided same harness on shared infra]
-    SharedRunner -->|no| SafeFallback[Provider fallback: explicitly not identical]
-    Policy -->|user-box, tools=true, user-box| BoxCLI[Same adapter CLI in Box]
-    SameHarness --> Out[stream chunks]
-    SafeFallback --> Out
-    BoxCLI --> Out
-```
-
-## What still cannot be honestly made identical for every harness
-
-For generic third-party agent CLIs (Claude Code, OpenCode, Codex, Pi, etc.), Optibox cannot safely assume that a local/shared-infra CLI invocation has a real structural no-tool mode. Some CLIs can read files or run commands unless invoked with harness-specific restrictions, and those restrictions are different per harness/version.
-
-Therefore, **true identity is only safe when the adapter declares/provides `runSharedInfra()`**, proving the shared-infra runner has tools structurally disabled. Without that, using the same CLI on shared infra would be a security lie: a prompt saying “do not use tools” is not equivalent to framework-enforced tool denial.
-
-The code now makes this explicit instead of pretending:
-
-```mermaid
-flowchart LR
-    A[Adapter has structural no-tool shared runner] -->|yes| B[Same harness can run on shared infra]
-    A -->|no| C[Use provider fallback]
-    C --> D[Report: not truly identical]
-    B --> E[Only policy/tool/runtime differ]
-```
-
-## Visual behavior after both fixes
+## Streaming behavior
 
 ```mermaid
 sequenceDiagram
@@ -100,22 +81,27 @@ sequenceDiagram
     participant P as Parser
 
     UI->>O: user sends message
-    O->>H: shared phase policy tools=false
-    H-->>O: shared chunks / routing tag
-    O-->>UI: shared.delta chunks in shared bubble
-    O->>H: Box phase policy tools=true
+    O->>H: shared phase policy tools=false (same binary, no-tool flags)
+    H-->>P: native stdout / JSON events
+    P-->>O: chunk + native messageId
+    O-->>UI: shared.delta chunks
+    O->>H: Box phase policy tools=true (same binary, tools on)
     H-->>P: native stdout / JSON events
     P-->>O: chunk + native messageId
     O-->>UI: user-box.delta chunk messageId=msg-1
-    O-->>UI: user-box.delta chunk messageId=msg-1
-    O-->>UI: user-box.delta chunk messageId=msg-2
     O-->>UI: user-box.delta chunk messageId=msg-2
 ```
 
-Result: separate assistant messages stay separate, and each message streams internally by real native chunks.
+Separate assistant messages stay separate (distinct `messageId`), and each
+message streams internally by real native chunks. The shared and Box surfaces use
+the identical parser, so message/chunk semantics cannot diverge.
 
-## Coverage added
+## Coverage
 
-- Prompt/policy coverage proving shared and user-box phases use the same prompt bundle builder with only policy differences.
-- Shared-infra runner coverage proving `realCliHarness.shared()` can run an adapter-provided shared-infra no-tool harness instead of the provider fallback.
-- Existing streaming coverage remains: native Box message ids, progressive private chunks, and demo UI separate bubbles.
+- `realCliHarness runs the SAME harness binary on shared infra with tools structurally disabled (no provider fallback)` — proves `shared()` launches the real argv with the no-tool flag, not a provider API.
+- `realCliHarness shared runtime must report shared-infra location` — guards the runtime contract.
+- `no provider fallback module remains` — asserts `streamSharedAnswer` is gone and `src/providerClient.ts` is deleted.
+- `every adapter structurally disables tools when toolsAllowed is false` — per-harness `buildArgv`/`buildEnv` evidence for all 7 adapters.
+- `shared-infra runtime streams the same harness stdout with separate message ids` — proves the local spawn runtime streams progressive chunks with native message boundaries.
+- `codebase daemon --no-tools never reads host machine facts` — proves the daemon's structural no-tool mode does not touch the host.
+- Existing Box streaming coverage remains: native message ids, progressive private chunks, separate UI bubbles.

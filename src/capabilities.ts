@@ -1,4 +1,8 @@
-import type { BoxClient, CommandResult, HarnessOutputMode, HarnessRunSpec, HarnessTextChunk, HarnessToolEvent, SafeSharedCapabilities, UserBoxCapabilities } from "./types.js";
+import { spawn } from "node:child_process";
+import { mkdtemp, mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import type { BoxClient, CommandResult, HarnessOutputMode, HarnessRunSpec, HarnessRuntime, HarnessTextChunk, HarnessToolEvent, SafeSharedCapabilities, UserBoxCapabilities } from "./types.js";
 
 class CapabilityDeniedError extends Error {
   constructor(action: string) {
@@ -297,10 +301,104 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
 
   return {
     mode: "user-box-full",
+    location: "user-box",
     boxId,
     runHarness,
     command,
     readFile: (path: string) => box.readFile(boxId, path),
     writeFile: (path: string, content: string) => box.writeFile(boxId, path, content),
   };
+}
+
+export interface SharedInfraCapabilityOptions {
+  /** Provider LLM keys exposed to the shared harness process (in addition to the host env). */
+  providerEnv?: Record<string, string>;
+  /** Called every time a real shared harness/command is launched (audit/proof). */
+  onExec?: (info: { kind: "command" | "harness"; argv?: string[]; command?: string }) => void;
+  /** Called when the harness' own stream reports a native tool call/result. */
+  onHarnessEvent?: (event: HarnessToolEvent) => void;
+  /** Override the process spawner (tests). Must match node:child_process spawn. */
+  spawn?: typeof spawn;
+}
+
+/**
+ * Shared-infra runtime. Runs the EXACT SAME external harness binary as the user
+ * Box, but as a local process on the always-on shared machine. The harness is
+ * launched with tools structurally disabled (the adapter passes the harness'
+ * native no-tool flags), so this runtime never needs — and never grants — the
+ * user's private machine. Multiple sessions can run in parallel in the same
+ * working directory because each turn gets its own temp workspace.
+ *
+ * This is the structural counterpart to {@link createUserBoxCapabilities}: same
+ * stdout parser, same chunk/message semantics, different execution location and
+ * tool policy. There is no separate "shared" LLM client and no provider fallback.
+ */
+export function createSharedInfraCapabilities(options: SharedInfraCapabilityOptions = {}): HarnessRuntime {
+  const providerEnv = options.providerEnv ?? {};
+  const spawnFn = options.spawn ?? spawn;
+
+  function baseEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
+    return { ...process.env, ...providerEnv, ...(extra ?? {}) };
+  }
+
+  async function command(cmd: string, opts: { cwd?: string; env?: Record<string, string>; timeoutMs?: number } = {}): Promise<CommandResult> {
+    options.onExec?.({ kind: "command", command: cmd });
+    return await new Promise<CommandResult>((resolve, reject) => {
+      const child = spawnFn("bash", ["-lc", cmd], { cwd: opts.cwd, env: baseEnv(opts.env), stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      const timer = opts.timeoutMs ? setTimeout(() => { child.kill("SIGKILL"); }, opts.timeoutMs) : undefined;
+      child.stdout?.on("data", (d) => { stdout += String(d); });
+      child.stderr?.on("data", (d) => { stderr += String(d); });
+      child.on("error", (err) => { if (timer) clearTimeout(timer); reject(err); });
+      child.on("close", (code) => { if (timer) clearTimeout(timer); resolve({ exitCode: code ?? 0, stdout, stderr }); });
+    });
+  }
+
+  async function* runHarness(spec: HarnessRunSpec): AsyncIterable<HarnessTextChunk> {
+    options.onExec?.({ kind: "harness", argv: spec.argv });
+    const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent);
+    const bin = spec.argv[0] ?? "";
+    const args = spec.argv.slice(1);
+    const child = spawnFn(bin, args, { cwd: spec.cwd, env: baseEnv(spec.env), stdio: ["ignore", "pipe", "pipe"] });
+    const timeoutMs = spec.timeoutMs ?? 240_000;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    child.stderr?.on("data", () => { /* surfaced via exit if non-zero; harness owns its own error text */ });
+    try {
+      if (child.stdout) {
+        for await (const buf of child.stdout) {
+          for (const chunk of parseHarnessOutput(String(buf), parser)) yield chunk;
+        }
+      }
+      // Flush any trailing partial JSON line the harness emitted without a newline.
+      if (parser.mode !== "raw-stdout" && parser.lineBuffer.trim()) {
+        const text = parseHarnessJsonLine(parser.lineBuffer.replace(/\r$/, ""), parser);
+        parser.lineBuffer = "";
+        if (text) yield text;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise<void>((resolve) => { child.on("close", () => resolve()); if (child.exitCode !== null) resolve(); });
+    if (timedOut) yield { text: `\n[shared harness timed out after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 };
+  }
+
+  async function writeFile(path: string, content: string): Promise<void> {
+    await mkdir(dirname(path), { recursive: true });
+    await fsWriteFile(path, content, "utf8");
+  }
+
+  return {
+    location: "shared-infra",
+    runHarness,
+    command,
+    readFile: (path: string) => fsReadFile(path, "utf8"),
+    writeFile,
+  };
+}
+
+/** Create a private temp working directory on shared infra (parallel-safe). */
+export async function makeSharedWorkdir(prefix = "optibox-shared-"): Promise<string> {
+  return await mkdtemp(join(tmpdir(), prefix));
 }

@@ -811,6 +811,95 @@ class StuckResumeBoxClient extends FakeBoxClient {
   }
 }
 
+class ResumeStopsBoxClient extends FakeBoxClient {
+  stopNow = false;
+  override async create(input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
+    const box = await super.create(input);
+    if ((input.name ?? "").includes("user")) {
+      const stopped = { ...box, state: "stopped" };
+      this.boxes.set(box.id, stopped);
+      return stopped;
+    }
+    return box;
+  }
+  override async resume(boxId: string): Promise<BoxInfo> {
+    const box = { ...(await this.get(boxId)), state: "cloning" };
+    this.boxes.set(boxId, box);
+    return box;
+  }
+  override async get(boxId: string): Promise<BoxInfo> {
+    const box = await super.get(boxId);
+    if (this.stopNow && box.state === "cloning") {
+      const stopped = { ...box, state: "stopped", updatedAt: new Date().toISOString() } as BoxInfo;
+      this.boxes.set(boxId, stopped);
+      return stopped;
+    }
+    return box;
+  }
+}
+
+test("filesystem follow-up during boot-in-flight is not suppressed and terminal stopped resume settles blockers", async () => {
+  const box = new ResumeStopsBoxClient();
+  box.boxes.set("box-resume", {
+    id: "box-resume",
+    name: "consumer-agent-user-u",
+    state: "archived",
+    snapshotAvailable: true,
+    snapshotCompletedAt: new Date().toISOString(),
+  } as any);
+  const harness: HarnessAdapter = {
+    name: "bridge-only",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared({ message }) {
+      if (/^hey\b/i.test(message)) {
+        yield `Hey! How can I help you today?\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+        return;
+      }
+      // Exact failure shape: bridge text only, no routing control metadata.
+      yield "On it — I’ll take a look.";
+    },
+    async *userBox() {
+      yield "SHOULD_NOT_RUN";
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({
+    box,
+    harnesses: [harness],
+    readinessPollMs: 2,
+    resumeTimeoutMs: 200,
+    handoffTimeoutMs: 200,
+    autoStopIdleMs: 1,
+  });
+  const selection = { harness: "bridge-only", provider: "anthropic", model: "m-1" };
+
+  const greeting: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection })) {
+    greeting.push(e);
+    if (e.type === "turn.done") break;
+  }
+  assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "box.boot.start"), "first greeting eagerly starts/resumes the Box");
+  assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"), "greeting itself can be shared-only");
+  box.stopNow = true;
+
+  const followup: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "xhat's in your filesystem", selection })) followup.push(e);
+
+  assert.ok(followup.some((e) => e.type === "trace" && e.stage === "box.boot.queued"), "follow-up is queued behind the in-flight boot/resume");
+  assert.equal(followup.filter((e) => e.type === "trace" && e.stage === "private-round.suppressed").length, 0, "filesystem prompt is not suppressed by bridge text alone");
+  assert.ok(followup.some((e) => e.type === "turn.blocked" && e.retryable && e.stage === "box.runtime.unavailable"), "terminal stopped resume surfaces a retryable blocker");
+  assert.equal(followup.filter((e) => e.type === "user-box.delta").length, 0, "private runtime never runs after terminal stopped state");
+  assert.ok(followup.some((e) => e.type === "billing.stop"), "billing is reconciled when the boot/resume terminates before ready");
+  const final = [...followup].reverse().find((e: any) => e.type === "trace" && e.stage === "autostop.gate.evaluated");
+  assert.equal(final?.data?.conversation?.activeTurnCount, 0);
+  assert.equal(final?.data?.conversation?.unansweredPromptCount, 0);
+  assert.equal(final?.data?.conversation?.userBoxBootInFlight, false);
+  assert.equal(final?.data?.conversation?.boxLockQueued, false);
+  assert.equal(final?.data?.conversation?.privateRoundStates?.needed, 0);
+  assert.equal(final?.data?.conversation?.privateRoundStates?.active, 0);
+  assert.deepEqual(final?.data?.conversation?.billableBoxIds, []);
+});
+
 test("stuck resume times out, recovers, and queued follow-up is suppressed while active", async () => {
   const box = new StuckResumeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 2, resumeTimeoutMs: 20, handoffTimeoutMs: 200, autoStopIdleMs: 1 });

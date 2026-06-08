@@ -140,6 +140,15 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): Harnes
     if (typeof delta === "string") {
       return emitChunk(delta, parser);
     }
+    // Claude Code's `--output-format stream-json` is not only Anthropic SDK
+    // `stream_event` deltas. In real CLI output, especially around tool calls,
+    // assistant messages are often emitted as JSON snapshots:
+    //   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+    // The previous parser observed the tool_use snapshot but ignored the later
+    // assistant text snapshot, so a perfectly valid answer could look like
+    // "no output" to the orchestrator and incorrectly arm idle shutdown.
+    const assistantText = j.type === "assistant" ? extractAssistantMessageText(j.message) : "";
+    if (assistantText) return emitNewSuffix(assistantText, parser);
     if (!parser.emittedText && j.type === "result" && typeof j.result === "string") {
       return emitChunk(j.result, parser);
     }
@@ -262,7 +271,7 @@ function noteMessageBoundary(j: any, parser: HarnessOutputParser): void {
     setActiveMessage(parser, explicitId);
     return;
   }
-  if (explicitId && explicitId !== parser.activeMessageId && (j.type === "message_update" || j.type === "message_end" || j.type === "item.completed")) {
+  if (explicitId && explicitId !== parser.activeMessageId && (j.type === "assistant" || j.type === "message_update" || j.type === "message_end" || j.type === "item.completed")) {
     setActiveMessage(parser, explicitId);
   }
 }

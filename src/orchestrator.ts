@@ -118,10 +118,11 @@ export type ConsumerTurnEventBody =
       model: string;
       route?: "shared" | "direct" | "bridge";
       /**
-       * True only when the box agent's harness loop DEFINITELY settled this prompt
-       * (clean native stream end or the hidden <end> sentinel). False when the loop
-       * ended ambiguously or was interrupted (abort). Only a settled box answer may
-       * arm the idle auto-stop — never short inactivity while tools are running.
+       * True when this accepted user prompt has a final answer/settlement. For
+       * private routes that means the box agent's harness loop definitely settled
+       * (clean native stream end or the hidden <end> sentinel). False marks a
+       * visible prompt that only received latency/bridge text and is still owed a
+       * final answer. Any false/unanswered prompt is a hard idle-stop blocker.
        */
       settled?: boolean;
     };
@@ -190,6 +191,8 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly turnSequences = new Map<string, number>();
   /** Number of response streams still active per conversation; auto-stop starts only when this reaches 0. */
   private readonly activeTurnCounts = new Map<string, number>();
+  /** Accepted/visible user prompts that have not received a final answer yet. */
+  private readonly unansweredPromptTurnIds = new Map<string, Set<string>>();
   /** Single authoritative per-conversation Box-request state machine. */
   private readonly privateRequests = new Map<string, ConversationPrivateRequestState>();
   /**
@@ -499,6 +502,7 @@ export class ConsumerBoxAgentOrchestrator {
     const key = `${input.userId}:${input.conversationId}`;
     const turnId = randomUUID();
     const turnSequence = this.bumpTurnSequence(key);
+    this.registerUnansweredPrompt(key, turnId);
     this.activeTurnCounts.set(key, (this.activeTurnCounts.get(key) ?? 0) + 1);
     // Do not await the remote Box status before emitting. A slow Box API check
     // made the preview look like Send did nothing because no SSE bytes were
@@ -529,6 +533,7 @@ export class ConsumerBoxAgentOrchestrator {
     //    stop the box out from under the pending answer.
     let boxAgentSettled = false;
     let routedToPrivate = false;
+    let promptAnswered = false;
     try {
       for await (const ev of this.runAdaptiveTurn(
         input,
@@ -539,6 +544,7 @@ export class ConsumerBoxAgentOrchestrator {
       )) {
         if (ev.type === "trace" && ev.stage === "user-box.response.end") boxAgentSettled = true;
         if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge") && ev.settled === true) boxAgentSettled = true;
+        if (ev.type === "turn.done" && ev.settled !== false) promptAnswered = true;
         if (
           ev.type === "handoff.started" ||
           ev.type === "user-box.delta" ||
@@ -549,6 +555,7 @@ export class ConsumerBoxAgentOrchestrator {
         yield { ...ev, turnId };
       }
     } finally {
+      if (promptAnswered || boxAgentSettled) this.markPromptAnswered(key, turnId);
       // If the browser closes/aborts the SSE stream after the shared bridge but
       // before the private handoff completes, the generator is returned early.
       // Always clear the active stream count so a canceled preview request cannot
@@ -577,6 +584,7 @@ export class ConsumerBoxAgentOrchestrator {
     if (
       (armForBoxDone || armForWarmSharedOnly) &&
       !this.activeTurnCounts.has(key) &&
+      !this.hasUnansweredPrompts(key) &&
       !roundOwed &&
       !bootInFlight
     ) {
@@ -834,7 +842,7 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
-      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared", settled: true };
       adaptiveTurnCompleted = true;
       return;
     }
@@ -853,7 +861,13 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
-      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+      yield {
+        type: "turn.done",
+        harness: harness.name,
+        model: input.selection.model,
+        route: "shared",
+        settled: !activeAtSubmit,
+      };
       adaptiveTurnCompleted = true;
       return;
     }
@@ -1057,6 +1071,26 @@ export class ConsumerBoxAgentOrchestrator {
     return active && (active.state === "needed" || active.state === "active") ? active : undefined;
   }
 
+  private registerUnansweredPrompt(key: string, turnId: string): void {
+    let turns = this.unansweredPromptTurnIds.get(key);
+    if (!turns) {
+      turns = new Set<string>();
+      this.unansweredPromptTurnIds.set(key, turns);
+    }
+    turns.add(turnId);
+  }
+
+  private markPromptAnswered(key: string, turnId: string): void {
+    const turns = this.unansweredPromptTurnIds.get(key);
+    if (!turns) return;
+    turns.delete(turnId);
+    if (turns.size === 0) this.unansweredPromptTurnIds.delete(key);
+  }
+
+  private hasUnansweredPrompts(key: string): boolean {
+    return (this.unansweredPromptTurnIds.get(key)?.size ?? 0) > 0;
+  }
+
   private reservePrivateRound(key: string, message: string): PrivateRequestRound {
     const state = this.requestState(key);
     const fingerprint = requestFingerprint(message) || randomUUID();
@@ -1137,6 +1171,7 @@ export class ConsumerBoxAgentOrchestrator {
     return (
       this.turnSequences.get(key) !== turnSequence ||
       this.activeTurnCounts.has(key) ||
+      this.hasUnansweredPrompts(key) ||
       Boolean(this.activePrivateRound(key)) ||
       this.userBoxStarts.has(key)
     );

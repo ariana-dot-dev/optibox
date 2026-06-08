@@ -268,8 +268,9 @@ test("concurrent shared-side turns do not enqueue duplicate Box rounds", async (
   assert.ok(a.some((e) => e.type === "user-box.delta"));
   assert.equal(b.filter((e) => e.type === "user-box.delta").length, 0);
   assert.ok(b.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"));
-  assert.ok(a.some((e) => e.type === "billing.stop"), "original private round stops after idle window");
-  assert.equal((await box.get(id1)).state, "archived", "Box ends archived after original turn");
+  assert.ok(!a.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "unanswered concurrent follow-up blocks the original idle countdown");
+  assert.ok(!a.some((e) => e.type === "billing.stop"), "original private round cannot stop while the follow-up is unanswered");
+  assert.equal((await box.get(id1)).state, "idle", "Box stays warm because a prompt is still unanswered");
   const users = orchestrator.getTranscript("u", "c").filter((m) => m.role === "user").map((m) => m.content);
   assert.deepEqual(users, ["create one", "run two"]);
 });
@@ -1498,11 +1499,14 @@ test("a box-bound turn whose box agent has not settled never auto-stops the box"
   assert.ok(!second.some((e) => e.type === "billing.stop"), "blocked second turn must NOT stop the still-needed Box");
   assert.ok(!second.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "blocked second turn must NOT arm the idle auto-stop");
 
-  // The first turn still completes normally and owns the eventual stop.
+  // The first turn still completes normally, but the unanswered second prompt is
+  // a hard blocker: no countdown may start while any accepted prompt lacks its
+  // final answer.
   releaseFirst();
   await d1;
   assert.ok(first.some((e) => e.type === "user-box.delta" && /first box answer/.test(e.text)), "first box round answers");
-  assert.ok(first.some((e) => e.type === "billing.stop"), "the first (settled) round owns the auto-stop");
+  assert.ok(!first.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "unanswered follow-up blocks the first turn's idle countdown");
+  assert.ok(!first.some((e) => e.type === "billing.stop"), "unanswered follow-up keeps the Box running");
 });
 
 test("a warm box small-talk follow-up settles via the box <end> sentinel and auto-stops", async () => {

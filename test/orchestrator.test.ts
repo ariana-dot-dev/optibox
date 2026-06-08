@@ -79,6 +79,17 @@ class StreamingLogBoxClient extends FakeBoxClient {
   }
 }
 
+class PausingStopBoxClient extends FakeBoxClient {
+  stopStarted = false;
+  releaseStop!: () => void;
+  stopGate = new Promise<void>((resolve) => { this.releaseStop = resolve; });
+  override async stop(boxId: string): Promise<BoxInfo> {
+    this.stopStarted = true;
+    await this.stopGate;
+    return super.stop(boxId);
+  }
+}
+
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 300): Promise<void> {
   const started = Date.now();
@@ -210,6 +221,35 @@ test("new turn inside idle window cancels pending auto-stop and reuses warm Box"
   assert.equal((await box.get(boxId)).state, "archived");
 });
 
+test("accepted prompt during auto-stop shutdown resumes and preserves the answer", async () => {
+  const box = new PausingStopBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const selection = { harness: "alpha", provider: "anthropic", model: "m-1" };
+
+  const first: any[] = [];
+  const d1 = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection })) first.push(e);
+  })();
+
+  await waitFor(() => box.stopStarted, 300);
+  const boxId = first.find((e) => e.type === "turn.done")?.boxId;
+  assert.ok(boxId, "first turn reached the private box before auto-stop began");
+
+  const second: any[] = [];
+  const d2 = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run follow up", selection })) second.push(e);
+  })();
+  await waitFor(() => second.some((e) => e.type === "trace" && e.stage === "turn.submit.accepted"), 300);
+
+  box.releaseStop();
+  await Promise.all([d1, d2]);
+
+  assert.ok(first.some((e) => e.type === "autostop.timer" && e.phase === "canceled"), "accepted prompt cancels the in-flight idle shutdown");
+  assert.ok(!first.some((e) => e.type === "billing.stop"), "raced auto-stop does not pause billing for an accepted prompt");
+  assert.ok(second.some((e) => e.type === "user-box.delta" && /box:alpha/.test(e.text)), "follow-up still gets its private Box answer");
+  assert.equal(second.find((e) => e.type === "turn.done")?.boxId, boxId, "follow-up continues on the same resumed Box");
+});
+
 test("concurrent shared-side turns do not enqueue duplicate Box rounds", async () => {
   const box = new FakeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
@@ -228,8 +268,9 @@ test("concurrent shared-side turns do not enqueue duplicate Box rounds", async (
   assert.ok(a.some((e) => e.type === "user-box.delta"));
   assert.equal(b.filter((e) => e.type === "user-box.delta").length, 0);
   assert.ok(b.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"));
-  assert.ok(a.some((e) => e.type === "billing.stop"), "original private round stops after idle window");
-  assert.equal((await box.get(id1)).state, "archived", "Box ends archived after original turn");
+  assert.ok(!a.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "unanswered concurrent follow-up blocks the original idle countdown");
+  assert.ok(!a.some((e) => e.type === "billing.stop"), "original private round cannot stop while the follow-up is unanswered");
+  assert.equal((await box.get(id1)).state, "idle", "Box stays warm because a prompt is still unanswered");
   const users = orchestrator.getTranscript("u", "c").filter((m) => m.role === "user").map((m) => m.content);
   assert.deepEqual(users, ["create one", "run two"]);
 });
@@ -1458,11 +1499,14 @@ test("a box-bound turn whose box agent has not settled never auto-stops the box"
   assert.ok(!second.some((e) => e.type === "billing.stop"), "blocked second turn must NOT stop the still-needed Box");
   assert.ok(!second.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "blocked second turn must NOT arm the idle auto-stop");
 
-  // The first turn still completes normally and owns the eventual stop.
+  // The first turn still completes normally, but the unanswered second prompt is
+  // a hard blocker: no countdown may start while any accepted prompt lacks its
+  // final answer.
   releaseFirst();
   await d1;
   assert.ok(first.some((e) => e.type === "user-box.delta" && /first box answer/.test(e.text)), "first box round answers");
-  assert.ok(first.some((e) => e.type === "billing.stop"), "the first (settled) round owns the auto-stop");
+  assert.ok(!first.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "unanswered follow-up blocks the first turn's idle countdown");
+  assert.ok(!first.some((e) => e.type === "billing.stop"), "unanswered follow-up keeps the Box running");
 });
 
 test("a warm box small-talk follow-up settles via the box <end> sentinel and auto-stops", async () => {

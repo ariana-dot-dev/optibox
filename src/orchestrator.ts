@@ -118,10 +118,11 @@ export type ConsumerTurnEventBody =
       model: string;
       route?: "shared" | "direct" | "bridge";
       /**
-       * True only when the box agent's harness loop DEFINITELY settled this prompt
-       * (clean native stream end or the hidden <end> sentinel). False when the loop
-       * ended ambiguously or was interrupted (abort). Only a settled box answer may
-       * arm the idle auto-stop — never short inactivity while tools are running.
+       * True when this accepted user prompt has a final answer/settlement. For
+       * private routes that means the box agent's harness loop definitely settled
+       * (clean native stream end or the hidden <end> sentinel). False marks a
+       * visible prompt that only received latency/bridge text and is still owed a
+       * final answer. Any false/unanswered prompt is a hard idle-stop blocker.
        */
       settled?: boolean;
     };
@@ -190,6 +191,8 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly turnSequences = new Map<string, number>();
   /** Number of response streams still active per conversation; auto-stop starts only when this reaches 0. */
   private readonly activeTurnCounts = new Map<string, number>();
+  /** Accepted/visible user prompts that have not received a final answer yet. */
+  private readonly unansweredPromptTurnIds = new Map<string, Set<string>>();
   /** Single authoritative per-conversation Box-request state machine. */
   private readonly privateRequests = new Map<string, ConversationPrivateRequestState>();
   /**
@@ -499,6 +502,7 @@ export class ConsumerBoxAgentOrchestrator {
     const key = `${input.userId}:${input.conversationId}`;
     const turnId = randomUUID();
     const turnSequence = this.bumpTurnSequence(key);
+    this.registerUnansweredPrompt(key, turnId);
     this.activeTurnCounts.set(key, (this.activeTurnCounts.get(key) ?? 0) + 1);
     // Do not await the remote Box status before emitting. A slow Box API check
     // made the preview look like Send did nothing because no SSE bytes were
@@ -529,6 +533,7 @@ export class ConsumerBoxAgentOrchestrator {
     //    stop the box out from under the pending answer.
     let boxAgentSettled = false;
     let routedToPrivate = false;
+    let promptAnswered = false;
     try {
       for await (const ev of this.runAdaptiveTurn(
         input,
@@ -539,6 +544,7 @@ export class ConsumerBoxAgentOrchestrator {
       )) {
         if (ev.type === "trace" && ev.stage === "user-box.response.end") boxAgentSettled = true;
         if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge") && ev.settled === true) boxAgentSettled = true;
+        if (ev.type === "turn.done" && ev.settled !== false) promptAnswered = true;
         if (
           ev.type === "handoff.started" ||
           ev.type === "user-box.delta" ||
@@ -549,6 +555,7 @@ export class ConsumerBoxAgentOrchestrator {
         yield { ...ev, turnId };
       }
     } finally {
+      if (promptAnswered || boxAgentSettled) this.markPromptAnswered(key, turnId);
       // If the browser closes/aborts the SSE stream after the shared bridge but
       // before the private handoff completes, the generator is returned early.
       // Always clear the active stream count so a canceled preview request cannot
@@ -577,6 +584,7 @@ export class ConsumerBoxAgentOrchestrator {
     if (
       (armForBoxDone || armForWarmSharedOnly) &&
       !this.activeTurnCounts.has(key) &&
+      !this.hasUnansweredPrompts(key) &&
       !roundOwed &&
       !bootInFlight
     ) {
@@ -834,7 +842,7 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
-      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared", settled: true };
       adaptiveTurnCompleted = true;
       return;
     }
@@ -853,7 +861,13 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
-      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+      yield {
+        type: "turn.done",
+        harness: harness.name,
+        model: input.selection.model,
+        route: "shared",
+        settled: !activeAtSubmit,
+      };
       adaptiveTurnCompleted = true;
       return;
     }
@@ -1057,6 +1071,26 @@ export class ConsumerBoxAgentOrchestrator {
     return active && (active.state === "needed" || active.state === "active") ? active : undefined;
   }
 
+  private registerUnansweredPrompt(key: string, turnId: string): void {
+    let turns = this.unansweredPromptTurnIds.get(key);
+    if (!turns) {
+      turns = new Set<string>();
+      this.unansweredPromptTurnIds.set(key, turns);
+    }
+    turns.add(turnId);
+  }
+
+  private markPromptAnswered(key: string, turnId: string): void {
+    const turns = this.unansweredPromptTurnIds.get(key);
+    if (!turns) return;
+    turns.delete(turnId);
+    if (turns.size === 0) this.unansweredPromptTurnIds.delete(key);
+  }
+
+  private hasUnansweredPrompts(key: string): boolean {
+    return (this.unansweredPromptTurnIds.get(key)?.size ?? 0) > 0;
+  }
+
   private reservePrivateRound(key: string, message: string): PrivateRequestRound {
     const state = this.requestState(key);
     const fingerprint = requestFingerprint(message) || randomUUID();
@@ -1117,16 +1151,12 @@ export class ConsumerBoxAgentOrchestrator {
           timer.unref?.();
         });
       }
-      if (this.turnSequences.get(key) !== turnSequence) return;
-      if (this.activeTurnCounts.has(key)) return;
-      if (this.activePrivateRound(key)) return;
-      if (this.userBoxStarts.has(key)) return;
+      if (this.isConversationBusyForIdleStop(key, turnSequence)) return;
       const session = await this.sessions.get(input.userId, input.conversationId);
       if (!session?.boxId || !this.billing.has(session.boxId)) return;
       const release = await this.acquireLock(this.boxLocks, key);
       try {
-        if (this.turnSequences.get(key) !== turnSequence) return;
-        if (this.activeTurnCounts.has(key) || this.activePrivateRound(key)) return;
+        if (this.isConversationBusyForIdleStop(key, turnSequence)) return;
         for await (const _ of this.stopUserBoxLocked(input.userId, input.conversationId)) {
           // This is a detached cleanup path after the SSE stream disappeared;
           // there is no client to receive lifecycle events.
@@ -1135,6 +1165,16 @@ export class ConsumerBoxAgentOrchestrator {
         release();
       }
     })().catch(() => undefined);
+  }
+
+  private isConversationBusyForIdleStop(key: string, turnSequence: number): boolean {
+    return (
+      this.turnSequences.get(key) !== turnSequence ||
+      this.activeTurnCounts.has(key) ||
+      this.hasUnansweredPrompts(key) ||
+      Boolean(this.activePrivateRound(key)) ||
+      this.userBoxStarts.has(key)
+    );
   }
 
   private bumpTurnSequence(key: string): number {
@@ -1178,7 +1218,7 @@ export class ConsumerBoxAgentOrchestrator {
       // leaving a hidden stop tail.
       let lastWholeSecond = Math.ceil(delayMs / 1000);
       while (true) {
-        if (this.turnSequences.get(key) !== turnSequence) {
+        if (this.isConversationBusyForIdleStop(key, turnSequence)) {
           yield {
             type: "autostop.timer",
             phase: "canceled",
@@ -1212,7 +1252,7 @@ export class ConsumerBoxAgentOrchestrator {
       }
     }
 
-    if (this.turnSequences.get(key) !== turnSequence) {
+    if (this.isConversationBusyForIdleStop(key, turnSequence)) {
       yield {
         type: "autostop.timer",
         phase: "canceled",
@@ -1226,7 +1266,7 @@ export class ConsumerBoxAgentOrchestrator {
 
     const release = await this.acquireLock(this.boxLocks, key);
     try {
-      if (this.turnSequences.get(key) !== turnSequence) {
+      if (this.isConversationBusyForIdleStop(key, turnSequence)) {
         yield {
           type: "autostop.timer",
           phase: "canceled",
@@ -1237,7 +1277,9 @@ export class ConsumerBoxAgentOrchestrator {
         };
         return;
       }
-      yield* this.stopUserBoxLocked(input.userId, input.conversationId);
+      yield* this.stopUserBoxLocked(input.userId, input.conversationId, {
+        shouldCancel: () => this.isConversationBusyForIdleStop(key, turnSequence),
+      });
     } finally {
       release();
     }
@@ -1523,7 +1565,9 @@ export class ConsumerBoxAgentOrchestrator {
   private async *stopUserBoxLocked(
     userId: string,
     conversationId: string,
+    options: { shouldCancel?: () => boolean } = {},
   ): AsyncIterable<ConsumerTurnEvent> {
+    const canceled = () => Boolean(options.shouldCancel?.());
     const session = await this.sessions.get(userId, conversationId);
     if (!session?.boxId) {
       yield {
@@ -1536,6 +1580,17 @@ export class ConsumerBoxAgentOrchestrator {
     }
     const boxId = session.boxId;
     const since = this.billing.get(boxId);
+    if (canceled()) {
+      yield {
+        type: "autostop.timer",
+        phase: "canceled",
+        boxId,
+        remainingMs: 0,
+        reason: "new-user-message",
+        note: "auto-stop canceled because a user prompt was accepted before shutdown began",
+      };
+      return;
+    }
     yield {
       type: "lifecycle",
       boxId,
@@ -1551,7 +1606,40 @@ export class ConsumerBoxAgentOrchestrator {
       current.state !== "archiving" &&
       current.state !== "archived"
     ) {
+      if (canceled()) {
+        yield {
+          type: "autostop.timer",
+          phase: "canceled",
+          boxId,
+          remainingMs: 0,
+          reason: "new-user-message",
+          note: "auto-stop canceled because a user prompt was accepted before the stop request was sent",
+        };
+        return;
+      }
       await this.options.box.stop(boxId).catch(() => undefined);
+    }
+    if (canceled()) {
+      const afterStop = await this.options.box.get(boxId).catch(() => undefined);
+      if (afterStop?.state === "archived") {
+        yield {
+          type: "lifecycle",
+          boxId,
+          state: "resuming",
+          note: "auto-stop stop request raced a new accepted prompt; resuming private box",
+        };
+        await this.options.box.resume(boxId).catch(() => undefined);
+        await this.waitUntilReady(boxId, "cancel-auto-stop-resume").catch(() => undefined);
+      }
+      yield {
+        type: "autostop.timer",
+        phase: "canceled",
+        boxId,
+        remainingMs: 0,
+        reason: "new-user-message",
+        note: "auto-stop canceled because a user prompt was accepted while shutdown was starting",
+      };
+      return;
     }
     yield {
       type: "lifecycle",

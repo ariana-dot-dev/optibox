@@ -196,8 +196,46 @@ The proven contract above is now wired through the framework (foundation layer):
   is in flight (`userBoxStarts`), so a shared-only answer can’t stop a box that
   is still booting/owing a turn and force a re-boot next message.
 
-Tests: `node --test` green (50/50), including new coverage for per-mode
-`onSessionId` extraction, per-adapter resume argv, and shared-infra abort.
+- **Part-B autostop fix — harness-loop settlement** (`src/types.ts`,
+  `src/capabilities.ts`, `examples/shared.ts`, `src/orchestrator.ts`): the idle
+  auto-stop countdown is no longer armed from "no visible message arrived for a
+  few seconds." Absence of user-visible output is NOT inactivity: a prompt can
+  run for minutes or hours doing tool calls / computer-use before any final text.
+  The ONLY signals that may arm the countdown for a box turn are a DEFINITE
+  harness-loop settlement for the current prompt:
+  - `HarnessCompletion.reason === "completed"` — the one-shot CLI/SDK process
+    finished its agent loop and its native stream ended cleanly (the in-Box exit
+    marker `__CBA_EXIT__:<code>` is observed by `runHarness`). This is the only
+    reason that means "the prompt is fully answered."
+  - `"timeout"` — a long safety backstop elapsed while the process was still
+    running. `DEFAULT_HARNESS_TIMEOUT_MS = 6h` (was 240s). This is an
+    hours-scale guard, never a short-inactivity stop.
+  - `"process-exited"` — the in-Box PID is gone (`kill -0` fails) with no exit
+    marker (crash/kill); the loop is over but the answer may be incomplete.
+  - `"aborted"` — the turn was interrupted (human "stop" / superseding turn).
+    This is NOT a settlement: `settled = reason !== "aborted"`, so an aborted
+    loop never arms the countdown.
+
+  Threading: `runHarness` (both shared-infra and user-box runtimes) tracks
+  `sawText` and fires `spec.onComplete(info)` exactly once at loop end with the
+  reason above. `examples/shared.ts` forwards `ctx.onComplete` into
+  `runtime.runHarness`. The orchestrator's `continueInUserBox` captures the
+  completion, computes `settled`, emits a `box.runtime.unsettled` trace when the
+  loop ended without settling, and carries `settled` on the `turn.done` event;
+  the epilogue only sets `boxAgentSettled` (which arms the idle countdown) when a
+  direct/bridge box `turn.done` has `settled === true`. Plain generator harnesses
+  (no `onComplete`) default to `{ reason: "completed" }` — a returning generator
+  means the loop finished.
+
+- **Tool-call visibility** (`src/orchestrator.ts`): `harness.tool` events are now
+  surfaced as `box.tool.use` / `box.tool.result` traces, so long tool-running
+  prompts are visibly ACTIVE in the trace stream rather than appearing idle.
+
+Tests: `node --test` green (56/56). New coverage: native-marker-only settlement
+(no inactivity stop), explicit long safety-timeout reason, end-to-end tool-trace
+visibility with settled-only auto-stop, and aborted-loop-does-not-arm. Plus prior
+coverage for per-mode `onSessionId` extraction, per-adapter resume argv, and
+shared-infra abort.
 
 **Not yet landed (deferred, needs per-case decisions):** the orchestrator
 queue→interrupt+coalesce policy inversion, and two live Box-side validations

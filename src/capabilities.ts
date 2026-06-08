@@ -2,7 +2,16 @@ import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { BoxClient, CommandResult, HarnessOutputMode, HarnessRunSpec, HarnessRuntime, HarnessTextChunk, HarnessToolEvent, SafeSharedCapabilities, UserBoxCapabilities } from "./types.js";
+import type { BoxClient, CommandResult, HarnessCompletion, HarnessOutputMode, HarnessRunSpec, HarnessRuntime, HarnessTextChunk, HarnessToolEvent, SafeSharedCapabilities, UserBoxCapabilities } from "./types.js";
+
+/**
+ * Default harness loop timeout. A single prompt can drive arbitrarily long tool
+ * calls / computer-use before producing its final text, so this is a multi-hour
+ * SAFETY backstop — not a short-inactivity stop. It only fires while the process
+ * is still running; a normal agent loop ends (and is reported) far sooner via its
+ * clean exit. Overridable per run via HarnessRunSpec.timeoutMs.
+ */
+export const DEFAULT_HARNESS_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
 class CapabilityDeniedError extends Error {
   constructor(action: string) {
@@ -309,8 +318,19 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     const env = { ...providerEnv, ...(spec.env ?? {}) };
     const envPrefix = Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}; `).join("");
     const argvStr = spec.argv.map(shq).join(" ");
-    const timeoutMs = spec.timeoutMs ?? 240_000;
+    const timeoutMs = spec.timeoutMs ?? DEFAULT_HARNESS_TIMEOUT_MS;
     const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent, spec.onSessionId);
+    let sawText = false;
+    let completionReported = false;
+    const reportCompletion = (info: HarnessCompletion): void => {
+      if (completionReported) return;
+      completionReported = true;
+      spec.onComplete?.({ ...info, sawText });
+    };
+    const noteChunk = (chunk: HarnessTextChunk): HarnessTextChunk => {
+      if (chunk.text && chunk.text.trim()) sawText = true;
+      return chunk;
+    };
     const effectivePollMs = spec.pollMs ?? pollMs;
     // Launch detached, tee to a log so we can poll for incremental output.
     // The harness process runs in spec.cwd so AGENTS.md / other native rule
@@ -326,7 +346,7 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
       if (!pid) return;
       await box.command(boxId, { command: `kill -INT ${pid} 2>/dev/null; sleep 0.2; kill -KILL ${pid} 2>/dev/null; true`, timeoutMs: 15_000 }).catch(() => undefined);
     };
-    if (spec.signal?.aborted) { await interruptInBox(); return; }
+    if (spec.signal?.aborted) { await interruptInBox(); reportCompletion({ reason: "aborted" }); return; }
     let aborted = false;
     const onAbort = () => { aborted = true; void interruptInBox(); };
     spec.signal?.addEventListener("abort", onAbort, { once: true });
@@ -335,9 +355,9 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     let offset = 0;
     try {
     while (Date.now() - started < timeoutMs) {
-      if (aborted) return;
+      if (aborted) { reportCompletion({ reason: "aborted" }); return; }
       await new Promise((r) => setTimeout(r, effectivePollMs));
-      if (aborted) return;
+      if (aborted) { reportCompletion({ reason: "aborted" }); return; }
       let content = "";
       try {
         content = (await box.command(boxId, { command: `cat ${shq(log)} 2>/dev/null || true`, timeoutMs: 15_000 })).stdout;
@@ -346,25 +366,32 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
       const visible = content.replace(/\n?__CBA_EXIT__:\d+\s*$/g, "");
       if (visible.length > offset) {
         const rawDelta = visible.slice(offset);
-        for (const chunk of parseHarnessOutput(rawDelta, parser)) yield chunk;
+        for (const chunk of parseHarnessOutput(rawDelta, parser)) yield noteChunk(chunk);
         offset = visible.length;
       }
       if (exitMatch) {
         if (parser.mode !== "raw-stdout" && parser.lineBuffer.trim()) {
           const text = parseHarnessJsonLine(parser.lineBuffer.replace(/\r$/, ""), parser);
           parser.lineBuffer = "";
-          if (text) yield text;
+          if (text) yield noteChunk(text);
         }
+        // Clean native stream end: the agent loop (incl. all tool calls) is done.
+        reportCompletion({ reason: "completed", exitCode: Number(exitMatch[1]) });
         return;
       }
-      // process gone but no exit marker -> stop polling
+      // process gone but no exit marker -> stop polling (crash/kill, not a clean end)
       if (pid) {
         const alive = (await box.command(boxId, { command: `kill -0 ${pid} 2>/dev/null && echo up || echo down`, timeoutMs: 15_000 })).stdout.trim();
-        if (alive === "down") { if (visible.length > offset) yield { text: visible.slice(offset), messageId: "stdout-0", messageIndex: 0 }; return; }
+        if (alive === "down") {
+          if (visible.length > offset) yield noteChunk({ text: visible.slice(offset), messageId: "stdout-0", messageIndex: 0 });
+          reportCompletion({ reason: "process-exited" });
+          return;
+        }
       }
     }
-    if (aborted) return;
-    yield { text: `\n[runHarness timed out after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 };
+    if (aborted) { reportCompletion({ reason: "aborted" }); return; }
+    yield noteChunk({ text: `\n[runHarness safety timeout after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 });
+    reportCompletion({ reason: "timeout" });
     } finally {
       spec.signal?.removeEventListener("abort", onAbort);
     }
@@ -432,9 +459,14 @@ export function createSharedInfraCapabilities(options: SharedInfraCapabilityOpti
     const bin = spec.argv[0] ?? "";
     const args = spec.argv.slice(1);
     const child = spawnFn(bin, args, { cwd: spec.cwd, env: baseEnv(spec.env), stdio: ["ignore", "pipe", "pipe"] });
-    const timeoutMs = spec.timeoutMs ?? 240_000;
+    const timeoutMs = spec.timeoutMs ?? DEFAULT_HARNESS_TIMEOUT_MS;
     let timedOut = false;
     let aborted = false;
+    let sawText = false;
+    const noteChunk = (chunk: HarnessTextChunk): HarnessTextChunk => {
+      if (chunk.text && chunk.text.trim()) sawText = true;
+      return chunk;
+    };
     const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
     // Interrupt == "agent stops talking": SIGINT for a graceful stop, then a hard
     // SIGKILL if it lingers. Completed turns are already flushed to the harness'
@@ -450,21 +482,22 @@ export function createSharedInfraCapabilities(options: SharedInfraCapabilityOpti
     try {
       if (child.stdout) {
         for await (const buf of child.stdout) {
-          for (const chunk of parseHarnessOutput(String(buf), parser)) yield chunk;
+          for (const chunk of parseHarnessOutput(String(buf), parser)) yield noteChunk(chunk);
         }
       }
       // Flush any trailing partial JSON line the harness emitted without a newline.
       if (parser.mode !== "raw-stdout" && parser.lineBuffer.trim()) {
         const text = parseHarnessJsonLine(parser.lineBuffer.replace(/\r$/, ""), parser);
         parser.lineBuffer = "";
-        if (text) yield text;
+        if (text) yield noteChunk(text);
       }
     } finally {
       clearTimeout(timer);
       spec.signal?.removeEventListener("abort", onAbort);
     }
     await new Promise<void>((resolve) => { child.on("close", () => resolve()); if (child.exitCode !== null) resolve(); });
-    if (timedOut && !aborted) yield { text: `\n[shared harness timed out after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 };
+    if (timedOut && !aborted) yield noteChunk({ text: `\n[shared harness safety timeout after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 });
+    spec.onComplete?.({ reason: aborted ? "aborted" : timedOut ? "timeout" : "completed", sawText, ...(typeof child.exitCode === "number" ? { exitCode: child.exitCode } : {}) });
   }
 
   async function writeFile(path: string, content: string): Promise<void> {

@@ -15,6 +15,7 @@ import { InMemorySessionStore } from "./store.js";
 import type {
   BoxInfo,
   HarnessAdapter,
+  HarnessCompletion,
   HarnessSelection,
   OrchestratorOptions,
   TranscriptMessage,
@@ -116,6 +117,13 @@ export type ConsumerTurnEventBody =
       harness: string;
       model: string;
       route?: "shared" | "direct" | "bridge";
+      /**
+       * True only when the box agent's harness loop DEFINITELY settled this prompt
+       * (clean native stream end or the hidden <end> sentinel). False when the loop
+       * ended ambiguously or was interrupted (abort). Only a settled box answer may
+       * arm the idle auto-stop — never short inactivity while tools are running.
+       */
+      settled?: boolean;
     };
 
 /**
@@ -528,7 +536,7 @@ export class ConsumerBoxAgentOrchestrator {
       lockBusyAtSubmit,
     )) {
       if (ev.type === "trace" && ev.stage === "user-box.response.end") boxAgentSettled = true;
-      if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge")) boxAgentSettled = true;
+      if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge") && ev.settled === true) boxAgentSettled = true;
       if (
         ev.type === "handoff.started" ||
         ev.type === "user-box.delta" ||
@@ -1226,6 +1234,11 @@ export class ConsumerBoxAgentOrchestrator {
     });
     const userBoxSessionKey = this.sessionKey(key, harness.name, "user-box");
     const knownUserBoxSessionId = this.harnessSessions.get(userBoxSessionKey);
+    // Captures WHY the harness loop ended for this prompt. Defaults to "completed"
+    // for plain generator harnesses (no real CLI loop): a generator that simply
+    // returns has, by definition, finished its work. Real CLI/SDK harnesses report
+    // the true reason (clean stream end vs timeout vs crash vs abort) via onComplete.
+    let completion: HarnessCompletion = { reason: "completed" };
     const continued = harness.userBox({
       userId: input.userId,
       conversationId: input.conversationId,
@@ -1240,12 +1253,15 @@ export class ConsumerBoxAgentOrchestrator {
       partialShared,
       ...(knownUserBoxSessionId ? { sessionId: knownUserBoxSessionId } : {}),
       onSessionId: (id: string) => this.harnessSessions.set(userBoxSessionKey, id),
+      onComplete: (info: HarnessCompletion) => { completion = info; },
     });
     let userText = "";
     let lastToolStdout = "";
     let sawToolUse = false;
     let heldEndCandidate = "";
     const itc = continued[Symbol.asyncIterator]();
+    const harnessName = harness.name;
+    const selectionModel = input.selection.model;
     const flushExecEvents = function* (): Iterable<ConsumerTurnEvent> {
       while (execEvents.length) {
         const ev = execEvents.shift()!;
@@ -1253,6 +1269,18 @@ export class ConsumerBoxAgentOrchestrator {
           if (ev.phase === "tool_use") sawToolUse = true;
           if (ev.phase === "tool_result" && typeof ev.stdout === "string" && ev.stdout.trim())
             lastToolStdout = ev.stdout.trim();
+          // Surface tool activity in traces so the scheduler/UI can see the box
+          // agent is actively working (NOT idle) even before any visible text.
+          yield {
+            type: "trace",
+            stage: ev.phase === "tool_use" ? "box.tool.use" : "box.tool.result",
+            message: ev.phase === "tool_use"
+              ? `box agent invoked tool ${ev.toolName ?? "tool"}${ev.command ? `: ${ev.command}` : ""}`
+              : `box agent received tool result${ev.isError ? " (error)" : ""}`,
+            harness: harnessName,
+            model: selectionModel,
+            boxId: box.id,
+          };
         }
         yield ev;
       }
@@ -1358,12 +1386,27 @@ export class ConsumerBoxAgentOrchestrator {
       this.markPrivateRound(key, round, "answered");
     }
     if (!userText) this.markPrivateRound(key, round, "suppressed");
+    // The box agent only "settled" this prompt if its loop ended of its own accord
+    // (clean stream end / safety timeout / process gone) — never if it was aborted
+    // out from under an in-flight turn. Only a settled answer may arm the idle stop.
+    const settled = completion.reason !== "aborted";
+    if (!settled) {
+      yield {
+        type: "trace",
+        stage: "box.runtime.unsettled",
+        message: `box agent loop ended without settling (${completion.reason}); not arming idle auto-stop`,
+        harness: harness.name,
+        model: input.selection.model,
+        boxId: box.id,
+      };
+    }
     yield {
       type: "turn.done",
       boxId: box.id,
       harness: harness.name,
       model: input.selection.model,
       route,
+      settled,
     };
   }
 

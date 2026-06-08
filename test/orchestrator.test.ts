@@ -1461,6 +1461,111 @@ test("a warm box small-talk follow-up settles via the box <end> sentinel and aut
   assert.equal((await box.get(boxId)).state, "archived", "warm box is archived, not leaked");
 });
 
+test("box harness loop only settles at the native completion marker, never on tool-call inactivity", async () => {
+  // A long-running prompt: the box agent issues tool calls across several polls
+  // with NO final text and NO exit marker. The loop must keep running (process
+  // alive) and must NOT report completion until the native stream actually ends.
+  const toolUse = { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "find / -name secret", description: "search filesystem" } }] } };
+  const working = `${JSON.stringify(toolUse)}\n`;
+  const snapshots = [
+    working,            // working, no answer yet
+    working,            // still working
+    working,            // still working — a few seconds of no visible text
+    `${working}${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Found it" } } })}\n${JSON.stringify({ type: "result", result: "Found it" })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const toolEvents: any[] = [];
+  const completions: any[] = [];
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (e) => toolEvents.push(e) });
+  const chunks: any[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json", pollMs: 1, onComplete: (info) => completions.push(info) })) chunks.push(chunk);
+  assert.deepEqual(chunks.map((c: any) => c.text), ["Found it"], "final answer is streamed only once, after tool work");
+  assert.ok(toolEvents.some((e) => e.phase === "tool_use"), "tool activity was observed during the loop");
+  assert.deepEqual(completions.length, 1, "completion is reported exactly once");
+  assert.equal(completions[0].reason, "completed", "loop settles via the native exit marker, not inactivity");
+  assert.equal(completions[0].exitCode, 0);
+  assert.equal(completions[0].sawText, true);
+});
+
+test("box harness reports the long safety timeout (not a short inactivity stop) when the agent never finishes", async () => {
+  // The process stays alive and never writes an exit marker. With a tiny timeoutMs
+  // we simulate the hours-scale safety backstop firing. It must be reported as
+  // "timeout" — a distinct, explicit reason — not silently treated as a clean end.
+  const working = `${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "thinking…" } } })}\n`;
+  const box = new StreamingLogBoxClient([working]); // every poll returns the same in-progress log, no marker
+  const completions: any[] = [];
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1 });
+  const chunks: any[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "hi"], outputMode: "claude-stream-json", pollMs: 1, timeoutMs: 30, onComplete: (info) => completions.push(info) })) chunks.push(chunk);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].reason, "timeout", "the safety backstop is an explicit timeout, distinct from a clean completion");
+});
+
+test("a long tool-running box prompt surfaces tool traces and only auto-stops after the agent settles", async () => {
+  // End-to-end through the orchestrator: the box agent runs tools for several
+  // polls, then answers and the native stream ends. Tool activity must show up as
+  // traces, and the idle auto-stop must arm ONLY after the settled final answer.
+  const toolUse = { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "ls -la /", description: "inspect filesystem" } }] } };
+  const working = `${JSON.stringify(toolUse)}\n`;
+  const answer = "Your filesystem has /home and /etc.";
+  const snapshots = [
+    working,
+    working,
+    `${working}${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: answer } } })}\n${JSON.stringify({ type: "result", result: answer })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const harness: HarnessAdapter = {
+    name: "cli",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() { yield `On it.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *userBox(ctx) {
+      yield* ctx.capabilities.runHarness({
+        argv: ["claude", "-p", "hi"],
+        outputMode: "claude-stream-json",
+        pollMs: 1,
+        ...(ctx.onComplete ? { onComplete: ctx.onComplete } : {}),
+      });
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 5 });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "whats on my filesystem", selection: { harness: "cli", provider: "anthropic", model: "m-1" } })) events.push(e);
+
+  assert.ok(events.some((e) => e.type === "trace" && e.stage === "box.tool.use"), "tool activity is visible as a trace");
+  assert.ok(events.some((e) => e.type === "user-box.delta" && /filesystem has/.test(e.text)), "the box agent's final answer is surfaced");
+  const done = events.find((e) => e.type === "turn.done" && e.boxId);
+  assert.equal(done?.settled, true, "a cleanly-completed loop is marked settled");
+  assert.ok(events.some((e) => e.type === "autostop.timer" && e.phase === "started"), "settled answer arms the idle countdown");
+  assert.ok(events.some((e) => e.type === "billing.stop"), "box auto-stops only after the settled answer goes idle");
+});
+
+test("a box turn whose harness loop is interrupted (aborted) does not arm the idle auto-stop", async () => {
+  // The dangerous case: the loop ended WITHOUT a clean completion (abort). Even
+  // though the box is billable, an unsettled loop must never start the countdown —
+  // the machine must not be stopped out from under a prompt that never settled.
+  const box = new FakeBoxClient();
+  const harness: HarnessAdapter = {
+    name: "abrt",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() { yield `On it.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *userBox(ctx) {
+      yield "partial working note";
+      ctx.onComplete?.({ reason: "aborted", sawText: true });
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 5 });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "do a long thing", selection: { harness: "abrt", provider: "anthropic", model: "m-1" } })) events.push(e);
+
+  const done = events.find((e) => e.type === "turn.done" && e.boxId);
+  assert.equal(done?.settled, false, "an aborted loop is not a settlement");
+  assert.ok(events.some((e) => e.type === "trace" && e.stage === "box.runtime.unsettled"), "the unsettled loop is traced");
+  assert.ok(!events.some((e) => e.type === "autostop.timer" && e.phase === "started"), "aborted loop does not arm the idle countdown");
+  assert.ok(!events.some((e) => e.type === "billing.stop"), "aborted loop does not auto-stop the box");
+});
+
 test("aborting a shared-infra harness run interrupts the process (SIGINT then SIGKILL)", async () => {
   const { createSharedInfraCapabilities } = await import("../src/index.js");
   const signals: string[] = [];

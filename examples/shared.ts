@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createSharedInfraCapabilities } from "../src/capabilities.js";
 import type { HarnessAdapter, HarnessOutputChunk, HarnessOutputMode, HarnessRuntime, ModelOption, SharedContext, UserBoxContext } from "../src/index.js";
 
@@ -49,6 +50,19 @@ export interface BuildArgvInput {
    * differs between the shared and Box runs of the same harness.
    */
   toolsAllowed: boolean;
+  /**
+   * Session id to ASSIGN on turn 1 for assign-style CLIs (claude `--session-id`,
+   * openclaude `--session-id`, daemon `--session-id`). Capture-style CLIs ignore
+   * it. Present only on the first turn of a conversation+harness.
+   */
+  sessionId?: string;
+  /**
+   * Session id to RESUME a prior conversation+harness on its NATIVE session
+   * (claude `-r`, codex `exec resume <id>`, pi `--session`, opencode `-s`, daemon
+   * `--resume`). Present only on resume turns. See
+   * docs/harness-interrupt-resume-evidence.md for the proven per-CLI mechanism.
+   */
+  resumeSessionId?: string;
 }
 
 export interface BuildEnvInput {
@@ -72,6 +86,18 @@ export interface RealCliHarnessSpec {
   instructionDelivery?: InstructionDelivery;
   /** How to extract assistant text from the harness stdout stream. */
   outputMode?: HarnessOutputMode;
+  /**
+   * How this harness manages its native session id for same-conversation resume
+   * (docs/harness-interrupt-resume-evidence.md):
+   *  - "assign":  host generates a UUID and passes it via buildArgv on turn 1
+   *               (claude/openclaude `--session-id`, daemon `--session-id`), then
+   *               resumes with the same id. The id is known up front.
+   *  - "capture": host cannot assign one; it reads the id the CLI emits on its
+   *               first turn (codex thread_id, pi header id, opencode sessionID)
+   *               and passes it back via `resumeSessionId` on later turns.
+   * Defaults to "capture" (no session id is assigned, none is required).
+   */
+  sessionStrategy?: "assign" | "capture";
   /**
    * Build the argv that runs the real harness for one turn. The SAME builder is
    * used for shared infra and the user Box; only `toolsAllowed` differs.
@@ -276,6 +302,18 @@ async function* runHarnessTurn(
   const bundle = buildHarnessPromptBundle(ctx, policy);
   const delivery = spec.instructionDelivery ?? "prompt-xml";
   const { cwd, systemInstructionPath } = await prepareInstructionWorkspace(runtime, spec.name, bundle.instructions, delivery);
+
+  // Same-conversation resume: reuse the persisted native session id when present,
+  // otherwise (assign-style CLIs) mint one up front so resume works even if this
+  // turn is interrupted before the CLI echoes the id. See
+  // docs/harness-interrupt-resume-evidence.md for the per-CLI mechanism.
+  const strategy = spec.sessionStrategy ?? "capture";
+  const knownSessionId = ctx.sessionId;
+  let assignSessionId: string | undefined;
+  if (knownSessionId === undefined && strategy === "assign") {
+    assignSessionId = randomUUID();
+    ctx.onSessionId?.(assignSessionId);
+  }
   const argv = spec.buildArgv({
     prompt: bundle.prompt,
     model: ctx.selection.model,
@@ -283,6 +321,8 @@ async function* runHarnessTurn(
     cwd,
     systemInstructionPath,
     toolsAllowed: policy.toolsAllowed,
+    ...(assignSessionId ? { sessionId: assignSessionId } : {}),
+    ...(knownSessionId ? { resumeSessionId: knownSessionId } : {}),
   });
   const env = spec.buildEnv?.({ provider: ctx.selection.provider, model: ctx.selection.model, toolsAllowed: policy.toolsAllowed });
   yield* runtime.runHarness({
@@ -290,6 +330,8 @@ async function* runHarnessTurn(
     cwd,
     ...(env ? { env } : {}),
     ...(spec.outputMode ? { outputMode: spec.outputMode } : {}),
+    ...(ctx.onSessionId ? { onSessionId: ctx.onSessionId } : {}),
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
     pollMs: 150,
   });
 }

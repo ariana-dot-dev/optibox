@@ -184,6 +184,14 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly activeTurnCounts = new Map<string, number>();
   /** Single authoritative per-conversation Box-request state machine. */
   private readonly privateRequests = new Map<string, ConversationPrivateRequestState>();
+  /**
+   * Per (conversation, harness, surface) CLI session id, so each surface resumes
+   * its own conversation/session across turns without history loss. Keyed
+   * `${userId}:${conversationId}:${harness}:${surface}` where surface is
+   * "shared" | "user-box". Populated either up-front (assign strategy) or from
+   * the id the CLI emits on turn 1 (capture strategy).
+   */
+  private readonly harnessSessions = new Map<string, string>();
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -528,7 +536,20 @@ export class ConsumerBoxAgentOrchestrator {
     // during the previous idle window.
     const session = await this.sessions.get(input.userId, input.conversationId);
     const hasBillableBox = Boolean(session?.boxId && this.billing.has(session.boxId));
-    if ((usedPrivateBox || hasBillableBox) && !this.activeTurnCounts.has(key)) {
+    // Don't arm the idle-stop while a private round is still owed (needed/active)
+    // or a Box boot is still in flight. Otherwise a shared-only answer that
+    // finishes before the private agent replies would stop a box that is still
+    // booting/owing a turn, then the next message re-boots it — the Part-A
+    // state-machine bug. The private round / boot completion restarts the
+    // countdown through its own epilogue when it is genuinely idle.
+    const roundOwed = Boolean(this.activePrivateRound(key));
+    const bootInFlight = this.userBoxStarts.has(key);
+    if (
+      (usedPrivateBox || hasBillableBox) &&
+      !this.activeTurnCounts.has(key) &&
+      !roundOwed &&
+      !bootInFlight
+    ) {
       const latestIdleSequence = this.turnSequences.get(key) ?? turnSequence;
       for await (const ev of this.stopAfterIdle(input, key, latestIdleSequence))
         yield { ...ev, turnId };
@@ -721,6 +742,8 @@ export class ConsumerBoxAgentOrchestrator {
     let rawSharedText = "";
     let emittedSharedText = "";
     const bufferSharedUntilRouted = sharedNeedsPrivate("", input.message);
+    const sharedSessionKey = this.sessionKey(key, harness.name, "shared");
+    const knownSharedSessionId = this.harnessSessions.get(sharedSessionKey);
     for await (const text of harness.shared({
       userId: input.userId,
       conversationId: input.conversationId,
@@ -731,6 +754,8 @@ export class ConsumerBoxAgentOrchestrator {
       hiddenContext: sharedHidden,
       machine: sharedMachine,
       toolIntent: false,
+      ...(knownSharedSessionId ? { sessionId: knownSharedSessionId } : {}),
+      onSessionId: (id: string) => this.harnessSessions.set(sharedSessionKey, id),
     })) {
       rawSharedText += String(text ?? "");
       if (bufferSharedUntilRouted) continue;
@@ -966,6 +991,10 @@ export class ConsumerBoxAgentOrchestrator {
     return state;
   }
 
+  private sessionKey(key: string, harness: string, surface: "shared" | "user-box"): string {
+    return `${key}:${harness}:${surface}`;
+  }
+
   private activePrivateRound(key: string): PrivateRequestRound | undefined {
     const active = this.privateRequests.get(key)?.active;
     return active && (active.state === "needed" || active.state === "active") ? active : undefined;
@@ -1180,6 +1209,8 @@ export class ConsumerBoxAgentOrchestrator {
       onHarnessEvent: (event) =>
         execEvents.push({ type: "harness.tool", boxId: box.id, ...event }),
     });
+    const userBoxSessionKey = this.sessionKey(key, harness.name, "user-box");
+    const knownUserBoxSessionId = this.harnessSessions.get(userBoxSessionKey);
     const continued = harness.userBox({
       userId: input.userId,
       conversationId: input.conversationId,
@@ -1192,6 +1223,8 @@ export class ConsumerBoxAgentOrchestrator {
       hiddenContext: userHidden,
       machine: userMachine,
       partialShared,
+      ...(knownUserBoxSessionId ? { sessionId: knownUserBoxSessionId } : {}),
+      onSessionId: (id: string) => this.harnessSessions.set(userBoxSessionKey, id),
     });
     let userText = "";
     let lastToolStdout = "";

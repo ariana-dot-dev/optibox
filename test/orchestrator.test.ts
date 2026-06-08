@@ -1246,3 +1246,157 @@ test("transcript flow: shared chatter around one Box request does not duplicate 
   assert.equal(privateStarts, 1, "only one Box harness round is invoked for the underlying request");
   assert.ok([...chatterA, ...chatterB].some((e) => e.type === "trace" && e.stage === "private-round.suppressed"), "shared chatter is suppressed instead of queued behind the active round");
 });
+
+// A spawn stub that streams the given stdout lines then closes. Optionally
+// records kill signals so abort behavior can be asserted.
+function fakeSpawnLines(lines: string[], hooks: { onKill?: (signal?: string) => void; hang?: boolean } = {}): typeof spawn {
+  return ((_bin: string, _args: string[]) => {
+    let release: (() => void) | undefined;
+    const killed = new Promise<void>((r) => { release = r; });
+    async function* gen() {
+      for (const l of lines) { yield Buffer.from(l); await new Promise((r) => setTimeout(r, 1)); }
+      if (hooks.hang) await killed; // block until killed, simulating a long-running harness
+    }
+    const child: any = {
+      stdout: gen(),
+      stderr: { on() {} },
+      exitCode: null,
+      kill(signal?: string) { hooks.onKill?.(signal); this.exitCode = 0; release?.(); return true; },
+      on(event: string, cb: () => void) { if (event === "close") setTimeout(cb, 0); return child; },
+    };
+    return child;
+  }) as unknown as typeof spawn;
+}
+
+test("session id is extracted once per harness output mode and reported via onSessionId", async () => {
+  const { createSharedInfraCapabilities } = await import("../src/index.js");
+  const cases: Array<{ mode: string; lines: string[]; expected: string }> = [
+    {
+      mode: "claude-stream-json",
+      // claude emits its assigned/echoed session id on the system init + result events.
+      lines: [
+        `${JSON.stringify({ type: "system", subtype: "init", session_id: "claude-sess-1", tools: [] })}\n`,
+        `${JSON.stringify({ type: "result", session_id: "claude-sess-1", result: "hi" })}\n`,
+      ],
+      expected: "claude-sess-1",
+    },
+    {
+      mode: "codex-json",
+      lines: [
+        `${JSON.stringify({ type: "thread.started", thread_id: "codex-thread-9" })}\n`,
+        `${JSON.stringify({ type: "item.delta", delta: "hello" })}\n`,
+      ],
+      expected: "codex-thread-9",
+    },
+    {
+      mode: "opencode-json",
+      lines: [
+        `${JSON.stringify({ type: "message_update", sessionID: "ses_abc", assistantMessageEvent: { type: "text_delta", delta: "hi" } })}\n`,
+      ],
+      expected: "ses_abc",
+    },
+    {
+      mode: "pi-json",
+      lines: [
+        `${JSON.stringify({ type: "session", id: "pi-sess-77" })}\n`,
+        `${JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } })}\n`,
+      ],
+      expected: "pi-sess-77",
+    },
+  ];
+  for (const c of cases) {
+    const ids: string[] = [];
+    const runtime = createSharedInfraCapabilities({ spawn: fakeSpawnLines(c.lines) });
+    for await (const _ of runtime.runHarness({ argv: ["bin", "-p", "hi"], outputMode: c.mode as any, onSessionId: (id) => ids.push(id) })) { /* drain */ }
+    assert.deepEqual(ids, [c.expected], `${c.mode} reports its session id exactly once`);
+  }
+});
+
+test("each adapter renders its native resume flags from sessionId/resumeSessionId", async () => {
+  const base = {
+    prompt: "<latest-user-request>hi</latest-user-request>",
+    model: "m-1",
+    provider: "anthropic",
+    cwd: "/tmp/consumer-agent-test-xyz",
+    systemInstructionPath: "/tmp/consumer-agent-test-xyz/CONSUMER_AGENT_SYSTEM.md",
+    toolsAllowed: true,
+  };
+  type Check = { mod: string; strategy: "assign" | "capture"; provider?: string; assertAssign?: (argv: string[]) => void; assertResume: (argv: string[]) => void };
+  const checks: Check[] = [
+    {
+      mod: "../examples/claude-sdk/adapter.js",
+      strategy: "assign",
+      assertAssign: (a) => assert.ok(joinedHas(a, "--session-id", "SID"), "claude assigns --session-id"),
+      assertResume: (a) => assert.ok(joinedHas(a, "-r", "RID") && !a.includes("--session-id"), "claude resumes with -r"),
+    },
+    {
+      mod: "../examples/openclaude/adapter.js",
+      strategy: "assign",
+      assertAssign: (a) => assert.ok(joinedHas(a, "--session-id", "SID"), "openclaude assigns --session-id"),
+      assertResume: (a) => assert.ok(joinedHas(a, "-r", "RID") && !a.includes("--session-id"), "openclaude resumes with -r"),
+    },
+    {
+      mod: "../examples/codex-sdk/adapter.js",
+      strategy: "capture",
+      provider: "openai",
+      assertResume: (a) => {
+        assert.deepEqual(a.slice(0, 4), ["codex", "exec", "resume", "RID"], "codex resumes via exec resume <id>");
+        assert.ok(!a.includes("-s"), "codex resume does not pass -s (rejected by resume)");
+        assert.ok(joinedHas(a, "-c", 'sandbox_mode="danger-full-access"'), "codex resume sets sandbox via -c");
+      },
+    },
+    {
+      mod: "../examples/pi/adapter.js",
+      strategy: "capture",
+      assertResume: (a) => assert.ok(joinedHas(a, "--session", "RID"), "pi resumes with --session"),
+    },
+    {
+      mod: "../examples/opencode/adapter.js",
+      strategy: "capture",
+      provider: "openai",
+      assertResume: (a) => assert.ok(joinedHas(a, "-s", "RID"), "opencode resumes with -s"),
+    },
+    {
+      mod: "../examples/hermes/adapter.js",
+      strategy: "capture",
+      provider: "openrouter",
+      assertResume: (a) => assert.ok(joinedHas(a, "-s", "RID"), "hermes resumes with -s"),
+    },
+    {
+      mod: "../examples/codebase-daemon/adapter.js",
+      strategy: "assign",
+      assertAssign: (a) => assert.ok(a.join(" ").includes("--session-id SID"), "daemon assigns --session-id positional"),
+      assertResume: (a) => assert.ok(a.join(" ").includes("--resume RID"), "daemon resumes with --resume positional"),
+    },
+  ];
+  for (const c of checks) {
+    const { spec }: any = await import(c.mod);
+    assert.equal(spec.sessionStrategy, c.strategy, `${c.mod} declares ${c.strategy} strategy`);
+    const input = { ...base, provider: c.provider ?? base.provider };
+    if (c.assertAssign) c.assertAssign(spec.buildArgv({ ...input, sessionId: "SID" }));
+    c.assertResume(spec.buildArgv({ ...input, resumeSessionId: "RID" }));
+    // No session flags when neither id is present (preserves the no-session default).
+    const bare = spec.buildArgv(input);
+    assert.ok(!bare.includes("-r") && !bare.includes("--session") && !bare.join(" ").includes("--session-id") && !bare.join(" ").includes("--resume") && !(bare[2] === "resume"), `${c.mod} adds no session flags when ids absent`);
+  }
+});
+
+test("aborting a shared-infra harness run interrupts the process (SIGINT then SIGKILL)", async () => {
+  const { createSharedInfraCapabilities } = await import("../src/index.js");
+  const signals: string[] = [];
+  const controller = new AbortController();
+  const runtime = createSharedInfraCapabilities({
+    spawn: fakeSpawnLines(
+      [`${JSON.stringify({ type: "result", session_id: "s-1", result: "partial" })}\n`],
+      { hang: true, onKill: (sig) => signals.push(String(sig)) },
+    ),
+  });
+  const drained: any[] = [];
+  const run = (async () => {
+    for await (const chunk of runtime.runHarness({ argv: ["bin", "-p", "hi"], outputMode: "claude-stream-json", signal: controller.signal })) drained.push(chunk);
+  })();
+  await new Promise((r) => setTimeout(r, 20));
+  controller.abort();
+  await run;
+  assert.ok(signals.includes("SIGINT"), "abort sends SIGINT to the harness process");
+});

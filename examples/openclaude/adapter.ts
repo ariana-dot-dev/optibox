@@ -13,12 +13,17 @@ export const spec: RealCliHarnessSpec = {
     { provider: "anthropic", model: "claude-sonnet-4-6", label: "OpenClaude · Sonnet 4.6" },
     { provider: "openai", model: "gpt-5.5", label: "OpenClaude · GPT-5.5" },
   ],
+  // OpenClaude is a Claude Code fork, so it shares Claude Code's session id model:
+  // assign `--session-id <uuid>` on turn 1 and resume with `-r <uuid>`.
+  sessionStrategy: "assign",
   // OpenClaude is a Claude Code fork and exposes the same `--tools` option
   // (src/main.tsx: `--tools <tools...> … Use "" to disable all tools`). The
   // shared run passes `--tools ""` for a structural zero-tool surface; the Box
   // run bypasses permissions so the native tools execute.
-  buildArgv: ({ prompt, model, toolsAllowed }) => [
-    "openclaude", "-p", prompt, "--model", model,
+  buildArgv: ({ prompt, model, toolsAllowed, sessionId, resumeSessionId }) => [
+    "openclaude", "-p", prompt,
+    ...(resumeSessionId ? ["-r", resumeSessionId] : sessionId ? ["--session-id", sessionId] : []),
+    "--model", model,
     ...(toolsAllowed ? ["--dangerously-skip-permissions"] : ["--tools", ""]),
   ],
 };

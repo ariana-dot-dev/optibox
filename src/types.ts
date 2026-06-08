@@ -76,6 +76,19 @@ export interface HarnessRunSpec {
   outputMode?: HarnessOutputMode;
   /** Poll cadence for the remote log tail; lower values expose real chunks sooner. */
   pollMs?: number;
+  /**
+   * Interrupt handle. When this aborts, the runtime stops the harness the same
+   * way a human "stops the agent": SIGINT then SIGKILL on shared infra, or
+   * `kill -INT`/`kill -KILL` of the captured PID inside the Box. Completed turns
+   * are already flushed to the harness' session file and remain resumable.
+   */
+  signal?: AbortSignal;
+  /**
+   * Called once when the harness' native stream reveals the session/thread id for
+   * this conversation (codex thread_id, pi header id, opencode sessionID, claude
+   * session_id). The host persists it to resume the SAME conversation next turn.
+   */
+  onSessionId?: (sessionId: string) => void;
 }
 
 /** User-visible text emitted by a harness, with optional native assistant-message identity. */
@@ -150,6 +163,12 @@ export interface SharedContext {
   machine: MachineState;
   /** Whether the user asked for real tool work (=> LARP a brief holding reply). */
   toolIntent: boolean;
+  /** Last known native session id for this conversation+harness (resume target). */
+  sessionId?: string;
+  /** Persist the native session id captured from the harness stream this turn. */
+  onSessionId?: (sessionId: string) => void;
+  /** Interrupt handle: aborting stops the harness like a human "stop". */
+  signal?: AbortSignal;
 }
 
 export interface UserBoxContext {
@@ -167,6 +186,12 @@ export interface UserBoxContext {
   machine: MachineState;
   /** Partial reply the shared prewarm agent already streamed to the user. */
   partialShared: string;
+  /** Last known native session id for this conversation+harness (resume target). */
+  sessionId?: string;
+  /** Persist the native session id captured from the harness stream this turn. */
+  onSessionId?: (sessionId: string) => void;
+  /** Interrupt handle: aborting stops the harness like a human "stop". */
+  signal?: AbortSignal;
 }
 
 export interface ModelOption {

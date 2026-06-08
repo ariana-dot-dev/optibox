@@ -13,12 +13,17 @@ export const spec: RealCliHarnessSpec = {
     { provider: "anthropic", model: "claude-haiku-4-5-20251001", label: "Pi · Haiku 4.5" },
   ],
   outputMode: "pi-json",
+  // Pi's `--mode json` first line is the session header `{"type":"session","id":…}`;
+  // we capture that id and resume the SAME session with `--session <id>`
+  // (verified, pi 0.74.2 — docs/harness-interrupt-resume-evidence.md).
+  sessionStrategy: "capture",
   // Structural no-tool mode (shared infra): Pi documents `--no-tools, -nt
   // Disable all tools` (packages/coding-agent/docs/usage.md), which loads the
   // agent with zero tools. The Box run omits it so the built-in tools (read,
   // bash, edit, write, grep, find, ls) are available.
-  buildArgv: ({ prompt, model, toolsAllowed }) => [
+  buildArgv: ({ prompt, model, toolsAllowed, resumeSessionId }) => [
     "pi", "--mode", "json",
+    ...(resumeSessionId ? ["--session", resumeSessionId] : []),
     ...(toolsAllowed ? [] : ["--no-tools"]),
     prompt, "--model", model,
   ],

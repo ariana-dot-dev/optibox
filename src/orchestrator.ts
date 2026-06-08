@@ -29,7 +29,7 @@ export interface ConsumerTurnInput {
 }
 
 export type ConsumerTurnEventBody =
-  | { type: "trace"; stage: string; message: string; harness?: string; model?: string; boxId?: string }
+  | { type: "trace"; stage: string; message: string; harness?: string; model?: string; boxId?: string; data?: Record<string, unknown> }
   | { type: "turn.blocked"; stage: string; message: string; retryable: boolean; harness?: string; model?: string; boxId?: string }
   | { type: "shared.delta"; text: string; harness: string; final?: boolean }
   | { type: "shared.larp"; harness: string; toolIntent: boolean; note: string }
@@ -173,6 +173,24 @@ interface ConversationPrivateRequestState {
   active?: PrivateRequestRound;
   answeredFingerprints: Set<string>;
   rounds: Map<string, PrivateRequestRound>;
+}
+
+interface ConversationDiagnosticSnapshot {
+  reason: string;
+  key: string;
+  turnSequence: number | null;
+  latestTurnSequence: number | null;
+  activeTurnCount: number;
+  unansweredPromptCount: number;
+  unansweredTurnIds: string[];
+  activePrivateRound: { id: string; state: PrivateRoundState; ageMs: number; fingerprint: string } | null;
+  privateRoundStates: Record<PrivateRoundState, number>;
+  privateRoundIds: Array<{ id: string; state: PrivateRoundState; ageMs: number; fingerprint: string }>;
+  answeredFingerprintCount: number;
+  userBoxBootInFlight: boolean;
+  boxLockQueued: boolean;
+  billableBoxIds: string[];
+  harnessSessionCount: number;
 }
 
 export class ConsumerBoxAgentOrchestrator {
@@ -518,6 +536,10 @@ export class ConsumerBoxAgentOrchestrator {
         : "submit reached backend; checking private runtime state",
       harness: input.selection.harness,
       model: input.selection.model,
+      data: {
+        lockBusyAtSubmit,
+        conversation: this.diagnosticSnapshot(key, "turn.submit.accepted", turnSequence),
+      },
       turnId,
     };
 
@@ -565,6 +587,18 @@ export class ConsumerBoxAgentOrchestrator {
       else this.activeTurnCounts.set(key, activeTurns);
     }
 
+    yield {
+      ...this.traceState(
+        key,
+        "turn.stream.finalized",
+        "turn stream finalized; evaluating unanswered prompts, private rounds, active streams, and auto-stop eligibility",
+        input,
+        turnSequence,
+        { promptAnswered, boxAgentSettled, routedToPrivate },
+      ),
+      turnId,
+    };
+
     // Keep the Box warm briefly after all current responses are done. Any user
     // message bumps turnSequences[key] immediately, which cancels/freezes an
     // existing countdown.
@@ -581,6 +615,31 @@ export class ConsumerBoxAgentOrchestrator {
     // had not yet had a chance to answer.
     const armForBoxDone = boxAgentSettled;
     const armForWarmSharedOnly = !routedToPrivate && hasBillableBox;
+    yield {
+      ...this.traceState(
+        key,
+        "autostop.gate.evaluated",
+        (armForBoxDone || armForWarmSharedOnly) &&
+          !this.activeTurnCounts.has(key) &&
+          !this.hasUnansweredPrompts(key) &&
+          !roundOwed &&
+          !bootInFlight
+          ? "idle auto-stop gate is clear; countdown may start"
+          : "idle auto-stop gate is blocked; Box will remain running until all blockers clear",
+        input,
+        turnSequence,
+        {
+          hasBillableBox,
+          roundOwed,
+          bootInFlight,
+          armForBoxDone,
+          armForWarmSharedOnly,
+          activeTurnBlocked: this.activeTurnCounts.has(key),
+          unansweredPromptBlocked: this.hasUnansweredPrompts(key),
+        },
+      ),
+      turnId,
+    };
     if (
       (armForBoxDone || armForWarmSharedOnly) &&
       !this.activeTurnCounts.has(key) &&
@@ -627,6 +686,23 @@ export class ConsumerBoxAgentOrchestrator {
     const activeAtSubmit = this.activePrivateRound(key);
     const candidateRound = activeAtSubmit ? undefined : this.reservePrivateRound(key, input.message);
     const roundBlockedAtSubmit = Boolean(activeAtSubmit || candidateRound?.state === "stale");
+    yield this.traceState(
+      key,
+      "private-round.reserved",
+      activeAtSubmit
+        ? `private round ${activeAtSubmit.id} was already active; this turn will not reserve another private round`
+        : candidateRound
+          ? `private round ${candidateRound.id} reserved with state=${candidateRound.state}`
+          : "no private round reserved",
+      input,
+      turnSequence,
+      {
+        activeRoundId: activeAtSubmit?.id ?? null,
+        candidateRoundId: candidateRound?.id ?? null,
+        candidateRoundState: candidateRound?.state ?? null,
+        roundBlockedAtSubmit,
+      },
+    );
     const recoveryEvents: ConsumerTurnEventBody[] = [];
     let settleBootAck!: (ack: UserBoxBootAck) => void;
     let rejectBootAck!: (error: unknown) => void;
@@ -641,7 +717,22 @@ export class ConsumerBoxAgentOrchestrator {
       : (async () => {
           const release = await this.acquireLock(this.boxLocks, key);
           try {
+            recoveryEvents.push(this.traceState(
+              key,
+              "box.lock.acquired",
+              "private Box lock acquired; refreshing status before create/resume/adopt",
+              input,
+              turnSequence,
+            ));
             const latestStatus = await this.userBoxStatus(input.userId, input.conversationId);
+            recoveryEvents.push(this.traceState(
+              key,
+              "box.status.refreshed",
+              `private Box status refreshed under lock as ${latestStatus.kind}`,
+              input,
+              turnSequence,
+              { latestStatus },
+            ));
             const box = latestStatus.kind === "ready"
               ? (settleBootAck({ action: "already-ready", box: latestStatus.box }), latestStatus.box)
               : await this.ensureUserBoxWithRecovery(
@@ -670,6 +761,10 @@ export class ConsumerBoxAgentOrchestrator {
       harness: harness.name,
       model: input.selection.model,
       ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+      data: {
+        resolvedStatus,
+        conversation: this.diagnosticSnapshot(key, "box.status.resolved", turnSequence),
+      },
     };
 
     if (roundBlockedAtSubmit || lockBusyAtSubmit) {
@@ -732,6 +827,7 @@ export class ConsumerBoxAgentOrchestrator {
             return;
           }
           this.markPrivateRound(key, round, "active");
+          while (recoveryEvents.length) yield recoveryEvents.shift()!;
           yield* this.runPrivateRuntime(
             input,
             key,
@@ -1091,6 +1187,80 @@ export class ConsumerBoxAgentOrchestrator {
     return (this.unansweredPromptTurnIds.get(key)?.size ?? 0) > 0;
   }
 
+  private diagnosticSnapshot(
+    key: string,
+    reason: string,
+    turnSequence?: number,
+  ): ConversationDiagnosticSnapshot {
+    const state = this.privateRequests.get(key);
+    const now = Date.now();
+    const unansweredTurnIds = [...(this.unansweredPromptTurnIds.get(key) ?? [])];
+    const privateRoundIds = [...(state?.rounds.values() ?? [])]
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map((round) => ({
+        id: round.id,
+        state: round.state,
+        ageMs: Math.max(0, now - round.createdAt),
+        fingerprint: round.fingerprint,
+      }));
+    const privateRoundStates: Record<PrivateRoundState, number> = {
+      needed: 0,
+      active: 0,
+      answered: 0,
+      suppressed: 0,
+      stale: 0,
+    };
+    for (const round of privateRoundIds) privateRoundStates[round.state] += 1;
+    const active = state?.active;
+    return {
+      reason,
+      key,
+      turnSequence: turnSequence ?? null,
+      latestTurnSequence: this.turnSequences.get(key) ?? null,
+      activeTurnCount: this.activeTurnCounts.get(key) ?? 0,
+      unansweredPromptCount: unansweredTurnIds.length,
+      unansweredTurnIds,
+      activePrivateRound: active
+        ? {
+            id: active.id,
+            state: active.state,
+            ageMs: Math.max(0, now - active.createdAt),
+            fingerprint: active.fingerprint,
+          }
+        : null,
+      privateRoundStates,
+      privateRoundIds,
+      answeredFingerprintCount: state?.answeredFingerprints.size ?? 0,
+      userBoxBootInFlight: this.userBoxStarts.has(key),
+      boxLockQueued: this.boxLocks.has(key),
+      billableBoxIds: [...this.billing.keys()],
+      harnessSessionCount: [...this.harnessSessions.keys()].filter((sessionKey) =>
+        sessionKey.startsWith(`${key}:`),
+      ).length,
+    };
+  }
+
+  private traceState(
+    key: string,
+    stage: string,
+    message: string,
+    input: ConsumerTurnInput,
+    turnSequence?: number,
+    extra: Record<string, unknown> = {},
+  ): ConsumerTurnEventBody {
+    return {
+      type: "trace",
+      stage,
+      message,
+      harness: input.selection.harness,
+      model: input.selection.model,
+      data: {
+        ...extra,
+        conversation: this.diagnosticSnapshot(key, stage, turnSequence),
+      },
+    };
+  }
+
   private reservePrivateRound(key: string, message: string): PrivateRequestRound {
     const state = this.requestState(key);
     const fingerprint = requestFingerprint(message) || randomUUID();
@@ -1168,13 +1338,17 @@ export class ConsumerBoxAgentOrchestrator {
   }
 
   private isConversationBusyForIdleStop(key: string, turnSequence: number): boolean {
-    return (
-      this.turnSequences.get(key) !== turnSequence ||
-      this.activeTurnCounts.has(key) ||
-      this.hasUnansweredPrompts(key) ||
-      Boolean(this.activePrivateRound(key)) ||
-      this.userBoxStarts.has(key)
-    );
+    return this.idleStopBlockers(key, turnSequence).length > 0;
+  }
+
+  private idleStopBlockers(key: string, turnSequence: number): string[] {
+    const blockers: string[] = [];
+    if (this.turnSequences.get(key) !== turnSequence) blockers.push("newer-turn-sequence");
+    if (this.activeTurnCounts.has(key)) blockers.push("active-turn-stream");
+    if (this.hasUnansweredPrompts(key)) blockers.push("unanswered-prompt");
+    if (this.activePrivateRound(key)) blockers.push("active-private-round");
+    if (this.userBoxStarts.has(key)) blockers.push("box-boot-in-flight");
+    return blockers;
   }
 
   private bumpTurnSequence(key: string): number {
@@ -1218,7 +1392,8 @@ export class ConsumerBoxAgentOrchestrator {
       // leaving a hidden stop tail.
       let lastWholeSecond = Math.ceil(delayMs / 1000);
       while (true) {
-        if (this.isConversationBusyForIdleStop(key, turnSequence)) {
+        const blockers = this.idleStopBlockers(key, turnSequence);
+        if (blockers.length > 0) {
           yield {
             type: "autostop.timer",
             phase: "canceled",
@@ -1226,7 +1401,7 @@ export class ConsumerBoxAgentOrchestrator {
             remainingMs: Math.max(0, deadlineEpochMs - Date.now()),
             deadlineEpochMs,
             reason: "new-user-message",
-            note: "auto-stop countdown reset because a new user message arrived; it will restart after that response finishes",
+            note: `auto-stop countdown reset because the conversation is busy (${blockers.join(", ")}); it will restart after blockers clear`,
           };
           return;
         }
@@ -1252,28 +1427,30 @@ export class ConsumerBoxAgentOrchestrator {
       }
     }
 
-    if (this.isConversationBusyForIdleStop(key, turnSequence)) {
+    let blockers = this.idleStopBlockers(key, turnSequence);
+    if (blockers.length > 0) {
       yield {
         type: "autostop.timer",
         phase: "canceled",
         boxId,
         remainingMs: 0,
         reason: "new-user-message",
-        note: "auto-stop skipped because a new user message arrived before stop could begin",
+        note: `auto-stop skipped before stop could begin because the conversation is busy (${blockers.join(", ")})`,
       };
       return;
     }
 
     const release = await this.acquireLock(this.boxLocks, key);
     try {
-      if (this.isConversationBusyForIdleStop(key, turnSequence)) {
+      blockers = this.idleStopBlockers(key, turnSequence);
+      if (blockers.length > 0) {
         yield {
           type: "autostop.timer",
           phase: "canceled",
           boxId,
           remainingMs: 0,
           reason: "new-user-message",
-          note: "auto-stop skipped because a new user message is using the private Box",
+          note: `auto-stop skipped after acquiring lock because the conversation is busy (${blockers.join(", ")})`,
         };
         return;
       }
@@ -1346,6 +1523,20 @@ export class ConsumerBoxAgentOrchestrator {
     });
     const userBoxSessionKey = this.sessionKey(key, harness.name, "user-box");
     const knownUserBoxSessionId = this.harnessSessions.get(userBoxSessionKey);
+    yield this.traceState(
+      key,
+      "user-box.runtime.start",
+      `starting private ${harness.name} runtime inside Box ${box.id} via ${route} route`,
+      input,
+      this.turnSequences.get(key),
+      {
+        boxId: box.id,
+        route,
+        roundId: round.id,
+        knownSessionId: Boolean(knownUserBoxSessionId),
+        partialSharedLength: partialShared.length,
+      },
+    );
     // Captures WHY the harness loop ended for this prompt. Defaults to "completed"
     // for plain generator harnesses (no real CLI loop): a generator that simply
     // returns has, by definition, finished its work. Real CLI/SDK harnesses report
@@ -1392,6 +1583,14 @@ export class ConsumerBoxAgentOrchestrator {
             harness: harnessName,
             model: selectionModel,
             boxId: box.id,
+            data: {
+              toolName: ev.toolName ?? null,
+              command: ev.command ?? null,
+              description: ev.description ?? null,
+              stdoutLength: typeof ev.stdout === "string" ? ev.stdout.length : 0,
+              stderrLength: typeof ev.stderr === "string" ? ev.stderr.length : 0,
+              isError: Boolean(ev.isError),
+            },
           };
         }
         yield ev;
@@ -1429,11 +1628,17 @@ export class ConsumerBoxAgentOrchestrator {
       }
       yield* emitChunkEvent(chunk);
     };
+    let next = itc.next();
     while (true) {
-      const n = await itc.next();
+      const raced = await Promise.race([
+        next.then((n) => ({ kind: "next" as const, n })),
+        sleep(50).then(() => ({ kind: "tick" as const })),
+      ]);
       yield* flushExecEvents();
-      if (n.done) break;
-      yield* emitPrivateChunk(n.value);
+      if (raced.kind === "tick") continue;
+      if (raced.n.done) break;
+      yield* emitPrivateChunk(raced.n.value);
+      next = itc.next();
     }
     yield* flushExecEvents();
     if (heldEndCandidate && heldEndCandidate !== PRIVATE_END_SENTINEL) {
@@ -1448,6 +1653,10 @@ export class ConsumerBoxAgentOrchestrator {
         harness: harness.name,
         model: input.selection.model,
         boxId: box.id,
+        data: {
+          roundId: round.id,
+          conversation: this.diagnosticSnapshot(key, "private-round.output.suppressed", this.turnSequences.get(key)),
+        },
       };
       yield { type: "turn.done", boxId: box.id, harness: harness.name, model: input.selection.model, route: "shared" };
       return;
@@ -1460,6 +1669,11 @@ export class ConsumerBoxAgentOrchestrator {
         harness: harness.name,
         model: input.selection.model,
         boxId: box.id,
+        data: {
+          roundId: round.id,
+          completion,
+          conversation: this.diagnosticSnapshot(key, "user-box.response.end", this.turnSequences.get(key)),
+        },
       };
       this.markPrivateRound(key, round, "suppressed");
       yield {
@@ -1510,6 +1724,13 @@ export class ConsumerBoxAgentOrchestrator {
         harness: harness.name,
         model: input.selection.model,
         boxId: box.id,
+        data: {
+          completion,
+          roundId: round.id,
+          sawUserText: Boolean(userText),
+          sawToolUse,
+          conversation: this.diagnosticSnapshot(key, "box.runtime.unsettled", this.turnSequences.get(key)),
+        },
       };
     }
     yield {
@@ -1739,6 +1960,9 @@ export class ConsumerBoxAgentOrchestrator {
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function normalizeHarnessChunk(value: unknown): { text: string; messageId?: string; messageIndex?: number } {
   if (typeof value === "object" && value !== null && "text" in value) {

@@ -90,6 +90,27 @@ class PausingStopBoxClient extends FakeBoxClient {
   }
 }
 
+class GatedToolLogBoxClient extends FakeBoxClient {
+  answerReleased = false;
+  releaseAnswer(): void { this.answerReleased = true; }
+  override async command(_boxId: string, input: { command: string }): Promise<CommandResult> {
+    this.commands.push(input.command);
+    if (/^cat\s/.test(input.command)) {
+      const toolUse = { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "sleep 1 && echo done", description: "long command" } }] } };
+      const working = `${JSON.stringify(toolUse)}\n`;
+      if (!this.answerReleased) return { exitCode: 0, stdout: working, stderr: "" };
+      const answer = "done from tool";
+      return {
+        exitCode: 0,
+        stdout: `${working}${JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: answer } } })}\n${JSON.stringify({ type: "result", result: answer })}\n__CBA_EXIT__:0\n`,
+        stderr: "",
+      };
+    }
+    if (/kill -0/.test(input.command)) return { exitCode: 0, stdout: "up\n", stderr: "" };
+    return { exitCode: 0, stdout: "", stderr: "" };
+  }
+}
+
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 300): Promise<void> {
   const started = Date.now();
@@ -184,6 +205,29 @@ test("tool turns resume the Box and auto-stop after answering", async () => {
   assert.ok(second.some((e) => e.type === "user-box.delta"), "tool follow-up is answered by the Box");
   assert.ok(second.some((e) => e.type === "billing.stop"), "follow-up auto-stops billing");
   assert.equal((await box.get(boxId)).state, "archived", "Box is archived again after follow-up");
+});
+
+test("turn traces include attachable conversation diagnostics", async () => {
+  const box = new FakeBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) events.push(e);
+
+  const accepted = events.find((e) => e.type === "trace" && e.stage === "turn.submit.accepted");
+  assert.equal(accepted?.data?.conversation?.activeTurnCount, 1);
+  assert.equal(accepted?.data?.conversation?.unansweredPromptCount, 1);
+
+  const reserved = events.find((e) => e.type === "trace" && e.stage === "private-round.reserved");
+  assert.equal(reserved?.data?.candidateRoundState, "needed");
+  assert.equal(reserved?.data?.conversation?.privateRoundStates?.needed, 1);
+
+  const runtime = events.find((e) => e.type === "trace" && e.stage === "user-box.runtime.start");
+  assert.equal(runtime?.data?.route, "bridge");
+  assert.ok(runtime?.data?.roundId);
+
+  const gate = events.find((e) => e.type === "trace" && e.stage === "autostop.gate.evaluated");
+  assert.equal(gate?.data?.armForBoxDone, true);
+  assert.equal(gate?.data?.conversation?.unansweredPromptCount, 0);
 });
 
 test("new turn inside idle window cancels pending auto-stop and reuses warm Box", async () => {

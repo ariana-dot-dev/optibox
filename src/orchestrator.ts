@@ -160,6 +160,13 @@ interface UserBoxBootAck {
 
 type PrivateRoundState = "needed" | "active" | "answered" | "suppressed" | "stale";
 
+class BoxTerminalStateError extends Error {
+  constructor(readonly boxId: string, readonly state: string, readonly label: string) {
+    super(`Box ${boxId} entered terminal state ${state} while waiting for ${label}`);
+    this.name = "BoxTerminalStateError";
+  }
+}
+
 interface PrivateRequestRound {
   id: string;
   fingerprint: string;
@@ -302,7 +309,7 @@ export class ConsumerBoxAgentOrchestrator {
     if (!box) return { kind: "none", staleBoxId: existing.boxId };
     if (box.state === "error") return { kind: "error", boxId: box.id, box };
     if (isReady(box.state)) return { kind: "ready", boxId: box.id, box };
-    if (box.state === "archived")
+    if (box.state === "archived" || box.state === "stopped")
       return { kind: "archived", boxId: box.id, box };
     if (box.state === "archiving")
       return { kind: "archiving", boxId: box.id, box };
@@ -363,7 +370,8 @@ export class ConsumerBoxAgentOrchestrator {
               "resume",
               this.options.resumeTimeoutMs,
             );
-          } catch {
+          } catch (e) {
+            if (e instanceof BoxTerminalStateError) throw e;
             return this.createFreshUserBox(userId, conversationId, onBootAck);
           }
         }
@@ -375,7 +383,8 @@ export class ConsumerBoxAgentOrchestrator {
           onBootAck?.({ action: "existing-boot", box });
           try {
             return await this.waitUntilReady(existing.boxId, "existing");
-          } catch {
+          } catch (e) {
+            if (e instanceof BoxTerminalStateError) throw e;
             await this.clearSession(userId, conversationId);
             return this.createFreshUserBox(userId, conversationId, onBootAck);
           }
@@ -427,7 +436,8 @@ export class ConsumerBoxAgentOrchestrator {
         await this.options.box.resume(box.id);
         onBootAck?.({ action: "adopt-resume-requested", box: await this.options.box.get(box.id).catch(() => box) });
         box = await this.waitUntilReady(box.id, "adopt-archived", this.options.resumeTimeoutMs);
-      } catch {
+      } catch (e) {
+        if (e instanceof BoxTerminalStateError) throw e;
         await this.clearSession(userId, conversationId);
         return undefined;
       }
@@ -497,6 +507,15 @@ export class ConsumerBoxAgentOrchestrator {
           this.options.resumeTimeoutMs,
         );
       } catch (e) {
+        if (e instanceof BoxTerminalStateError) {
+          emit({
+            type: "lifecycle",
+            boxId: oldBoxId,
+            state: e.state,
+            note: `private Box resume ended in terminal state ${e.state}; a retry can request a fresh runtime`,
+          });
+          throw e;
+        }
         emit({
           type: "lifecycle",
           boxId: oldBoxId,
@@ -567,6 +586,7 @@ export class ConsumerBoxAgentOrchestrator {
         if (ev.type === "trace" && ev.stage === "user-box.response.end") boxAgentSettled = true;
         if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge") && ev.settled === true) boxAgentSettled = true;
         if (ev.type === "turn.done" && ev.settled !== false) promptAnswered = true;
+        if (ev.type === "turn.blocked") promptAnswered = true;
         if (
           ev.type === "handoff.started" ||
           ev.type === "user-box.delta" ||
@@ -976,6 +996,21 @@ export class ConsumerBoxAgentOrchestrator {
     } catch (error) {
       this.markPrivateRound(key, round, "suppressed");
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
+      const blockedBoxId = error instanceof BoxTerminalStateError
+        ? error.boxId
+        : ("boxId" in resolvedStatus ? resolvedStatus.boxId : undefined);
+      if (blockedBoxId && this.billing.has(blockedBoxId)) {
+        const since = this.billing.get(blockedBoxId) ?? Date.now();
+        const elapsedSeconds = Math.max(0, (Date.now() - since) / 1000);
+        this.billing.delete(blockedBoxId);
+        yield {
+          type: "billing.stop",
+          boxId: blockedBoxId,
+          elapsedSeconds,
+          costUsd: elapsedSeconds * BOX_PRICE_USD_PER_SECOND,
+          note: "billing PAUSED — private Box boot/resume ended before it became usable",
+        };
+      }
       yield {
         type: "turn.blocked",
         stage: "box.runtime.unavailable",
@@ -983,7 +1018,7 @@ export class ConsumerBoxAgentOrchestrator {
         retryable: true,
         harness: harness.name,
         model: input.selection.model,
-        ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
+        ...(blockedBoxId ? { boxId: blockedBoxId } : {}),
       };
       adaptiveTurnCompleted = true;
       return;
@@ -1924,7 +1959,7 @@ export class ConsumerBoxAgentOrchestrator {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       const box = await this.options.box.get(boxId);
-      if (box.state === "archived") return box;
+      if (box.state === "archived" || box.state === "stopped") return box;
       if (box.state === "error")
         throw new Error(
           `Box ${boxId} entered error while waiting for ${label}`,
@@ -1952,6 +1987,8 @@ export class ConsumerBoxAgentOrchestrator {
         throw new Error(
           `Box ${boxId} entered error while waiting for ${label}`,
         );
+      if (box.state === "archived" || box.state === "stopped")
+        throw new BoxTerminalStateError(boxId, box.state, label);
       await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
     throw new Error(
@@ -2002,7 +2039,7 @@ function sharedNeedsPrivate(rawSharedText: string, message: string): boolean {
       // emits malformed routing metadata.
     }
   }
-  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
+  return /\b(run|execute|shell|bash|terminal|command|file|files|filesystem|fs|create|write|edit|read|inspect|check|list|install|curl|hostname|ip|ip address|ipv[46]|cpu|core|nproc|pwd|directory|directories)\b/i.test(message);
 }
 
 const PRIVATE_END_SENTINEL = "<end>";

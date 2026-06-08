@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { URL } from "node:url";
 import {
   BoxHttpClient,
@@ -7,51 +8,158 @@ import {
   ConsumerBoxAgentOrchestrator,
   InMemorySessionStore,
   createRestrictedSharedCapabilities,
+  createSharedInfraCapabilities,
   RUNTIME_FEASIBILITY,
   type ConsumerTurnEvent,
 } from "../src/index.js";
-import { harness as claude } from "../examples/claude-sdk/adapter.js";
-
-const apiKey = process.env.BOX_API_KEY;
-if (!apiKey)
-  throw new Error(
-    "BOX_API_KEY is required; this server refuses to run without the real Box credential.",
-  );
-const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-if (!anthropicApiKey)
-  throw new Error(
-    "ANTHROPIC_API_KEY is required; demo backend proof is Claude-only and will not substitute OpenAI/Codex/GPT providers.",
-  );
+import { realCliHarness, type RealCliHarnessSpec } from "../examples/shared.js";
+import { spec as claudeSpec } from "../examples/claude-sdk/adapter.js";
+import { spec as codebaseDaemonSpec } from "../examples/codebase-daemon/adapter.js";
+import { spec as codexSpec } from "../examples/codex-sdk/adapter.js";
+import { spec as hermesSpec } from "../examples/hermes/adapter.js";
+import { spec as openclaudeSpec } from "../examples/openclaude/adapter.js";
+import { spec as opencodeSpec } from "../examples/opencode/adapter.js";
+import { spec as piSpec } from "../examples/pi/adapter.js";
 
 const port = Number(process.env.PORT ?? 4178);
-const box = assertNoBoxAgent(new BoxHttpClient({ apiKey })); // runtime proof: Box's built-in agent is forbidden
-// Demo proof is Claude-only: Sonnet/Haiku via Anthropic, never Opus by default, never OpenAI/Codex/GPT fallback.
-const allHarnesses = [claude];
-const orchestrator = new ConsumerBoxAgentOrchestrator({
-  box,
-  harnesses: allHarnesses,
-  sessions: new InMemorySessionStore(),
-  providerEnv: { ANTHROPIC_API_KEY: anthropicApiKey },
-  sharedBoxName: "consumer-agent-shared-prewarm",
-  userBoxName: (userId) => `consumer-agent-user-${userId}`,
-  userBoxTtlSeconds: 900,
-  readinessPollMs: 2000,
-  handoffTimeoutMs: 120_000,
-  resumeTimeoutMs: 60_000,
-  autoStopIdleMs: 10_000,
-});
 
-function keyAvailable(provider: string): boolean {
-  return provider === "anthropic" && Boolean(anthropicApiKey);
+// Public task-agent previews must never reuse the task agent's real Box/LLM keys.
+// Alfred/private previews can opt into the old zero-config behavior with
+// OPTIBOX_ALLOW_SERVER_KEYS=1; non-agent private runtimes also keep it by default.
+const allowServerKeys =
+  process.env.OPTIBOX_ALLOW_SERVER_KEYS === "1" ||
+  (process.env.PRODUCT_MODE !== "agent" &&
+    process.env.OPTIBOX_ALLOW_SERVER_KEYS !== "0");
+
+const allSpecs: RealCliHarnessSpec[] = [
+  claudeSpec,
+  codebaseDaemonSpec,
+  codexSpec,
+  hermesSpec,
+  openclaudeSpec,
+  opencodeSpec,
+  piSpec,
+];
+
+interface DemoCredentials {
+  boxApiKey: string | undefined;
+  providerEnv: Record<string, string>;
+  source: "server" | "byok";
 }
 
-function harnessInfo() {
-  return allHarnesses.map((h) => ({
-    name: h.name,
-    description: h.description,
-    models: h.models.map((m) => ({
+const serverProviderEnv = allowServerKeys ? providerEnvFromProcess() : {};
+const serverBoxApiKey = allowServerKeys ? process.env.BOX_API_KEY : undefined;
+const orchestrators = new Map<string, ConsumerBoxAgentOrchestrator>();
+
+function providerEnvFromProcess(): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (process.env.ANTHROPIC_API_KEY) env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY_SCOPED ?? process.env.OPENAI_API_KEY;
+  if (openaiKey) {
+    env.OPENAI_API_KEY = openaiKey;
+    env.OPENAI_API_KEY_SCOPED = openaiKey;
+  }
+  if (process.env.OPENROUTER_API_KEY) env.OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+  return env;
+}
+
+function providerEnvFromBody(raw: any): Record<string, string> {
+  const apiKeys = raw && typeof raw === "object" ? raw.apiKeys ?? raw.keys ?? {} : {};
+  const env: Record<string, string> = {};
+  const put = (name: string, value: unknown) => {
+    if (typeof value === "string" && value.trim()) env[name] = value.trim();
+  };
+  put("ANTHROPIC_API_KEY", apiKeys.anthropicApiKey ?? apiKeys.ANTHROPIC_API_KEY);
+  const openai = apiKeys.openaiApiKey ?? apiKeys.OPENAI_API_KEY ?? apiKeys.OPENAI_API_KEY_SCOPED;
+  put("OPENAI_API_KEY", openai);
+  put("OPENAI_API_KEY_SCOPED", openai);
+  put("OPENROUTER_API_KEY", apiKeys.openrouterApiKey ?? apiKeys.OPENROUTER_API_KEY);
+  return env;
+}
+
+function boxApiKeyFromBody(raw: any): string | undefined {
+  const apiKeys = raw && typeof raw === "object" ? raw.apiKeys ?? raw.keys ?? {} : {};
+  const value = apiKeys.boxApiKey ?? apiKeys.BOX_API_KEY;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function credentialsFromBody(raw: any): DemoCredentials {
+  const byokProviderEnv = providerEnvFromBody(raw);
+  const byokBoxApiKey = boxApiKeyFromBody(raw);
+  const useByok = Boolean(byokBoxApiKey || Object.keys(byokProviderEnv).length);
+  if (useByok) {
+    return {
+      boxApiKey: byokBoxApiKey ?? serverBoxApiKey,
+      providerEnv: { ...serverProviderEnv, ...byokProviderEnv },
+      source: "byok",
+    };
+  }
+  return { boxApiKey: serverBoxApiKey, providerEnv: serverProviderEnv, source: "server" };
+}
+
+function envForProvider(provider: string): string {
+  if (provider === "anthropic") return "ANTHROPIC_API_KEY";
+  if (provider === "openrouter") return "OPENROUTER_API_KEY";
+  return "OPENAI_API_KEY";
+}
+
+function keyAvailable(provider: string, providerEnv = serverProviderEnv): boolean {
+  return Boolean(providerEnv[envForProvider(provider)]);
+}
+
+function credentialError(selection: { harness: string; provider: string; model: string }, credentials: DemoCredentials): string | undefined {
+  if (!credentials.boxApiKey) {
+    return allowServerKeys
+      ? "BOX_API_KEY is not configured on the private preview and no BYOK Box key was provided."
+      : "This public/dev preview requires your own Box API key. Open Settings (gear) and paste BOX_API_KEY.";
+  }
+  const required = envForProvider(selection.provider);
+  if (!credentials.providerEnv[required]) {
+    return allowServerKeys
+      ? `${required} is not configured on the private preview and no BYOK provider key was provided.`
+      : `This public/dev preview requires your own ${required}. Open Settings (gear), paste the key, and retry.`;
+  }
+  return undefined;
+}
+
+function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestrator {
+  if (!credentials.boxApiKey) throw new Error("BOX_API_KEY is required");
+  const cacheKey = createHash("sha256")
+    .update(JSON.stringify({ box: credentials.boxApiKey, providerEnv: credentials.providerEnv }))
+    .digest("hex");
+  const cached = orchestrators.get(cacheKey);
+  if (cached) return cached;
+  const providerEnv = credentials.providerEnv;
+  const harnesses = allSpecs.map((spec) =>
+    realCliHarness(spec, {
+      createSharedRuntime: () => createSharedInfraCapabilities({ providerEnv }),
+    }),
+  );
+  const orchestrator = new ConsumerBoxAgentOrchestrator({
+    box: assertNoBoxAgent(new BoxHttpClient({ apiKey: credentials.boxApiKey })),
+    harnesses,
+    sessions: new InMemorySessionStore(),
+    providerEnv,
+    sharedBoxName: `consumer-agent-shared-prewarm-${cacheKey.slice(0, 8)}`,
+    userBoxName: (userId) => `consumer-agent-user-${userId}-${cacheKey.slice(0, 8)}`,
+    userBoxTtlSeconds: 900,
+    readinessPollMs: 2000,
+    handoffTimeoutMs: 120_000,
+    resumeTimeoutMs: 60_000,
+    autoStopIdleMs: 10_000,
+  });
+  orchestrators.set(cacheKey, orchestrator);
+  return orchestrator;
+}
+
+function harnessInfo(providerEnv = serverProviderEnv) {
+  return allSpecs.map((spec) => ({
+    name: spec.name,
+    description: spec.description,
+    models: spec.models.map((m) => ({
       ...m,
-      keyAvailable: keyAvailable(m.provider),
+      keyAvailable: keyAvailable(m.provider, providerEnv),
+      requiredEnv: envForProvider(m.provider),
     })),
   }));
 }
@@ -124,9 +232,14 @@ const server = http.createServer(async (req, res) => {
         JSON.stringify({
           harnesses: harnessInfo(),
           env: {
+            BOX_API_KEY: Boolean(serverBoxApiKey),
             ANTHROPIC_API_KEY: keyAvailable("anthropic"),
+            OPENAI_API_KEY: keyAvailable("openai"),
+            OPENROUTER_API_KEY: keyAvailable("openrouter"),
           },
-          runtimeFeasibility: RUNTIME_FEASIBILITY.filter((r) => r.harnessName === claude.name),
+          serverKeysAllowed: allowServerKeys,
+          credentialMode: allowServerKeys ? "server-or-byok" : "byok-required",
+          runtimeFeasibility: RUNTIME_FEASIBILITY,
           boxAgent: "disabled (assertNoBoxAgent guard)",
           pricing: BOX_PRICING,
         }),
@@ -171,7 +284,15 @@ const server = http.createServer(async (req, res) => {
         provider: String(body.provider),
         model: String(body.model),
       };
+      const credentials = credentialsFromBody(body);
       try {
+        const configError = credentialError(selection, credentials);
+        if (configError) {
+          send({ type: "error", message: configError });
+          send({ type: "stream.end" });
+          return void res.end();
+        }
+        const orchestrator = orchestratorFor(credentials);
         const turnInput = {
           userId: String(body.userId ?? "user-a"),
           conversationId: String(body.conversationId ?? "conv-1"),
@@ -205,6 +326,13 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const send = sse(res);
       try {
+        const credentials = credentialsFromBody(body);
+        if (!credentials.boxApiKey) {
+          send({ type: "error", message: allowServerKeys ? "BOX_API_KEY is not configured." : "Open Settings (gear) and paste BOX_API_KEY before pausing a BYOK Box." });
+          send({ type: "stream.end" });
+          return void res.end();
+        }
+        const orchestrator = orchestratorFor(credentials);
         for await (const event of orchestrator.stopUserBox(
           String(body.userId ?? "user-a"),
           String(body.conversationId ?? "conv-1"),
@@ -247,7 +375,7 @@ function html() {
 .shell{height:100dvh;max-width:1180px;margin:0 auto;display:grid;grid-template-columns:minmax(380px,560px) 330px;gap:24px;align-items:stretch;padding:0 24px}.app{height:100dvh;min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e0e0e0;border-right:1px solid #e0e0e0}
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e0e0e0;padding:calc(14px + env(safe-area-inset-top)) 16px 14px;display:grid;gap:12px}
 .counters{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.counter{border:1px solid #e0e0e0;background:#f6f6f6;padding:11px 12px;min-width:0}.label{display:block;color:#555;letter-spacing:.01em;font-size:12px;font-weight:400}.value{display:block;margin-top:3px;font:400 21px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:1px solid #111;background:#111;color:#fff;padding:10px 13px;font-size:13px;font-weight:400;text-align:center}
-.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.controls button,.traceToggle{min-height:36px;background:#fff;color:#111;border:1px solid #d9d9d9;padding:0 12px;font-weight:400;font-size:12px;display:inline-flex;align-items:center;gap:7px;cursor:pointer}.traceToggle input{accent-color:#111}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.controls button,.traceToggle{min-height:36px;background:#fff;color:#111;border:1px solid #d9d9d9;padding:0 12px;font-weight:400;font-size:12px;display:inline-flex;align-items:center;gap:7px;cursor:pointer}.traceToggle input{accent-color:#111}.iconButton{width:36px;justify-content:center;padding:0!important;font-size:16px}.settingsBackdrop{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:18px}.settingsBackdrop.open{display:flex}.settingsDialog{width:min(560px,100%);max-height:92dvh;overflow:auto;background:#fff;border:1px solid #111;box-shadow:0 20px 70px rgba(0,0,0,.22);padding:18px;color:#111}.settingsHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.settingsHead h2{margin:0;font-size:20px;font-weight:400;letter-spacing:-.02em}.settingsHead p{margin:4px 0 0;color:#555;font-size:12px}.settingsDialog label{display:grid;gap:5px;margin-top:10px;font-size:12px;color:#555}.settingsDialog input,.settingsDialog select{width:100%;border:1px solid #d9d9d9;background:#fff;color:#111;min-height:38px;padding:8px 10px;font:inherit;font-size:13px}.settingsDialog input:focus,.settingsDialog select:focus{outline:none;border-color:#111}.settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.settingsNote{margin-top:12px;border:1px solid #e0e0e0;background:#f6f6f6;padding:10px 12px;font-size:12px;color:#333}.settingsActions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.settingsActions button.secondary{background:#fff;color:#111;border:1px solid #d9d9d9}.settingsStatus{font-size:12px;color:#555;margin-top:8px}.dangerText{color:#9f1239}.okText{color:#166534}
 .chat{flex:1;overflow:auto;padding:18px 16px 20px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#555;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;font-weight:400;border:1px solid transparent}.msg.user{align-self:flex-end;background:#111;color:#fff}.msg.assistant{align-self:flex-start;background:#f6f6f6;color:#111;border-color:#e0e0e0}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed #d9d9d9;color:#555;font-size:12px;max-width:92%;padding:8px 10px}.tag{display:block;margin-bottom:4px;color:#555;letter-spacing:.01em;font-size:10px;font-weight:400}.msg.user .tag{color:#d9d9d9}.msg.trace .tag{color:#777}
 .composer{position:relative;display:block;padding:12px 16px calc(14px + env(safe-area-inset-bottom));border-top:1px solid #e0e0e0;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}textarea{width:100%;min-height:58px;max-height:140px;resize:none;border:1px solid #d9d9d9;background:#fff;color:#111;padding:13px 92px 13px 13px;font:inherit;font-weight:400;outline:none;display:block}textarea:focus{border-color:#111}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}#send{position:absolute;right:16px;bottom:calc(14px + env(safe-area-inset-bottom));height:42px;min-height:42px;background:#fc4b55;color:#fff;border:1px solid #fc4b55}
 .schematic{align-self:center;border:1px solid #e0e0e0;background:#fff;padding:20px;color:#111}.schematic h2{font-family:"Funnel Display",Inter,ui-sans-serif,system-ui,sans-serif;font-size:22px;line-height:1.15;letter-spacing:-.02em;margin:0 0 18px;color:#111;font-weight:400}.route{display:grid;gap:10px}.node{border:1px solid #e0e0e0;background:#f6f6f6;padding:13px;transition:.18s ease}.node .nodeTitle{display:block;font-size:15px;font-weight:400;color:inherit}.node span{display:block;margin-top:3px;color:#555;font-size:12px;font-weight:400}.path{min-height:22px;display:flex;align-items:center;color:#777;font-size:13px;letter-spacing:0}.path span{display:block}.path span:before{content:"↓ ";color:#fc4b55}.schematic[data-route="shared"] .shared-node,.schematic[data-route="private"] .private-node{border-color:#111;background:#111;color:#fff}.schematic[data-route="shared"] .shared-node span,.schematic[data-route="private"] .private-node span{color:#efefef}.schematic[data-route="private"] .to-private span,.schematic[data-route="shared"] .to-shared span{color:#fc4b55}.routeStatus{margin-top:12px;border:1px solid #e0e0e0;padding:10px 12px;background:#fff;font-size:12px;font-weight:400;color:#111}.matrix{margin-top:12px;display:grid;gap:7px}.matrixRow{border:1px solid #e0e0e0;background:#fff;padding:8px 9px;font-size:11px;font-weight:400}.matrixRow .matrixTitle{display:block;font-size:12px;font-weight:400}.matrixRow span{display:block;color:#555;margin-top:2px;font-weight:400}
@@ -262,7 +390,7 @@ function html() {
       <div class="counter"><span class="label">auto-stop</span><span class="value" id="autoStopTimer">idle</span></div>
     </section>
     <div class="state" id="machineState">Shared bridge ready · private machine stopped</div>
-    <div class="controls"><button id="stopBox" type="button">Pause Box now</button><label class="traceToggle"><input id="showTraces" type="checkbox"/> Show traces</label></div>
+    <div class="controls"><button id="stopBox" type="button">Pause Box now</button><label class="traceToggle"><input id="showTraces" type="checkbox"/> Show traces</label><button id="settingsOpen" class="iconButton" type="button" aria-label="Settings" title="Settings">⚙</button></div>
   </header>
   <section class="chat" id="chat" aria-live="polite"><div class="empty" id="empty">Send a message to start the demo.</div></section>
   <form class="composer" id="composer">
@@ -283,12 +411,46 @@ function html() {
   <div class="matrix" id="matrix"></div>
 </aside>
 </div>
+<div class="settingsBackdrop" id="settingsBackdrop" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+  <section class="settingsDialog">
+    <div class="settingsHead">
+      <div><h2 id="settingsTitle">Demo settings</h2><p>Choose harness/model and bring your own keys for public/dev previews.</p></div>
+      <button id="settingsClose" class="iconButton" type="button" aria-label="Close settings">×</button>
+    </div>
+    <div class="settingsGrid">
+      <label>Harness<select id="settingsHarness"></select></label>
+      <label>Model<select id="settingsModel"></select></label>
+    </div>
+    <label>BOX_API_KEY<input id="settingsBoxKey" type="password" autocomplete="off" placeholder="bx_…"/></label>
+    <label>ANTHROPIC_API_KEY<input id="settingsAnthropicKey" type="password" autocomplete="off" placeholder="sk-ant-…"/></label>
+    <label>OPENAI_API_KEY<input id="settingsOpenaiKey" type="password" autocomplete="off" placeholder="sk-…"/></label>
+    <label>OPENROUTER_API_KEY<input id="settingsOpenrouterKey" type="password" autocomplete="off" placeholder="sk-or-…"/></label>
+    <div class="settingsNote" id="settingsNote">Loading credential mode…</div>
+    <div class="settingsStatus" id="settingsStatus"></div>
+    <div class="settingsActions"><button id="settingsClear" class="secondary" type="button">Clear BYOK</button><button id="settingsSave" type="button">Save</button></div>
+  </section>
+</div>
 <script>
-let H=[]; let MATRIX=[]; let PRICING=null; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser=(new URLSearchParams(location.search).get('userId')||'user-a'), selectedConversation=(new URLSearchParams(location.search).get('conversationId')||'conv-1');
+let H=[]; let MATRIX=[]; let PRICING=null; let HARNESS_META={serverKeysAllowed:false,credentialMode:'byok-required',env:{}}; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser=(new URLSearchParams(location.search).get('userId')||'user-a'), selectedConversation=(new URLSearchParams(location.search).get('conversationId')||'conv-1');
 let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
 let autoStopInterval=null, autoStopDeadline=0, autoStopBoxId=null;
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+const SETTINGS_KEY='optibox.demo.settings.v1';
+function readSettings(){try{return JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}')||{};}catch{return {};}}
+function writeSettings(next){localStorage.setItem(SETTINGS_KEY,JSON.stringify(next));}
+function has(v){return typeof v==='string'&&v.trim().length>0;}
+function clientProviderKeyAvailable(provider){const s=readSettings();if(provider==='anthropic')return has(s.anthropicApiKey)||Boolean(HARNESS_META.env&&HARNESS_META.env.ANTHROPIC_API_KEY);if(provider==='openrouter')return has(s.openrouterApiKey)||Boolean(HARNESS_META.env&&HARNESS_META.env.OPENROUTER_API_KEY);return has(s.openaiApiKey)||Boolean(HARNESS_META.env&&HARNESS_META.env.OPENAI_API_KEY);}
+function clientBoxKeyAvailable(){const s=readSettings();return has(s.boxApiKey)||Boolean(HARNESS_META.env&&HARNESS_META.env.BOX_API_KEY);}
+function currentApiKeys(){const s=readSettings();return {boxApiKey:s.boxApiKey||'',anthropicApiKey:s.anthropicApiKey||'',openaiApiKey:s.openaiApiKey||'',openrouterApiKey:s.openrouterApiKey||''};}
+function selectedModelOption(){const h=H.find(x=>x.name===selectedHarness);return h&&h.models.find(m=>m.provider===selectedProvider&&m.model===selectedModel);}
+function currentSettingsStatus(){const model=selectedModelOption();if(!clientBoxKeyAvailable())return {ok:false,msg:'BOX_API_KEY required for this preview.'};if(model&&!clientProviderKeyAvailable(model.provider))return {ok:false,msg:(model.requiredEnv||'Provider key')+' required for '+(model.label||model.model)+'.'};return {ok:true,msg:HARNESS_META.serverKeysAllowed&&!Object.values(currentApiKeys()).some(Boolean)?'Using private server keys for this preview.':'BYOK credentials ready.'};}
+function updateSettingsStatus(){const st=currentSettingsStatus();const el=$('settingsStatus');if(el){el.className='settingsStatus '+(st.ok?'okText':'dangerText');el.textContent=st.msg;}if(!st.ok)setState('Settings required · '+st.msg);}
+function renderSettingsControls(){const hs=$('settingsHarness'), ms=$('settingsModel');if(!hs||!ms)return;hs.innerHTML=H.map(h=>'<option value="'+esc(h.name)+'">'+esc(h.name)+'</option>').join('');hs.value=selectedHarness;const h=H.find(x=>x.name===selectedHarness);ms.innerHTML=(h?h.models:[]).map(m=>'<option value="'+esc(m.provider+'|'+m.model)+'">'+esc((m.label||m.model)+' · '+m.requiredEnv+(clientProviderKeyAvailable(m.provider)?' ✓':''))+'</option>').join('');ms.value=selectedProvider+'|'+selectedModel;updateSettingsStatus();}
+function openSettings(){const s=readSettings();if(!$('settingsBackdrop')||!$('settingsBoxKey'))return;$('settingsBoxKey').value=s.boxApiKey||'';$('settingsAnthropicKey').value=s.anthropicApiKey||'';$('settingsOpenaiKey').value=s.openaiApiKey||'';$('settingsOpenrouterKey').value=s.openrouterApiKey||'';renderSettingsControls();$('settingsBackdrop').classList.add('open');$('settingsHarness').focus();}
+function closeSettings(){if($('settingsBackdrop'))$('settingsBackdrop').classList.remove('open');}
+function saveSettings(){writeSettings({boxApiKey:$('settingsBoxKey').value.trim(),anthropicApiKey:$('settingsAnthropicKey').value.trim(),openaiApiKey:$('settingsOpenaiKey').value.trim(),openrouterApiKey:$('settingsOpenrouterKey').value.trim(),harness:selectedHarness,provider:selectedProvider,model:selectedModel});renderSettingsControls();updateSettingsStatus();closeSettings();}
+function clearSettings(){writeSettings({harness:selectedHarness,provider:selectedProvider,model:selectedModel});$('settingsBoxKey').value='';$('settingsAnthropicKey').value='';$('settingsOpenaiKey').value='';$('settingsOpenrouterKey').value='';renderSettingsControls();}
 const hiddenContextPattern=new RegExp('<consumer-context>[\\s\\S]*?</consumer-context>','g');
 function stripHidden(s){return String(s).replace(hiddenContextPattern,'').trim();}
 function fmtUsd(n){return '$'+n.toFixed(6);}
@@ -327,9 +489,9 @@ function routeEvent(ev){
 }
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}
 function renderTotals(){const seconds=activeSeconds();$('totalSeconds').textContent=seconds.toFixed(1)+'s';$('totalCost').textContent=fmtUsd(seconds*billRate);}
-async function load(){const r=await fetch('/api/harnesses');const j=await r.json();H=j.harnesses;MATRIX=j.runtimeFeasibility||[];PRICING=j.pricing;billRate=PRICING.ratePerSecond;renderMatrix();chooseDefaultModel();renderTotals();}
-function renderMatrix(){const el=$('matrix');if(!el)return;el.innerHTML=MATRIX.map(r=>'<div class="matrixRow"><span class="matrixTitle">'+esc(r.runtime)+' · '+esc(r.streaming)+'</span>'+(r.blocker?'<span>'+esc(r.blocker)+'</span>':'')+'</div>').join('');}
-function chooseDefaultModel(){const preferred=H.find(h=>h.models.some(m=>m.keyAvailable))||H[0];if(!preferred){setState('No harnesses available');return;}const model=preferred.models.find(m=>m.keyAvailable)||preferred.models[0];selectedHarness=preferred.name;selectedProvider=model.provider;selectedModel=model.model;if(!model.keyAvailable)setState('Waiting for a valid model key · private machine stopped');}
+async function load(){const r=await fetch('/api/harnesses');const j=await r.json();H=j.harnesses;MATRIX=j.runtimeFeasibility||[];PRICING=j.pricing;HARNESS_META={serverKeysAllowed:j.serverKeysAllowed===undefined?true:Boolean(j.serverKeysAllowed),credentialMode:j.credentialMode||(j.serverKeysAllowed===false?'byok-required':'server-or-byok'),env:j.env||{BOX_API_KEY:true,ANTHROPIC_API_KEY:H.some(h=>h.models.some(m=>m.provider==='anthropic'&&m.keyAvailable)),OPENAI_API_KEY:H.some(h=>h.models.some(m=>m.provider==='openai'&&m.keyAvailable)),OPENROUTER_API_KEY:H.some(h=>h.models.some(m=>m.provider==='openrouter'&&m.keyAvailable))}};billRate=PRICING.ratePerSecond;renderMatrix();chooseDefaultModel();renderSettingsControls();const note=$('settingsNote');if(note)note.textContent=HARNESS_META.serverKeysAllowed?'Private preview: configured server keys are available; BYOK overrides them.':'Public/dev preview: server keys are disabled. Add your own Box and model provider keys.';renderTotals();if(!currentSettingsStatus().ok)openSettings();}
+function renderMatrix(){const el=$('matrix');if(!el)return;el.innerHTML=MATRIX.map(r=>'<div class="matrixRow"><span class="matrixTitle">'+esc(r.harnessName||r.runtime)+' · '+esc(r.streaming||r.runtime||'runtime')+'</span>'+(r.blocker?'<span>'+esc(r.blocker)+'</span>':'')+'</div>').join('');}
+function chooseDefaultModel(){const saved=readSettings();const savedHarness=H.find(h=>h.name===saved.harness);const savedModel=savedHarness&&savedHarness.models.find(m=>m.provider===saved.provider&&m.model===saved.model);if(savedHarness&&savedModel){selectedHarness=savedHarness.name;selectedProvider=savedModel.provider;selectedModel=savedModel.model;return;}const preferred=H.find(h=>h.models.some(m=>clientProviderKeyAvailable(m.provider)))||H[0];if(!preferred){setState('No harnesses available');return;}const model=preferred.models.find(m=>clientProviderKeyAvailable(m.provider))||preferred.models[0];selectedHarness=preferred.name;selectedProvider=model.provider;selectedModel=model.model;if(!clientProviderKeyAvailable(model.provider)||!clientBoxKeyAvailable())setState('Waiting for BYOK settings · private machine stopped');}
 const bubbles=new Map();
 let showTraces=false;
 function syncTraceVisibility(){document.body.classList.toggle('hide-traces',!showTraces);}
@@ -339,17 +501,20 @@ function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>
 const activeTurns=new Map();
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg){clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private Box boot requested');resetRouteForTurn();try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
+async function runTurn(msg){clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private Box boot requested');resetRouteForTurn();try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys()})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 const stopBtn=$('stopBox');
 const showTracesEl=$('showTraces');
 if(showTracesEl){showTracesEl.checked=false;showTracesEl.addEventListener('change',()=>{showTraces=Boolean(showTracesEl.checked);syncTraceVisibility();});}
+$('settingsOpen')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsClear')?.addEventListener('click',clearSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});$('settingsHarness')?.addEventListener('change',e=>{selectedHarness=e.target.value;const h=H.find(x=>x.name===selectedHarness);const m=h&&h.models[0];if(m){selectedProvider=m.provider;selectedModel=m.model;}renderSettingsControls();});$('settingsModel')?.addEventListener('change',e=>{const [provider,model]=String(e.target.value).split('|');selectedProvider=provider;selectedModel=model;renderSettingsControls();});
 syncTraceVisibility();
 let lastSubmitAt=0;
 function submitComposer(source){
   const text=msgEl.value.trim();
   console.debug('[trace] submit event fired', {source, hasText:Boolean(text), harness:selectedHarness, model:selectedModel});
   if(!text){console.debug('[trace] empty submit ignored', {source});return false;}
+  const st=currentSettingsStatus();
+  if(!st.ok){addMsg('trace','settings required',st.msg+'\\n');openSettings();return false;}
   const now=Date.now();
   if(now-lastSubmitAt<150){console.debug('[trace] duplicate submit suppressed', {source});return false;}
   lastSubmitAt=now;
@@ -361,7 +526,7 @@ function submitComposer(source){
 }
 composer.addEventListener('submit',e=>{e.preventDefault();submitComposer('form.submit');});
 sendBtn.addEventListener('click',e=>{e.preventDefault();submitComposer('button.click');});
-stopBtn.addEventListener('click',async e=>{e.preventDefault();stopBtn.disabled=true;addMsg('trace','manual stop','pause request sent for this conversation\\n');setState('Private machine stopping · manual pause requested');try{const res=await fetch('/api/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation})});await drain(res,newTurnId());}catch(err){addMsg('assistant','assistant','Stop failed: '+String(err&&err.message||err));}finally{stopBtn.disabled=false;}});
+stopBtn.addEventListener('click',async e=>{e.preventDefault();stopBtn.disabled=true;addMsg('trace','manual stop','pause request sent for this conversation\\n');setState('Private machine stopping · manual pause requested');try{const res=await fetch('/api/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()})});await drain(res,newTurnId());}catch(err){addMsg('assistant','assistant','Stop failed: '+String(err&&err.message||err));}finally{stopBtn.disabled=false;}});
 msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer('textarea.enter');}});
 msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer('textarea.beforeinput');}});
 async function drain(res,localId){if(!res){throw new Error('No response object from /api/send');}if(!res.ok){const body=await res.text().catch(()=>'');throw new Error('/api/send failed with HTTP '+res.status+' '+body);}if(!res.body){throw new Error('/api/send did not return a readable SSE body');}const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}

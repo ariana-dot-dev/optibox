@@ -509,19 +509,33 @@ export class ConsumerBoxAgentOrchestrator {
       turnId,
     };
 
-    let usedPrivateBox = false;
+    // The auto-stop must be armed by the BOX agent finishing, never by the shared
+    // assistant finishing. We watch this turn's event stream for two facts:
+    //  - boxAgentSettled: the agent ON the box produced its final output for THIS
+    //    message — a real answer (turn.done route direct/bridge) or the hidden
+    //    <end> sentinel (trace user-box.response.end). This is the only signal
+    //    that may start the idle countdown.
+    //  - routedToPrivate: this turn engaged or queued the private box at all. A
+    //    turn that needed the box but did NOT settle it (e.g. the shared bridge
+    //    said "I'm looking into it" and the box has not answered yet) must never
+    //    stop the box out from under the pending answer.
+    let boxAgentSettled = false;
+    let routedToPrivate = false;
     for await (const ev of this.runAdaptiveTurn(
       input,
       key,
       statusPromise,
       lockBusyAtSubmit,
     )) {
+      if (ev.type === "trace" && ev.stage === "user-box.response.end") boxAgentSettled = true;
+      if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge")) boxAgentSettled = true;
       if (
         ev.type === "handoff.started" ||
         ev.type === "user-box.delta" ||
         ev.type === "billing.start" ||
-        (ev.type === "turn.done" && Boolean(ev.boxId))
-      ) usedPrivateBox = true;
+        (ev.type === "turn.done" && Boolean(ev.boxId)) ||
+        (ev.type === "trace" && PRIVATE_ROUTE_TRACE_STAGES.has(ev.stage))
+      ) routedToPrivate = true;
       yield { ...ev, turnId };
     }
 
@@ -531,21 +545,22 @@ export class ConsumerBoxAgentOrchestrator {
 
     // Keep the Box warm briefly after all current responses are done. Any user
     // message bumps turnSequences[key] immediately, which cancels/freezes an
-    // existing countdown. The last response to finish restarts the countdown if
-    // the Box is still billing, including shared-only follow-ups that arrived
-    // during the previous idle window.
+    // existing countdown.
     const session = await this.sessions.get(input.userId, input.conversationId);
     const hasBillableBox = Boolean(session?.boxId && this.billing.has(session.boxId));
-    // Don't arm the idle-stop while a private round is still owed (needed/active)
-    // or a Box boot is still in flight. Otherwise a shared-only answer that
-    // finishes before the private agent replies would stop a box that is still
-    // booting/owing a turn, then the next message re-boots it — the Part-A
-    // state-machine bug. The private round / boot completion restarts the
-    // countdown through its own epilogue when it is genuinely idle.
+    // Never arm the idle-stop while a private round is still owed (needed/active)
+    // or a Box boot is still in flight.
     const roundOwed = Boolean(this.activePrivateRound(key));
     const bootInFlight = this.userBoxStarts.has(key);
+    // Arm only when the box agent actually finished this turn, OR when this was a
+    // pure shared turn (it never touched the box) that left a warm billable box
+    // idle. The middle case — routed to the box but the agent has not settled —
+    // is exactly the bug where a shared "I'm looking into it" stopped a box that
+    // had not yet had a chance to answer.
+    const armForBoxDone = boxAgentSettled;
+    const armForWarmSharedOnly = !routedToPrivate && hasBillableBox;
     if (
-      (usedPrivateBox || hasBillableBox) &&
+      (armForBoxDone || armForWarmSharedOnly) &&
       !this.activeTurnCounts.has(key) &&
       !roundOwed &&
       !bootInFlight
@@ -1566,6 +1581,19 @@ function sharedNeedsPrivate(rawSharedText: string, message: string): boolean {
 }
 
 const PRIVATE_END_SENTINEL = "<end>";
+
+/**
+ * Trace stages that prove a turn engaged or queued the private Box (even if it
+ * never produced a visible answer). Used by the idle-auto-stop gate to tell a
+ * pure shared turn (which may stop a warm box) apart from a box-bound turn whose
+ * agent has not settled yet (which must not stop the box).
+ */
+const PRIVATE_ROUTE_TRACE_STAGES = new Set<string>([
+  "box.boot.queued",
+  "private-round.active",
+  "box.boot.start",
+  "runtime.owner.selected",
+]);
 
 function requestFingerprint(message: string): string {
   return String(message ?? "")

@@ -50,6 +50,14 @@ interface DemoCredentials {
 const serverProviderEnv = allowServerKeys ? providerEnvFromProcess() : {};
 const serverBoxApiKey = allowServerKeys ? process.env.BOX_API_KEY : undefined;
 const orchestrators = new Map<string, ConsumerBoxAgentOrchestrator>();
+const serverRunId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const auditRing: unknown[] = [];
+const AUDIT_RING_LIMIT = Number(process.env.OPTIBOX_AUDIT_RING_LIMIT ?? 5000);
+
+function rememberAudit(entry: unknown): void {
+  auditRing.push(entry);
+  while (auditRing.length > AUDIT_RING_LIMIT) auditRing.shift();
+}
 
 function providerEnvFromProcess(): Record<string, string> {
   const env: Record<string, string> = {};
@@ -192,10 +200,27 @@ function readBody(req: http.IncomingMessage): Promise<any> {
   });
 }
 
-function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversationId: string; message: string }) {
-  const redacted: any = { ...event };
-  if (redacted.hidden) redacted.hidden = "[redacted hidden context]";
-  if (redacted.recap) redacted.recap = "[redacted recap]";
+function redactAuditValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(redactAuditValue);
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+      if (/hidden|recap|apiKey|token|secret|authorization/i.test(key)) {
+        out[key] = "[redacted]";
+      } else {
+        out[key] = redactAuditValue(raw);
+      }
+    }
+    return out;
+  }
+  if (typeof value === "string" && value.length > 500) return value.slice(0, 500) + "…";
+  return value;
+}
+
+function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversationId: string; message: string }, requestId: string) {
+  const redacted: any = redactAuditValue(event);
   if (Array.isArray(redacted.argv)) redacted.argv = redacted.argv.map((v: unknown) => {
     const text = String(v);
     return /<consumer-agent-system-instructions>|<consumer-context>|<latest-user-request>/.test(text) || text.length > 300
@@ -204,14 +229,19 @@ function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversat
   });
   if (typeof redacted.command === "string" && redacted.command.includes("base64 -d")) redacted.command = "[redacted instruction-file write]";
   if (redacted.text && String(redacted.text).length > 160) redacted.text = String(redacted.text).slice(0, 160) + "…";
-  console.log(JSON.stringify({
+  const entry = {
     ts: new Date().toISOString(),
+    runId: serverRunId,
+    requestId,
     audit: "turn-event",
     userId: input.userId,
     conversationId: input.conversationId,
-    message: input.message,
+    messageHash: createHash("sha256").update(input.message).digest("hex").slice(0, 16),
+    messagePreview: input.message.slice(0, 160),
     event: redacted,
-  }));
+  };
+  rememberAudit(entry);
+  console.log(JSON.stringify(entry));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -244,6 +274,28 @@ const server = http.createServer(async (req, res) => {
           pricing: BOX_PRICING,
         }),
       );
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/diagnostics") {
+      const format = url.searchParams.get("format") ?? "json";
+      const payload = {
+        runId: serverRunId,
+        generatedAt: new Date().toISOString(),
+        eventCount: auditRing.length,
+        audit: auditRing,
+      };
+      if (format === "jsonl") {
+        res.writeHead(200, {
+          "content-type": "application/x-ndjson; charset=utf-8",
+          "content-disposition": `attachment; filename="optibox-diagnostics-${serverRunId}.jsonl"`,
+        });
+        return void res.end(auditRing.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+      }
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-disposition": `attachment; filename="optibox-diagnostics-${serverRunId}.json"`,
+      });
+      return void res.end(JSON.stringify(payload, null, 2));
     }
 
     // Live restricted-mode proof: exercise the shared capabilities and show denials.
@@ -279,6 +331,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/send") {
       const body = await readBody(req);
       const send = sse(res);
+      const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const selection = {
         harness: String(body.harness),
         provider: String(body.provider),
@@ -299,15 +352,22 @@ const server = http.createServer(async (req, res) => {
           message: String(body.message ?? ""),
           selection,
         };
-        send({
+        const receivedEvent: ConsumerTurnEvent = {
           type: "trace",
           stage: "backend.request.received",
           message: "POST /api/send reached backend; SSE stream opened",
           harness: selection.harness,
           model: selection.model,
-        });
+          data: {
+            runId: serverRunId,
+            requestId,
+            credentialSource: credentials.source,
+          },
+        };
+        auditEvent(receivedEvent, turnInput, requestId);
+        send(receivedEvent);
         for await (const event of orchestrator.runTurn(turnInput)) {
-          auditEvent(event as ConsumerTurnEvent, turnInput);
+          auditEvent(event as ConsumerTurnEvent, turnInput, requestId);
           send(event as ConsumerTurnEvent);
         }
         send({ type: "stream.end" });
@@ -391,7 +451,7 @@ function html() {
       <div class="counter"><span class="label">auto-stop</span><span class="value" id="autoStopTimer">idle</span></div>
     </section>
     <div class="state" id="machineState">Shared bridge ready · private machine stopped</div>
-    <div class="controls"><button id="stopBox" type="button">Pause Box now</button><label class="traceToggle"><input id="showTraces" type="checkbox"/> Show traces</label><button id="settingsOpen" class="iconButton" type="button" aria-label="Settings" title="Settings">⚙</button></div>
+    <div class="controls"><button id="stopBox" type="button">Pause Box now</button><button id="downloadDiagnostics" type="button">Download diagnostics</button><label class="traceToggle"><input id="showTraces" type="checkbox"/> Show traces</label><button id="settingsOpen" class="iconButton" type="button" aria-label="Settings" title="Settings">⚙</button></div>
   </header>
   <section class="chat" id="chat" aria-live="polite"><div class="empty" id="empty">Send a message to start the demo.</div></section>
   <form class="composer" id="composer">
@@ -519,6 +579,7 @@ function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID
 async function runTurn(msg){clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});addMsg('user','you',msg,'user:'+localId);setState('Shared bridge starting · private Box boot requested');resetRouteForTurn();try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys()})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','assistant','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{activeTurns.delete(localId);}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 const stopBtn=$('stopBox');
+const diagnosticsBtn=$('downloadDiagnostics');
 const showTracesEl=$('showTraces');
 if(showTracesEl){showTracesEl.checked=false;showTracesEl.addEventListener('change',()=>{showTraces=Boolean(showTracesEl.checked);syncTraceVisibility();});}
 $('settingsOpen')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsClear')?.addEventListener('click',clearSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});$('settingsHarness')?.addEventListener('change',e=>{selectedHarness=e.target.value;const h=H.find(x=>x.name===selectedHarness);const m=h&&h.models[0];if(m){selectedProvider=m.provider;selectedModel=m.model;}renderSettingsControls();});$('settingsModel')?.addEventListener('change',e=>{const [provider,model]=String(e.target.value).split('|');selectedProvider=provider;selectedModel=model;renderSettingsControls();});
@@ -542,6 +603,7 @@ function submitComposer(source){
 composer.addEventListener('submit',e=>{e.preventDefault();submitComposer('form.submit');});
 sendBtn.addEventListener('click',e=>{e.preventDefault();submitComposer('button.click');});
 stopBtn.addEventListener('click',async e=>{e.preventDefault();stopBtn.disabled=true;addMsg('trace','manual stop','pause request sent for this conversation\\n');setState('Private machine stopping · manual pause requested');try{const res=await fetch('/api/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()})});await drain(res,newTurnId());}catch(err){addMsg('assistant','assistant','Stop failed: '+String(err&&err.message||err));}finally{stopBtn.disabled=false;}});
+diagnosticsBtn?.addEventListener('click',e=>{e.preventDefault();const a=document.createElement('a');a.href='/api/diagnostics?format=json';a.download='optibox-diagnostics.json';document.body.appendChild(a);a.click();a.remove();addMsg('trace','diagnostics','downloaded redacted JSON event log from /api/diagnostics\\n');});
 msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer('textarea.enter');}});
 msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer('textarea.beforeinput');}});
 async function drain(res,localId){if(!res){throw new Error('No response object from /api/send');}if(!res.ok){const body=await res.text().catch(()=>'');throw new Error('/api/send failed with HTTP '+res.status+' '+body);}if(!res.body){throw new Error('/api/send did not return a readable SSE body');}const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}

@@ -1381,6 +1381,86 @@ test("each adapter renders its native resume flags from sessionId/resumeSessionI
   }
 });
 
+test("a box-bound turn whose box agent has not settled never auto-stops the box", async () => {
+  // Reproduces the reported bug: a second tool message arrives while the first
+  // private round is still active. The second turn cannot run its own Box round
+  // (it routes to the shared bridge "I'm looking into it"), but the Box is
+  // billable. The OLD gate armed the idle auto-stop off that shared completion
+  // and killed the Box out from under the still-pending first answer. The Box
+  // may only auto-stop once the agent ON the box has settled — never off a
+  // shared bridge.
+  const box = new FakeBoxClient();
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((r) => { releaseFirst = r; });
+  const harness: HarnessAdapter = {
+    name: "gated",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() {
+      yield `I’m looking into it.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+    },
+    async *userBox() {
+      await firstGate; // hold the first private round open so the second turn is blocked behind it
+      yield "first box answer";
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const selection = { harness: "gated", provider: "anthropic", model: "m-1" };
+
+  const first: any[] = [];
+  const second: any[] = [];
+  const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run one", selection });
+  const d1 = (async () => { for await (const e of g1) first.push(e); })();
+  // Wait until the first round is active and the Box is billing.
+  await waitFor(() => first.some((e) => e.type === "billing.start"), 200);
+
+  // Fire the second tool turn while the first round is still active/unsettled.
+  const d2 = (async () => { for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection })) second.push(e); })();
+  await d2;
+
+  // The second turn routed to private (it was blocked behind the active round)
+  // but did NOT settle a Box answer, so it must not stop the Box.
+  assert.equal(second.filter((e) => e.type === "user-box.delta").length, 0, "second turn produced no Box answer");
+  assert.ok(!second.some((e) => e.type === "billing.stop"), "blocked second turn must NOT stop the still-needed Box");
+  assert.ok(!second.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "blocked second turn must NOT arm the idle auto-stop");
+
+  // The first turn still completes normally and owns the eventual stop.
+  releaseFirst();
+  await d1;
+  assert.ok(first.some((e) => e.type === "user-box.delta" && /first box answer/.test(e.text)), "first box round answers");
+  assert.ok(first.some((e) => e.type === "billing.stop"), "the first (settled) round owns the auto-stop");
+});
+
+test("a warm box small-talk follow-up settles via the box <end> sentinel and auto-stops", async () => {
+  // The flip side of the gate: the auto-stop must still fire for legitimately
+  // idle boxes so warm boxes don't leak after small talk. A greeting follow-up
+  // on a WARM box takes the direct path (the box is already ready), so the box
+  // agent itself runs and emits the hidden <end> sentinel. That box-agent
+  // settlement — not any shared completion — is what arms the idle countdown.
+  const box = new FakeBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 20 });
+
+  // Turn 1: tool turn answers and leaves the box warm (idle window 20ms).
+  const first: any[] = [];
+  const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
+  const d1 = (async () => { for await (const e of g1) first.push(e); })();
+  await waitFor(() => first.some((e) => e.type === "turn.done"), 200);
+  const boxId = first.find((e) => e.type === "turn.done")?.boxId;
+  assert.equal((await box.get(boxId)).state, "idle", "box is warm after the tool turn");
+
+  // Turn 2: a greeting (needsPrivate:false) within the idle window. The warm box
+  // is resumed directly and the box agent answers with the hidden <end>.
+  const second: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey thanks", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
+  await d1;
+
+  assert.ok(second.some((e) => e.type === "trace" && e.stage === "user-box.response.end"), "the box agent settles this turn by emitting the hidden <end> sentinel");
+  assert.equal(second.filter((e) => e.type === "user-box.delta").length, 0, "the <end> sentinel produces no visible box answer");
+  assert.ok(second.some((e) => e.type === "autostop.timer" && e.phase === "started"), "box-agent settlement (not a shared completion) re-arms the idle countdown");
+  assert.ok(second.some((e) => e.type === "billing.stop"), "the warm box is stopped after the settled follow-up goes idle");
+  assert.equal((await box.get(boxId)).state, "archived", "warm box is archived, not leaked");
+});
+
 test("aborting a shared-infra harness run interrupts the process (SIGINT then SIGKILL)", async () => {
   const { createSharedInfraCapabilities } = await import("../src/index.js");
   const signals: string[] = [];

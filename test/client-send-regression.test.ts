@@ -4,7 +4,14 @@ import test from "node:test";
 import vm from "node:vm";
 
 class FakeClassList {
-  toggle(_name: string, _force?: boolean) {}
+  names = new Set<string>();
+  toggle(name: string, force?: boolean) {
+    const next = force ?? !this.names.has(name);
+    if (next) this.names.add(name); else this.names.delete(name);
+    return next;
+  }
+  remove(name: string) { this.names.delete(name); }
+  add(name: string) { this.names.add(name); }
 }
 
 class FakeElement {
@@ -13,7 +20,7 @@ class FakeElement {
   checked = false;
   disabled = false;
   textContent = "";
-  innerHTML = "";
+  private _innerHTML = "";
   className = "";
   scrollTop = 0;
   scrollHeight = 0;
@@ -21,6 +28,8 @@ class FakeElement {
   classList = new FakeClassList();
   listeners = new Map<string, Function[]>();
   children: FakeElement[] = [];
+  queryChildren = new Map<string, FakeElement>();
+  offsetWidth = 1;
 
   constructor(id = "") {
     this.id = id;
@@ -38,6 +47,9 @@ class FakeElement {
     }
   }
 
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(value: string) { this._innerHTML = value; this.queryChildren.clear(); }
+
   appendChild(el: FakeElement) {
     this.children.push(el);
     return el;
@@ -45,10 +57,18 @@ class FakeElement {
 
   remove() {}
   focus() {}
+  setAttribute(name: string, value: string) { (this as any)[name] = value; }
+  getAttribute(name: string) { return (this as any)[name]; }
 
   querySelector(selector: string) {
     if (selector === ".body") return this;
-    return null;
+    let el = this.queryChildren.get(selector);
+    if (!el) {
+      el = new FakeElement(selector);
+      if (selector.startsWith('.')) el.className = selector.slice(1);
+      this.queryChildren.set(selector, el);
+    }
+    return el;
   }
 }
 
@@ -255,4 +275,85 @@ test("interactive demo client renders distinct Box assistant messages by native 
   const assistants = getElement("chat").children.filter((el) => el.className.includes("assistant"));
   assert.equal(assistants.length, 2, "two native Box assistant messages should create two bubbles");
   assert.deepEqual(assistants.map((el) => el.textContent), ["Hello", "Second"]);
+});
+
+
+test("interactive demo client groups consecutive tool calls into minimal chains", async () => {
+  const script = extractClientScript(readFileSync("scripts/interactive-proof-server.ts", "utf8"));
+  const elements = new Map<string, FakeElement>();
+  const getElement = (id: string) => {
+    let el = elements.get(id);
+    if (!el) {
+      el = new FakeElement(id);
+      elements.set(id, el);
+    }
+    return el;
+  };
+  for (const id of [
+    "composer", "msg", "send", "stopBox", "showTraces", "chat", "empty",
+    "schematic", "routeStatus", "machineState", "totalSeconds", "totalCost", "autoStopTimer", "matrix",
+  ]) getElement(id);
+
+  let now = 3_000_000;
+  const context = vm.createContext({
+    console: { ...console, debug() {} },
+    AbortController,
+    TextDecoder,
+    TextEncoder,
+    URLSearchParams,
+    location: { search: "" },
+    setInterval,
+    clearInterval,
+    setTimeout,
+    document: {
+      body: new FakeElement("body"),
+      getElementById: getElement,
+      createElement: () => new FakeElement(),
+    },
+    globalThis: { crypto: { randomUUID: () => "turn-tool-proof" } },
+    Date: Object.assign(class extends Date { static now() { now += 1000; return now; } }, Date),
+    fetch: async (url: string, init?: any) => {
+      if (url === "/api/harnesses") {
+        return {
+          ok: true,
+          json: async () => ({
+            harnesses: [{ name: "claude", models: [{ provider: "anthropic", model: "claude-sonnet", keyAvailable: true }] }],
+            runtimeFeasibility: [],
+            pricing: { ratePerSecond: 0.001 },
+          }),
+        };
+      }
+      if (url === "/api/send") {
+        JSON.parse(init.body);
+        return { ok: true, body: makeReadableSse([
+          { type: "harness.tool", phase: "tool_use", toolName: "bash", command: "ls" },
+          { type: "harness.tool", phase: "tool_use", toolName: "read", description: "read file xyz" },
+          { type: "harness.tool", phase: "tool_result", stdout: "ok" },
+          { type: "harness.tool", phase: "tool_result", stdout: "done" },
+          { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-1", text: "message between chains" },
+          { type: "harness.tool", phase: "tool_use", toolName: "bash", command: "sleep 10" },
+          { type: "stream.end" },
+        ]) };
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    },
+  });
+
+  vm.runInContext(script, context);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const msg = getElement("msg");
+  msg.value = "use tools";
+  getElement("composer").dispatch("submit");
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const children = getElement("chat").children;
+  const toolChains = children.filter((el) => el.className === "toolChain");
+  assert.equal(toolChains.length, 2, "visible assistant text splits tool-call chains");
+  assert.equal(toolChains[0]!.querySelector(".toolChainLabel")!.textContent, "2 tool calls");
+  assert.equal(toolChains[1]!.querySelector(".toolChainLabel")!.textContent, "1 tool call");
+  assert.ok(toolChains[1]!.classList.names.has("running"), "running tool chain shows the animated ellipsis state");
+  const assistantIndex = children.findIndex((el) => el.className.includes("assistant"));
+  assert.ok(assistantIndex > children.indexOf(toolChains[0]!) && assistantIndex < children.indexOf(toolChains[1]!), "normal message bubble remains between chains");
 });

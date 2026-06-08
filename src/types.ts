@@ -89,6 +89,40 @@ export interface HarnessRunSpec {
    * session_id). The host persists it to resume the SAME conversation next turn.
    */
   onSessionId?: (sessionId: string) => void;
+  /**
+   * Called exactly once when the harness loop ends, with WHY it ended. The host
+   * uses this to decide whether the box agent has DEFINITELY settled the current
+   * prompt (and may therefore begin the idle auto-stop countdown) versus the loop
+   * ending ambiguously or being interrupted. See {@link HarnessCompletion}.
+   */
+  onComplete?: (info: HarnessCompletion) => void;
+}
+
+/**
+ * Why a harness loop ended for one turn. This is the cross-harness "the prompt is
+ * done" signal: every adapter runs a one-shot CLI/SDK invocation that performs the
+ * entire agent loop — including arbitrarily long tool calls / computer-use — and
+ * only ends its native stream when there is nothing more to do. Short inactivity
+ * (no visible text for a few seconds while tools run) is NOT a completion and must
+ * never be treated as one.
+ */
+export interface HarnessCompletion {
+  /**
+   *  - "completed": the CLI/SDK process finished its agent loop normally and the
+   *    native stream ended (clean exit marker / process close). The only signal
+   *    that the prompt is definitely fully answered.
+   *  - "timeout": the long safety timeout elapsed while the process was still
+   *    running (an hours-scale backstop, never short inactivity).
+   *  - "process-exited": the process is gone but no clean exit marker was seen
+   *    (crash/kill); the loop is over, though the answer may be incomplete.
+   *  - "aborted": the turn was interrupted (human "stop" / superseding turn). The
+   *    loop did NOT settle on its own and must not arm an idle stop.
+   */
+  reason: "completed" | "timeout" | "process-exited" | "aborted";
+  /** Process exit code when a clean exit marker was observed. */
+  exitCode?: number;
+  /** Whether any user-visible assistant text was streamed during this turn. */
+  sawText?: boolean;
 }
 
 /** User-visible text emitted by a harness, with optional native assistant-message identity. */
@@ -167,6 +201,8 @@ export interface SharedContext {
   sessionId?: string;
   /** Persist the native session id captured from the harness stream this turn. */
   onSessionId?: (sessionId: string) => void;
+  /** Notified once when the harness loop ends, with why (see {@link HarnessCompletion}). */
+  onComplete?: (info: HarnessCompletion) => void;
   /** Interrupt handle: aborting stops the harness like a human "stop". */
   signal?: AbortSignal;
 }
@@ -190,6 +226,8 @@ export interface UserBoxContext {
   sessionId?: string;
   /** Persist the native session id captured from the harness stream this turn. */
   onSessionId?: (sessionId: string) => void;
+  /** Notified once when the harness loop ends, with why (see {@link HarnessCompletion}). */
+  onComplete?: (info: HarnessCompletion) => void;
   /** Interrupt handle: aborting stops the harness like a human "stop". */
   signal?: AbortSignal;
 }

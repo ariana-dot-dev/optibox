@@ -331,6 +331,7 @@ async function* runHarnessTurn(
     ...(env ? { env } : {}),
     ...(spec.outputMode ? { outputMode: spec.outputMode } : {}),
     ...(ctx.onSessionId ? { onSessionId: ctx.onSessionId } : {}),
+    ...(ctx.onComplete ? { onComplete: ctx.onComplete } : {}),
     ...(ctx.signal ? { signal: ctx.signal } : {}),
     pollMs: 150,
   });

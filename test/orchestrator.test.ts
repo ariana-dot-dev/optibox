@@ -416,6 +416,34 @@ test("runHarness extracts real Claude stream-json text deltas without duplicatin
   assert.ok(toolEvents.some((e) => e.phase === "tool_result" && e.stdout === "78.47.150.66"));
 });
 
+test("runHarness extracts Claude assistant message snapshots after tool calls", async () => {
+  // Root-cause regression for the current diagnostics: Claude Code stream-json
+  // can emit final assistant text as an `assistant.message.content[].text`
+  // snapshot rather than as Anthropic SDK `stream_event` deltas. The old parser
+  // saw tool_use/tool_result but ignored this text shape, making a real answer
+  // look like empty private runtime output.
+  const toolUse = { type: "assistant", message: { id: "msg-tool", content: [{ type: "tool_use", name: "Bash", input: { command: "find . -maxdepth 1", description: "inspect filesystem" } }] } };
+  const toolResult = { type: "user", tool_use_result: { stdout: "README.md\nsrc\n", stderr: "", is_error: false } };
+  const answer1 = { type: "assistant", message: { id: "msg-answer", content: [{ type: "text", text: "I found README.md" }] } };
+  const answer2 = { type: "assistant", message: { id: "msg-answer", content: [{ type: "text", text: "I found README.md and src." }] } };
+  const snapshots = [
+    `${JSON.stringify(toolUse)}\n${JSON.stringify(toolResult)}\n${JSON.stringify(answer1)}\n`,
+    `${JSON.stringify(toolUse)}\n${JSON.stringify(toolResult)}\n${JSON.stringify(answer1)}\n${JSON.stringify(answer2)}\n${JSON.stringify({ type: "result", session_id: "s-1" })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const toolEvents: any[] = [];
+  const caps = createUserBoxCapabilities(box, "box-1", { pollMs: 1, onHarnessEvent: (event) => toolEvents.push(event) });
+  const chunks: any[] = [];
+  for await (const chunk of caps.runHarness({ argv: ["claude", "-p", "what is in the filesystem"], outputMode: "claude-stream-json", pollMs: 1 })) chunks.push(chunk);
+
+  assert.deepEqual(chunks.map((c: any) => [c.messageId, c.text]), [
+    ["msg-answer", "I found README.md"],
+    ["msg-answer", " and src."],
+  ]);
+  assert.ok(toolEvents.some((e) => e.phase === "tool_use" && e.command === "find . -maxdepth 1"));
+  assert.ok(toolEvents.some((e) => e.phase === "tool_result" && /README/.test(e.stdout)));
+});
+
 test("runHarness forwards Codex JSON final message only when token deltas are not exposed", async () => {
   const snapshots = [
     `${JSON.stringify({ type: "session.started" })}\n`,
@@ -1660,6 +1688,43 @@ test("a long tool-running box prompt surfaces tool traces and only auto-stops af
   assert.equal(done?.settled, true, "a cleanly-completed loop is marked settled");
   assert.ok(events.some((e) => e.type === "autostop.timer" && e.phase === "started"), "settled answer arms the idle countdown");
   assert.ok(events.some((e) => e.type === "billing.stop"), "box auto-stops only after the settled answer goes idle");
+});
+
+test("filesystem question answered when Claude final text arrives as assistant snapshot", async () => {
+  // Mirrors the failing run shape: exec/tool activity appears, but there are no
+  // `stream_event.content_block_delta` text deltas. The answer is present in the
+  // native Claude assistant snapshot and must be surfaced as user-box.delta.
+  const toolUse = { type: "assistant", message: { id: "msg-tool", content: [{ type: "tool_use", name: "Bash", input: { command: "find /home/user -maxdepth 1 -type f", description: "list files" } }] } };
+  const toolResult = { type: "user", tool_use_result: { stdout: "/home/user/package.json\n/home/user/README.md\n", stderr: "", is_error: false } };
+  const answer = "The filesystem contains package.json and README.md at /home/user.";
+  const snapshots = [
+    `${JSON.stringify(toolUse)}\n`,
+    `${JSON.stringify(toolUse)}\n${JSON.stringify(toolResult)}\n`,
+    `${JSON.stringify(toolUse)}\n${JSON.stringify(toolResult)}\n${JSON.stringify({ type: "assistant", message: { id: "msg-answer", content: [{ type: "text", text: answer }] } })}\n${JSON.stringify({ type: "result", session_id: "s-1" })}\n__CBA_EXIT__:0\n`,
+  ];
+  const box = new StreamingLogBoxClient(snapshots);
+  const harness: HarnessAdapter = {
+    name: "claude-real-shape",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() { yield `On it.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *userBox(ctx) {
+      yield* ctx.capabilities.runHarness({
+        argv: ["claude", "-p", "what is in your filesystem"],
+        outputMode: "claude-stream-json",
+        pollMs: 1,
+        ...(ctx.onComplete ? { onComplete: ctx.onComplete } : {}),
+      });
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 5 });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what is in your filesystem", selection: { harness: "claude-real-shape", provider: "anthropic", model: "m-1" } })) events.push(e);
+
+  assert.ok(events.some((e) => e.type === "trace" && e.stage === "box.tool.use"), "tool activity is still traced");
+  assert.equal(events.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), answer, "assistant snapshot text is surfaced as the private answer");
+  assert.equal(events.find((e) => e.type === "turn.done" && e.boxId)?.settled, true, "the real answer settles the turn");
+  assert.ok(events.some((e) => e.type === "autostop.timer" && e.phase === "started"), "idle countdown starts only after the surfaced answer");
 });
 
 test("a box turn whose harness loop is interrupted (aborted) does not arm the idle auto-stop", async () => {

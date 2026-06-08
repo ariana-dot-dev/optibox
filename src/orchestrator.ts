@@ -1117,16 +1117,12 @@ export class ConsumerBoxAgentOrchestrator {
           timer.unref?.();
         });
       }
-      if (this.turnSequences.get(key) !== turnSequence) return;
-      if (this.activeTurnCounts.has(key)) return;
-      if (this.activePrivateRound(key)) return;
-      if (this.userBoxStarts.has(key)) return;
+      if (this.isConversationBusyForIdleStop(key, turnSequence)) return;
       const session = await this.sessions.get(input.userId, input.conversationId);
       if (!session?.boxId || !this.billing.has(session.boxId)) return;
       const release = await this.acquireLock(this.boxLocks, key);
       try {
-        if (this.turnSequences.get(key) !== turnSequence) return;
-        if (this.activeTurnCounts.has(key) || this.activePrivateRound(key)) return;
+        if (this.isConversationBusyForIdleStop(key, turnSequence)) return;
         for await (const _ of this.stopUserBoxLocked(input.userId, input.conversationId)) {
           // This is a detached cleanup path after the SSE stream disappeared;
           // there is no client to receive lifecycle events.
@@ -1135,6 +1131,15 @@ export class ConsumerBoxAgentOrchestrator {
         release();
       }
     })().catch(() => undefined);
+  }
+
+  private isConversationBusyForIdleStop(key: string, turnSequence: number): boolean {
+    return (
+      this.turnSequences.get(key) !== turnSequence ||
+      this.activeTurnCounts.has(key) ||
+      Boolean(this.activePrivateRound(key)) ||
+      this.userBoxStarts.has(key)
+    );
   }
 
   private bumpTurnSequence(key: string): number {
@@ -1178,7 +1183,7 @@ export class ConsumerBoxAgentOrchestrator {
       // leaving a hidden stop tail.
       let lastWholeSecond = Math.ceil(delayMs / 1000);
       while (true) {
-        if (this.turnSequences.get(key) !== turnSequence) {
+        if (this.isConversationBusyForIdleStop(key, turnSequence)) {
           yield {
             type: "autostop.timer",
             phase: "canceled",
@@ -1212,7 +1217,7 @@ export class ConsumerBoxAgentOrchestrator {
       }
     }
 
-    if (this.turnSequences.get(key) !== turnSequence) {
+    if (this.isConversationBusyForIdleStop(key, turnSequence)) {
       yield {
         type: "autostop.timer",
         phase: "canceled",
@@ -1226,7 +1231,7 @@ export class ConsumerBoxAgentOrchestrator {
 
     const release = await this.acquireLock(this.boxLocks, key);
     try {
-      if (this.turnSequences.get(key) !== turnSequence) {
+      if (this.isConversationBusyForIdleStop(key, turnSequence)) {
         yield {
           type: "autostop.timer",
           phase: "canceled",
@@ -1237,7 +1242,9 @@ export class ConsumerBoxAgentOrchestrator {
         };
         return;
       }
-      yield* this.stopUserBoxLocked(input.userId, input.conversationId);
+      yield* this.stopUserBoxLocked(input.userId, input.conversationId, {
+        shouldCancel: () => this.isConversationBusyForIdleStop(key, turnSequence),
+      });
     } finally {
       release();
     }
@@ -1523,7 +1530,9 @@ export class ConsumerBoxAgentOrchestrator {
   private async *stopUserBoxLocked(
     userId: string,
     conversationId: string,
+    options: { shouldCancel?: () => boolean } = {},
   ): AsyncIterable<ConsumerTurnEvent> {
+    const canceled = () => Boolean(options.shouldCancel?.());
     const session = await this.sessions.get(userId, conversationId);
     if (!session?.boxId) {
       yield {
@@ -1536,6 +1545,17 @@ export class ConsumerBoxAgentOrchestrator {
     }
     const boxId = session.boxId;
     const since = this.billing.get(boxId);
+    if (canceled()) {
+      yield {
+        type: "autostop.timer",
+        phase: "canceled",
+        boxId,
+        remainingMs: 0,
+        reason: "new-user-message",
+        note: "auto-stop canceled because a user prompt was accepted before shutdown began",
+      };
+      return;
+    }
     yield {
       type: "lifecycle",
       boxId,
@@ -1551,7 +1571,40 @@ export class ConsumerBoxAgentOrchestrator {
       current.state !== "archiving" &&
       current.state !== "archived"
     ) {
+      if (canceled()) {
+        yield {
+          type: "autostop.timer",
+          phase: "canceled",
+          boxId,
+          remainingMs: 0,
+          reason: "new-user-message",
+          note: "auto-stop canceled because a user prompt was accepted before the stop request was sent",
+        };
+        return;
+      }
       await this.options.box.stop(boxId).catch(() => undefined);
+    }
+    if (canceled()) {
+      const afterStop = await this.options.box.get(boxId).catch(() => undefined);
+      if (afterStop?.state === "archived") {
+        yield {
+          type: "lifecycle",
+          boxId,
+          state: "resuming",
+          note: "auto-stop stop request raced a new accepted prompt; resuming private box",
+        };
+        await this.options.box.resume(boxId).catch(() => undefined);
+        await this.waitUntilReady(boxId, "cancel-auto-stop-resume").catch(() => undefined);
+      }
+      yield {
+        type: "autostop.timer",
+        phase: "canceled",
+        boxId,
+        remainingMs: 0,
+        reason: "new-user-message",
+        note: "auto-stop canceled because a user prompt was accepted while shutdown was starting",
+      };
+      return;
     }
     yield {
       type: "lifecycle",

@@ -79,6 +79,17 @@ class StreamingLogBoxClient extends FakeBoxClient {
   }
 }
 
+class PausingStopBoxClient extends FakeBoxClient {
+  stopStarted = false;
+  releaseStop!: () => void;
+  stopGate = new Promise<void>((resolve) => { this.releaseStop = resolve; });
+  override async stop(boxId: string): Promise<BoxInfo> {
+    this.stopStarted = true;
+    await this.stopGate;
+    return super.stop(boxId);
+  }
+}
+
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 300): Promise<void> {
   const started = Date.now();
@@ -208,6 +219,35 @@ test("new turn inside idle window cancels pending auto-stop and reuses warm Box"
   assert.ok(secondTimerStopIndex > secondTimerStartIndex, "visible countdown reaches stopping before Box stop lifecycle");
   assert.ok(secondBillingStopIndex > secondTimerStopIndex, "billing stops promptly after visible countdown reaches zero");
   assert.equal((await box.get(boxId)).state, "archived");
+});
+
+test("accepted prompt during auto-stop shutdown resumes and preserves the answer", async () => {
+  const box = new PausingStopBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const selection = { harness: "alpha", provider: "anthropic", model: "m-1" };
+
+  const first: any[] = [];
+  const d1 = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection })) first.push(e);
+  })();
+
+  await waitFor(() => box.stopStarted, 300);
+  const boxId = first.find((e) => e.type === "turn.done")?.boxId;
+  assert.ok(boxId, "first turn reached the private box before auto-stop began");
+
+  const second: any[] = [];
+  const d2 = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run follow up", selection })) second.push(e);
+  })();
+  await waitFor(() => second.some((e) => e.type === "trace" && e.stage === "turn.submit.accepted"), 300);
+
+  box.releaseStop();
+  await Promise.all([d1, d2]);
+
+  assert.ok(first.some((e) => e.type === "autostop.timer" && e.phase === "canceled"), "accepted prompt cancels the in-flight idle shutdown");
+  assert.ok(!first.some((e) => e.type === "billing.stop"), "raced auto-stop does not pause billing for an accepted prompt");
+  assert.ok(second.some((e) => e.type === "user-box.delta" && /box:alpha/.test(e.text)), "follow-up still gets its private Box answer");
+  assert.equal(second.find((e) => e.type === "turn.done")?.boxId, boxId, "follow-up continues on the same resumed Box");
 });
 
 test("concurrent shared-side turns do not enqueue duplicate Box rounds", async () => {

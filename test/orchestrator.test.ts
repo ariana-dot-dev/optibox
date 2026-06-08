@@ -743,6 +743,40 @@ test("stuck first Box create does not poison second message session", async () =
   assert.equal(second.filter((e) => e.type === "turn.done").length, 1, "second turn completes once");
 });
 
+test("aborted shared bridge releases prepared Box round so next message is not a nudge", async () => {
+  const box = new SlowUserBoxClient();
+  box.delayMs = 25;
+  const harness: HarnessAdapter = {
+    name: "abort-cleanup",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() {
+      yield `I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+    },
+    async *userBox({ latestUserMessage }) {
+      yield `BOX_HANDLED:${latestUserMessage}`;
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const selection = { harness: "abort-cleanup", provider: "anthropic", model: "m-1" };
+
+  const first = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run first command", selection });
+  const firstIterator = first[Symbol.asyncIterator]();
+  const seen: any[] = [];
+  while (!seen.some((e) => e.type === "shared.delta")) {
+    const n = await firstIterator.next();
+    assert.equal(n.done, false, "first turn should reach the shared bridge before cancellation");
+    seen.push(n.value);
+  }
+  await firstIterator.return?.(undefined as never);
+
+  const second: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run second command", selection })) second.push(e);
+
+  assert.ok(second.some((e) => e.type === "handoff.started"), "second turn reaches the Box instead of being suppressed by the orphaned first round");
+  assert.equal(second.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "BOX_HANDLED:run second command");
+});
+
 test("two successful messages reuse one Box conversation without duplicate answers", async () => {
   const box = new FakeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });

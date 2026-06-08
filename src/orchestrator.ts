@@ -529,27 +529,34 @@ export class ConsumerBoxAgentOrchestrator {
     //    stop the box out from under the pending answer.
     let boxAgentSettled = false;
     let routedToPrivate = false;
-    for await (const ev of this.runAdaptiveTurn(
-      input,
-      key,
-      statusPromise,
-      lockBusyAtSubmit,
-    )) {
-      if (ev.type === "trace" && ev.stage === "user-box.response.end") boxAgentSettled = true;
-      if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge") && ev.settled === true) boxAgentSettled = true;
-      if (
-        ev.type === "handoff.started" ||
-        ev.type === "user-box.delta" ||
-        ev.type === "billing.start" ||
-        (ev.type === "turn.done" && Boolean(ev.boxId)) ||
-        (ev.type === "trace" && PRIVATE_ROUTE_TRACE_STAGES.has(ev.stage))
-      ) routedToPrivate = true;
-      yield { ...ev, turnId };
+    try {
+      for await (const ev of this.runAdaptiveTurn(
+        input,
+        key,
+        turnSequence,
+        statusPromise,
+        lockBusyAtSubmit,
+      )) {
+        if (ev.type === "trace" && ev.stage === "user-box.response.end") boxAgentSettled = true;
+        if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge") && ev.settled === true) boxAgentSettled = true;
+        if (
+          ev.type === "handoff.started" ||
+          ev.type === "user-box.delta" ||
+          ev.type === "billing.start" ||
+          (ev.type === "turn.done" && Boolean(ev.boxId)) ||
+          (ev.type === "trace" && PRIVATE_ROUTE_TRACE_STAGES.has(ev.stage))
+        ) routedToPrivate = true;
+        yield { ...ev, turnId };
+      }
+    } finally {
+      // If the browser closes/aborts the SSE stream after the shared bridge but
+      // before the private handoff completes, the generator is returned early.
+      // Always clear the active stream count so a canceled preview request cannot
+      // leave the conversation permanently "active" and block future settlement.
+      const activeTurns = Math.max(0, (this.activeTurnCounts.get(key) ?? 1) - 1);
+      if (activeTurns === 0) this.activeTurnCounts.delete(key);
+      else this.activeTurnCounts.set(key, activeTurns);
     }
-
-    const activeTurns = Math.max(0, (this.activeTurnCounts.get(key) ?? 1) - 1);
-    if (activeTurns === 0) this.activeTurnCounts.delete(key);
-    else this.activeTurnCounts.set(key, activeTurns);
 
     // Keep the Box warm briefly after all current responses are done. Any user
     // message bumps turnSequences[key] immediately, which cancels/freezes an
@@ -582,6 +589,7 @@ export class ConsumerBoxAgentOrchestrator {
   private async *runAdaptiveTurn(
     input: ConsumerTurnInput,
     key: string,
+    turnSequence: number,
     statusPromise: Promise<UserBoxStatus>,
     lockBusyAtSubmit: boolean,
   ): AsyncIterable<ConsumerTurnEvent> {
@@ -642,7 +650,10 @@ export class ConsumerBoxAgentOrchestrator {
             throw error;
           }
         })();
+    let privateReadyConsumed = false;
+    let adaptiveTurnCompleted = false;
 
+    try {
     let resolvedStatus = await statusPromise;
     yield {
       type: "trace",
@@ -689,6 +700,7 @@ export class ConsumerBoxAgentOrchestrator {
     // that avoids unnecessary shared bridge text for a ready Box.
     if (resolvedStatus.kind === "ready" && !lockBusyAtSubmit && !activeAtSubmit && privateReady && candidateRound) {
       const privateResult = await privateReady;
+      privateReadyConsumed = true;
       try {
         if (privateResult.status.kind === "ready") {
           yield {
@@ -708,6 +720,7 @@ export class ConsumerBoxAgentOrchestrator {
               boxId: privateResult.box.id,
             };
             yield { type: "turn.done", boxId: privateResult.box.id, harness: harness.name, model: input.selection.model, route: "shared" };
+            adaptiveTurnCompleted = true;
             return;
           }
           this.markPrivateRound(key, round, "active");
@@ -721,6 +734,7 @@ export class ConsumerBoxAgentOrchestrator {
             privateResult.status,
             round,
           );
+          adaptiveTurnCompleted = true;
           return;
         }
         resolvedStatus = privateResult.status;
@@ -821,6 +835,7 @@ export class ConsumerBoxAgentOrchestrator {
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
       yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+      adaptiveTurnCompleted = true;
       return;
     }
 
@@ -839,6 +854,7 @@ export class ConsumerBoxAgentOrchestrator {
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
       yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared" };
+      adaptiveTurnCompleted = true;
       return;
     }
     this.markPrivateRound(key, round, "active");
@@ -846,6 +862,7 @@ export class ConsumerBoxAgentOrchestrator {
     let privateResult: { box: BoxInfo; status: UserBoxStatus; release: () => void };
     try {
       privateResult = await privateReady;
+      privateReadyConsumed = true;
     } catch (error) {
       this.markPrivateRound(key, round, "suppressed");
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
@@ -858,6 +875,7 @@ export class ConsumerBoxAgentOrchestrator {
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
+      adaptiveTurnCompleted = true;
       return;
     }
 
@@ -880,8 +898,24 @@ export class ConsumerBoxAgentOrchestrator {
         privateResult.status,
         round,
       );
+      adaptiveTurnCompleted = true;
     } finally {
       privateResult.release();
+    }
+    } finally {
+      // A browser/SSE abort can return this generator after the private Box
+      // create/resume has been accepted but before this code reaches the
+      // handoff. Without cleanup, the prepared runtime promise keeps the
+      // per-conversation lock and the reserved private round remains "needed",
+      // so the next message appears to nudge a stuck warm Box. Release any
+      // unconsumed prepared runtime and clear the orphaned round.
+      if (!adaptiveTurnCompleted && !privateReadyConsumed) {
+        if (candidateRound && (candidateRound.state === "needed" || candidateRound.state === "active")) {
+          this.markPrivateRound(key, candidateRound, "suppressed");
+        }
+        this.discardPreparedPrivateRuntime(privateReady);
+        this.scheduleAbandonedPreparedStop(input, key, turnSequence);
+      }
     }
   }
 
@@ -1065,6 +1099,42 @@ export class ConsumerBoxAgentOrchestrator {
   ): void {
     if (!prepared) return;
     void prepared.then((result) => result.release()).catch(() => undefined);
+  }
+
+  private scheduleAbandonedPreparedStop(
+    input: ConsumerTurnInput,
+    key: string,
+    turnSequence: number,
+  ): void {
+    void (async () => {
+      // If a create/resume is still being deduped, let it finish before deciding
+      // whether the abandoned turn left a billable warm Box behind.
+      await this.userBoxStarts.get(key)?.catch(() => undefined);
+      const delayMs = this.options.autoStopIdleMs ?? 5000;
+      if (delayMs > 0) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, delayMs);
+          timer.unref?.();
+        });
+      }
+      if (this.turnSequences.get(key) !== turnSequence) return;
+      if (this.activeTurnCounts.has(key)) return;
+      if (this.activePrivateRound(key)) return;
+      if (this.userBoxStarts.has(key)) return;
+      const session = await this.sessions.get(input.userId, input.conversationId);
+      if (!session?.boxId || !this.billing.has(session.boxId)) return;
+      const release = await this.acquireLock(this.boxLocks, key);
+      try {
+        if (this.turnSequences.get(key) !== turnSequence) return;
+        if (this.activeTurnCounts.has(key) || this.activePrivateRound(key)) return;
+        for await (const _ of this.stopUserBoxLocked(input.userId, input.conversationId)) {
+          // This is a detached cleanup path after the SSE stream disappeared;
+          // there is no client to receive lifecycle events.
+        }
+      } finally {
+        release();
+      }
+    })().catch(() => undefined);
   }
 
   private bumpTurnSequence(key: string): number {

@@ -1,0 +1,7 @@
+# Example: run a Harbor task with Ascii Box using a custom environment import path.
+# Install this repo in the same Python environment as Harbor, set BOX_API_KEY,
+# then use: harbor task run examples/harbor/box-task.yaml --environment-import-path harbor_box:BoxEnvironment
+instruction: |
+  Print the current working directory, write hello.txt, and show its contents.
+environment:
+  os: linux

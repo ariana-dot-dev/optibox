@@ -1,0 +1,5 @@
+[console_scripts]
+harbor = harbor.cli.main:app
+hb = harbor.cli.main:app
+hr = harbor.cli.main:app
+

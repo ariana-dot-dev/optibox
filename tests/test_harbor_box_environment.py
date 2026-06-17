@@ -102,6 +102,13 @@ async def test_upload_and_download_dir(tmp_path):
     await env.upload_dir(src, "/remote")
     assert client.files["/remote/nested/a.txt"] == b"A"
 
+    # Files are written as the default Box user, so their parent directories must
+    # be created as that same user. Creating them as root makes the dirs unwritable
+    # for the subsequent file writes (silent permission-denied data loss).
+    upload_mkdirs = [c["command"] for c in client.commands if "mkdir -p" in c["command"] and "/remote" in c["command"]]
+    assert upload_mkdirs, "upload_dir should create the target directories"
+    assert all("sudo" not in cmd for cmd in upload_mkdirs), upload_mkdirs
+
     client.files["/remote/nested/a.txt"] = b"B"
     dst = tmp_path / "out"
     await env.download_dir("/remote", dst)

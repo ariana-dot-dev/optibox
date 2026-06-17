@@ -170,11 +170,13 @@ class AsyncBoxClient:
         encoded = base64.b64encode(content).decode("ascii")
         if path.startswith("/"):
             parent = str(PurePosixPath(path).parent)
-            await self.command(
+            result = await self.command(
                 box_id,
                 f"mkdir -p {shlex.quote(parent)} && printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(path)}",
                 timeout_seconds=120,
             )
+            if result.return_code != 0:
+                raise BoxApiError(0, "box_write_failed", f"Failed to write {path!r} to Box: {result.stderr or result.stdout}".strip())
             return
         await self.write_file(box_id, path, encoded, encoding="base64")
 
@@ -408,7 +410,7 @@ class BoxEnvironment(BaseEnvironment):
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         parents = _parents([target_path])
         if parents:
-            await self.exec("mkdir -p " + " ".join(_quote(p) for p in parents), user="root")
+            await self.exec("mkdir -p " + " ".join(_quote(p) for p in parents))
         await self._client.write_file_binary(self.box_id, target_path, Path(source_path).read_bytes())
 
     @override
@@ -417,7 +419,7 @@ class BoxEnvironment(BaseEnvironment):
         files = [path for path in source.rglob("*") if path.is_file()]
         remote_paths = [str(PurePosixPath(target_dir) / path.relative_to(source).as_posix()) for path in files]
         parents = _parents(remote_paths)
-        await self.exec("mkdir -p " + " ".join(_quote(p) for p in [target_dir, *parents]), user="root")
+        await self.exec("mkdir -p " + " ".join(_quote(p) for p in [target_dir, *parents]))
         for path, remote_path in zip(files, remote_paths, strict=True):
             await self._client.write_file_binary(self.box_id, remote_path, path.read_bytes())
 

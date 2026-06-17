@@ -110,6 +110,22 @@ stateDiagram-v2
   WarmIdle --> DirectBox: quick follow-up
 ```
 
+
+## Eve sandbox backend
+
+Optibox also exports an Eve sandbox backend for Ascii Box:
+
+```ts
+import { defineSandbox } from "eve/sandbox";
+import { asciiBox } from "@ascii-prototypes/consumer-box-agents";
+
+export default defineSandbox({
+  backend: asciiBox({ apiKey: process.env.BOX_API_KEY! }),
+});
+```
+
+See [`docs/eve-box-backend.md`](./docs/eve-box-backend.md) for capability mapping, examples, and current Box/Eve feature gaps.
+
 ## Running the repo
 
 ```bash

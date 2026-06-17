@@ -11,7 +11,8 @@
     "outDir": "dist",
     "rootDir": ".",
     "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true
   },
   "include": ["src/**/*.ts", "test/**/*.ts", "examples/**/*.ts", "scripts/**/*.ts"]
 }

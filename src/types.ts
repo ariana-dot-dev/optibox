@@ -48,6 +48,8 @@ export interface BoxClient {
   command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number; env?: Record<string, string> }): Promise<CommandResult>;
   readFile(boxId: string, path: string): Promise<string>;
   writeFile(boxId: string, path: string, content: string): Promise<void>;
+  readFileBinary?(boxId: string, path: string): Promise<Uint8Array | null>;
+  writeFileBinary?(boxId: string, path: string, content: Uint8Array): Promise<void>;
 }
 
 /** Identifies which external harness + which model/provider a turn should use. */

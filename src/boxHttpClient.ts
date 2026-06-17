@@ -121,6 +121,21 @@ export class BoxHttpClient implements BoxClient {
   async writeFile(boxId: string, path: string, content: string): Promise<void> {
     await this.request(`/boxes/${encodeURIComponent(boxId)}/files`, { method: "PUT", body: JSON.stringify({ path, content, encoding: "utf8" }) });
   }
+
+  async readFileBinary(boxId: string, path: string): Promise<Uint8Array | null> {
+    try {
+      const json = await this.request<{ content?: string; file?: { content: string } }>(`/boxes/${encodeURIComponent(boxId)}/files?${new URLSearchParams({ path, encoding: "base64" })}`);
+      const content = json.content ?? json.file?.content;
+      return content === undefined ? null : Buffer.from(content, "base64");
+    } catch (error) {
+      if (error instanceof BoxApiError && error.status === 404) return null;
+      throw error;
+    }
+  }
+
+  async writeFileBinary(boxId: string, path: string, content: Uint8Array): Promise<void> {
+    await this.request(`/boxes/${encodeURIComponent(boxId)}/files`, { method: "PUT", body: JSON.stringify({ path, content: Buffer.from(content).toString("base64"), encoding: "base64" }) });
+  }
 }
 
 /**

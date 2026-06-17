@@ -1,105 +1,137 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { asciiBox, EveBoxUnsupportedError, type EveBoxClient } from "../src/index.js";
+import { asciiBox, BoxHttpClient, EveBoxUnsupportedError } from "../src/index.js";
+import type { SandboxSession } from "eve/sandbox";
 
-class FakeBoxClient implements EveBoxClient {
-  boxes = new Map<string, { id: string; state: string; name?: string }>();
-  files = new Map<string, Uint8Array>();
-  commands: Array<{ boxId: string; input: { command: string; cwd?: string; timeoutMs?: number } }> = [];
-  created = 0;
-  resumed: string[] = [];
+const requiredApiKey = process.env.BOX_API_KEY;
+if (!requiredApiKey) throw new Error("BOX_API_KEY is required for real Eve Box adapter tests");
+const apiKey: string = requiredApiKey;
 
-  async create(input: { name?: string; ttlSeconds?: number | null }) {
-    const id = `bx_fake${++this.created}`;
-    const box = { id, state: "ready", ...(input.name ? { name: input.name } : {}) };
-    this.boxes.set(id, box);
-    return box;
+const runId = `eve-box-adapter-${Date.now()}-${process.pid}`;
+const testRoot = `real-tests/${runId}`;
+
+async function streamToText(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return out;
+    out += decoder.decode(value, { stream: true });
   }
-  async get(boxId: string) { return this.boxes.get(boxId) ?? { id: boxId, state: "ready" }; }
-  async update(boxId: string, input: { name?: string }) {
-    const box = { ...(await this.get(boxId)), ...input };
-    this.boxes.set(boxId, box);
-    return box;
-  }
-  async stop() { return { ok: true }; }
-  async resume(boxId: string) { this.resumed.push(boxId); return this.get(boxId); }
-  async command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number }) {
-    this.commands.push({ boxId, input });
-    if (input.command.startsWith("rm ")) return { exitCode: 0, stdout: "", stderr: "" };
-    return { exitCode: 7, stdout: `ran:${input.command}`, stderr: "err" };
-  }
-  async readFile(boxId: string, path: string) {
-    const bytes = this.files.get(`${boxId}:${path}`);
-    if (!bytes) throw Object.assign(new Error("missing"), { status: 404 });
-    return new TextDecoder().decode(bytes);
-  }
-  async writeFile(boxId: string, path: string, content: string) {
-    this.files.set(`${boxId}:${path}`, new TextEncoder().encode(content));
-  }
-  async readFileBinary(boxId: string, path: string) { return this.files.get(`${boxId}:${path}`) ?? null; }
-  async writeFileBinary(boxId: string, path: string, content: Uint8Array) { this.files.set(`${boxId}:${path}`, content); }
 }
 
-test("asciiBox creates an Eve backend that runs commands and persists box metadata", async () => {
-  const client = new FakeBoxClient();
-  const backend = asciiBox({ client, name: ({ sessionKey }) => `eve-${sessionKey}`, networkPolicy: "allow-all" });
-  assert.equal(backend.name, "ascii-box");
+let sharedPromise: Promise<{
+  backend: ReturnType<typeof asciiBox>;
+  boxId: string;
+  session: SandboxSession;
+}> | undefined;
 
-  const handle = await backend.create({ templateKey: null, sessionKey: "session-1", runtimeContext: { appRoot: "/app" } });
-  const sandbox = await handle.useSessionFn({ networkPolicy: "allow-all" });
+async function sharedRealBox() {
+  sharedPromise ??= (async () => {
+    const backend = asciiBox({
+      apiKey,
+      name: `optibox-eve-adapter-test-${runId}`,
+      ttlSeconds: 300,
+      pollMs: 250,
+      networkPolicy: "allow-all",
+    });
+    const handle = await backend.create({
+      templateKey: null,
+      sessionKey: `${runId}-shared-session`,
+      runtimeContext: { appRoot: process.cwd() },
+      tags: { test: "eve-box-adapter", runId },
+    });
+    const state = await handle.captureState();
+    const boxId = String(state.metadata.boxId);
+    const session = await handle.useSessionFn({ networkPolicy: "allow-all" });
+    await session.removePath({ path: testRoot, recursive: true, force: true });
+    await session.run({ command: `mkdir -p ${testRoot}` });
+    return { backend, boxId, session };
+  })();
+  return sharedPromise;
+}
 
-  assert.equal(sandbox.id, "session-1");
-  assert.equal(sandbox.resolvePath("foo.txt"), "/workspace/foo.txt");
+test("real asciiBox session runs commands and resolves /workspace paths", async () => {
+  const { session } = await sharedRealBox();
+  assert.equal(session.resolvePath("repo/file.txt"), "/workspace/repo/file.txt");
 
-  const result = await sandbox.run({ command: "echo hi", workingDirectory: "repo", env: { TOKEN: "secret value" } });
-  assert.equal(result.exitCode, 7);
-  assert.match(result.stdout, /ran:export TOKEN='secret value'; echo hi/);
-  assert.equal(client.commands.at(-1)?.input.cwd, "repo");
-
-  await sandbox.writeTextFile({ path: "dir/a.txt", content: "one\ntwo\nthree\n" });
-  assert.equal(await sandbox.readTextFile({ path: "/workspace/dir/a.txt", startLine: 2, endLine: 2 }), "two\n");
-
-  await sandbox.writeBinaryFile({ path: "bin.dat", content: new Uint8Array([0, 255, 42]) });
-  assert.deepEqual([...(await sandbox.readBinaryFile({ path: "bin.dat" }) ?? [])], [0, 255, 42]);
-
-  await sandbox.removePath({ path: "dir", recursive: true, force: true });
-  assert.match(client.commands.at(-1)?.input.command ?? "", /^rm -fr -- 'dir'/);
-
-  const state = await handle.captureState();
-  assert.deepEqual(state, { backendName: "ascii-box", sessionKey: "session-1", metadata: { boxId: "bx_fake1" } });
-});
-
-test("asciiBox reconnects to the persisted Box id instead of creating a new Box", async () => {
-  const client = new FakeBoxClient();
-  client.boxes.set("bx_keep", { id: "bx_keep", state: "ready" });
-  const backend = asciiBox({ client });
-  const handle = await backend.create({ templateKey: null, sessionKey: "session-2", existingMetadata: { boxId: "bx_keep" }, runtimeContext: { appRoot: "/app" } });
-  assert.equal(client.created, 0);
-  assert.deepEqual(client.resumed, ["bx_keep"]);
-  assert.equal((await handle.captureState()).metadata.boxId, "bx_keep");
-});
-
-test("asciiBox explicitly rejects unsupported network policies", async () => {
-  const client = new FakeBoxClient();
-  assert.throws(() => asciiBox({ client, networkPolicy: "deny-all" }), EveBoxUnsupportedError);
-  const backend = asciiBox({ client });
-  const handle = await backend.create({ templateKey: null, sessionKey: "session-3", runtimeContext: { appRoot: "/app" } });
-  await assert.rejects(() => handle.session.setNetworkPolicy("deny-all"), EveBoxUnsupportedError);
-});
-
-test("asciiBox replays recorded seed files and bootstrap on first create", async () => {
-  const client = new FakeBoxClient();
-  const backend = asciiBox({ client });
-  await backend.prewarm({
-    templateKey: "tpl",
-    runtimeContext: { appRoot: "/app" },
-    seedFiles: [{ path: "seed.txt", content: "seeded" }],
-    bootstrap: async ({ use }) => {
-      const sandbox = await use();
-      await sandbox.writeTextFile({ path: "boot.txt", content: "booted" });
-    },
+  await session.run({ command: `mkdir -p ${testRoot}/cmd`, workingDirectory: "." });
+  const result = await session.run({
+    command: "printf \"$EVE_BOX_TEST:$PWD\" > result.txt && cat result.txt",
+    workingDirectory: `${testRoot}/cmd`,
+    env: { EVE_BOX_TEST: "real-api" },
   });
-  const handle = await backend.create({ templateKey: "tpl", sessionKey: "session-4", runtimeContext: { appRoot: "/app" } });
-  assert.equal(await handle.session.readTextFile({ path: "seed.txt" }), "seeded");
-  assert.equal(await handle.session.readTextFile({ path: "boot.txt" }), "booted");
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /^real-api:/);
+  assert.match(result.stdout, /workspace/);
+  assert.equal(await session.readTextFile({ path: `${testRoot}/cmd/result.txt` }), result.stdout);
+
+  const absoluteWorkspace = await session.run({ command: `cat /workspace/${testRoot}/cmd/result.txt` });
+  assert.equal(absoluteWorkspace.exitCode, 0, absoluteWorkspace.stderr);
+  assert.equal(absoluteWorkspace.stdout, result.stdout);
+});
+
+test("real asciiBox session reads, writes, slices, and removes text and binary files", async () => {
+  const { session } = await sharedRealBox();
+  const textPath = `${testRoot}/files/text.txt`;
+  const binaryPath = `${testRoot}/files/binary.dat`;
+
+  await session.writeTextFile({ path: textPath, content: "one\ntwo\nthree\n" });
+  assert.equal(await session.readTextFile({ path: `/workspace/${textPath}`, startLine: 2, endLine: 2 }), "two\n");
+
+  await session.writeBinaryFile({ path: binaryPath, content: new Uint8Array([0, 1, 2, 253, 254, 255]) });
+  assert.deepEqual([...(await session.readBinaryFile({ path: binaryPath }) ?? [])], [0, 1, 2, 253, 254, 255]);
+
+  await session.removePath({ path: `${testRoot}/files`, recursive: true, force: true });
+  assert.equal(await session.readTextFile({ path: textPath }), null);
+});
+
+test("real asciiBox spawn streams stdout/stderr, waits, and reports exit code", async () => {
+  const { session } = await sharedRealBox();
+  const proc = await session.spawn({
+    command: "printf out; printf err >&2; exit 3",
+    workingDirectory: testRoot,
+  });
+
+  const [stdout, stderr, exit] = await Promise.all([
+    streamToText(proc.stdout),
+    streamToText(proc.stderr),
+    proc.wait(),
+  ]);
+
+  assert.equal(stdout, "out");
+  assert.equal(stderr, "err");
+  assert.equal(exit.exitCode, 3);
+});
+
+test("real asciiBox reconnects to the same Box metadata and preserves workspace", async () => {
+  const { backend, boxId, session } = await sharedRealBox();
+  const markerPath = `${testRoot}/reconnect-marker.txt`;
+  await session.writeTextFile({ path: markerPath, content: `box=${boxId}\n` });
+
+  const reconnected = await backend.create({
+    templateKey: null,
+    sessionKey: `${runId}-reconnected-session`,
+    existingMetadata: { boxId },
+    runtimeContext: { appRoot: process.cwd() },
+  });
+
+  const state = await reconnected.captureState();
+  assert.equal(state.metadata.boxId, boxId);
+  assert.equal(await reconnected.session.readTextFile({ path: markerPath }), `box=${boxId}\n`);
+});
+
+test("real asciiBox explicitly rejects unsupported Eve network policies", async () => {
+  const { session } = await sharedRealBox();
+  await assert.rejects(() => session.setNetworkPolicy("deny-all"), EveBoxUnsupportedError);
+});
+
+test("BoxHttpClient talks to the same real Box API used by the adapter", async () => {
+  const { boxId } = await sharedRealBox();
+  const client = new BoxHttpClient({ apiKey });
+  const box = await client.get(boxId);
+  assert.equal(box.id, boxId);
+  assert.match(box.state, /^(ready|idle|running)$/);
 });

@@ -130,5 +130,7 @@ See [`docs/eve-box-backend.md`](./docs/eve-box-backend.md) for capability mappin
 
 ```bash
 npm install
-npm test
+BOX_API_KEY=box_... npm test
 ```
+
+`npm test` includes the real Eve Box adapter tests. To run only those adapter tests, use `BOX_API_KEY=box_... npm run test:eve-box`; the test process creates one shared Box with a five-minute TTL and reuses it across all Eve assertions.

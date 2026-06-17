@@ -21,6 +21,7 @@ import type { BoxClient, BoxInfo, CommandResult } from "./types.js";
 
 export const ASCII_BOX_EVE_BACKEND_NAME = "ascii-box";
 const WORKSPACE = "/workspace";
+const BOX_WORKSPACE_DIR = "workspace";
 const SPAWN_DIR = ".eve-spawn";
 
 type SandboxBackendPrewarmResult = { readonly reused: boolean };
@@ -95,19 +96,30 @@ function resolveWorkspacePath(path: string): string {
 
 function toBoxPath(path: string): string {
   const resolved = resolveWorkspacePath(path);
-  if (resolved === WORKSPACE) return ".";
-  if (resolved.startsWith(`${WORKSPACE}/`)) return resolved.slice(WORKSPACE.length + 1);
-  throw new EveBoxUnsupportedError("paths outside /workspace", `received ${JSON.stringify(path)}; Box file APIs are scoped to /workspace`);
+  if (resolved === WORKSPACE) return BOX_WORKSPACE_DIR;
+  if (resolved.startsWith(`${WORKSPACE}/`)) return `${BOX_WORKSPACE_DIR}/${resolved.slice(WORKSPACE.length + 1)}`;
+  throw new EveBoxUnsupportedError("paths outside /workspace", `received ${JSON.stringify(path)}; Box file APIs are scoped to Eve's /workspace namespace`);
 }
 
-function toBoxCwd(path: string | undefined): string | undefined {
-  if (!path) return undefined;
-  const boxPath = toBoxPath(path);
-  return boxPath === "." ? undefined : boxPath;
+function toWorkspaceRelativePath(path: string): string {
+  const resolved = resolveWorkspacePath(path);
+  if (resolved === WORKSPACE) return ".";
+  if (resolved.startsWith(`${WORKSPACE}/`)) return resolved.slice(WORKSPACE.length + 1);
+  throw new EveBoxUnsupportedError("paths outside /workspace", `received ${JSON.stringify(path)}; Box commands are scoped to Eve's /workspace namespace`);
+}
+
+function toBoxCwd(path: string | undefined): string {
+  const workspaceRelative = toWorkspaceRelativePath(path ?? ".");
+  return workspaceRelative === "." ? BOX_WORKSPACE_DIR : `${BOX_WORKSPACE_DIR}/${workspaceRelative}`;
 }
 
 function shq(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function dirname(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index <= 0 ? "." : path.slice(0, index);
 }
 
 function envPrefix(env?: Record<string, string>): string {
@@ -187,7 +199,9 @@ async function maybeMissing<T>(operation: Promise<T>): Promise<T | null> {
     if (isRecord(error)) {
       const status = error.status;
       const code = error.code;
-      if (status === 404 || code === "not_found" || code === "file_not_found") return null;
+      const details = isRecord(error.details) ? error.details : undefined;
+      const message = typeof error.message === "string" ? error.message : typeof details?.message === "string" ? details.message : "";
+      if (status === 404 || code === "not_found" || code === "file_not_found" || (status === 400 && code === "box_direct_failed" && message.includes("ENOENT"))) return null;
     }
     throw error;
   }
@@ -195,7 +209,7 @@ async function maybeMissing<T>(operation: Promise<T>): Promise<T | null> {
 
 async function readBinary(client: EveBoxClient, boxId: string, path: string): Promise<Uint8Array | null> {
   const boxPath = toBoxPath(path);
-  if (client.readFileBinary) return client.readFileBinary(boxId, boxPath);
+  if (client.readFileBinary) return maybeMissing(client.readFileBinary(boxId, boxPath));
   const base64 = await maybeMissing(client.readFile(boxId, boxPath));
   if (base64 === null) return null;
   // BoxHttpClient.readFile currently reads UTF-8. Prefer API-native binary when the client provides it.
@@ -204,13 +218,39 @@ async function readBinary(client: EveBoxClient, boxId: string, path: string): Pr
 
 async function writeBinary(client: EveBoxClient, boxId: string, path: string, content: Uint8Array): Promise<void> {
   const boxPath = toBoxPath(path);
+  const parent = dirname(boxPath);
+  if (parent !== ".") await client.command(boxId, { command: `mkdir -p ${shq(parent)}`, timeoutMs: 10_000 });
   if (client.writeFileBinary) return client.writeFileBinary(boxId, boxPath, content);
   await client.writeFile(boxId, boxPath, decodeText(content));
 }
 
-async function waitForReady(client: EveBoxClient, box: BoxInfo): Promise<BoxInfo> {
-  if (box.state === "ready" || box.state === "idle" || box.state === "running") return box;
-  return box;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForReady(client: EveBoxClient, box: BoxInfo, timeoutMs = 300_000): Promise<BoxInfo> {
+  const started = Date.now();
+  let current = box;
+  for (;;) {
+    if (current.state === "ready" || current.state === "idle" || current.state === "running") return current;
+    if (current.state === "error") throw new Error(`Box ${current.id} entered error state while waiting for readiness`);
+    if (Date.now() - started > timeoutMs) throw new Error(`Timed out waiting for Box ${current.id} to become ready; last state was ${current.state}`);
+    await sleep(2_000);
+    current = await client.get(current.id);
+  }
+}
+
+async function ensureEveWorkspace(client: EveBoxClient, boxId: string): Promise<void> {
+  const checkFile = `.eve-workspace-check-${Date.now().toString(36)}`;
+  const command = [
+    `mkdir -p ${shq(BOX_WORKSPACE_DIR)}`,
+    `if [ ! -L ${shq(WORKSPACE)} ] && ! findmnt -rn --target ${shq(WORKSPACE)} >/dev/null 2>&1; then sudo rmdir ${shq(WORKSPACE)} 2>/dev/null || true; fi`,
+    `if [ ! -e ${shq(WORKSPACE)} ]; then sudo ln -s "$PWD/${BOX_WORKSPACE_DIR}" ${shq(WORKSPACE)} 2>/dev/null || true; fi`,
+    `if [ ! -L ${shq(WORKSPACE)} ] && ! findmnt -rn --target ${shq(WORKSPACE)} >/dev/null 2>&1; then sudo mkdir -p ${shq(WORKSPACE)} 2>/dev/null && sudo mount --bind "$PWD/${BOX_WORKSPACE_DIR}" ${shq(WORKSPACE)} 2>/dev/null || true; fi`,
+    `touch ${shq(`${WORKSPACE}/${checkFile}`)} && test -e ${shq(`${BOX_WORKSPACE_DIR}/${checkFile}`)} && rm -f ${shq(`${WORKSPACE}/${checkFile}`)} ${shq(`${BOX_WORKSPACE_DIR}/${checkFile}`)}`,
+  ].join("; ");
+  const result = await client.command(boxId, { command, timeoutMs: 10_000 });
+  if (result.exitCode !== 0) throw new Error(`Failed to initialize Eve /workspace in Box ${boxId}: ${result.stderr || result.stdout}`);
 }
 
 function commandResultExitCode(result: CommandResult): number {
@@ -233,14 +273,14 @@ function makeTailStream(input: {
       try {
         for (;;) {
           if (input.signal?.aborted) throw input.signal.reason ?? new Error("spawn stream aborted");
-          const text = await maybeMissing(input.client.readFile(input.boxId, input.path));
+          const text = await maybeMissing(input.client.readFile(input.boxId, toBoxPath(input.path)));
           if (text && text.length > offset) {
             controller.enqueue(encoder.encode(text.slice(offset)));
             offset = text.length;
           }
-          const status = await maybeMissing(input.client.readFile(input.boxId, input.statusPath));
+          const status = await maybeMissing(input.client.readFile(input.boxId, toBoxPath(input.statusPath)));
           if (status !== null) {
-            const finalText = await maybeMissing(input.client.readFile(input.boxId, input.path));
+            const finalText = await maybeMissing(input.client.readFile(input.boxId, toBoxPath(input.path)));
             if (finalText && finalText.length > offset) controller.enqueue(encoder.encode(finalText.slice(offset)));
             controller.close();
             return;
@@ -274,7 +314,7 @@ class EveBoxSession implements SandboxSession {
     const commandInput: { command: string; cwd?: string; timeoutMs?: number } = { command: `${envPrefix(options.env)}${options.command}` };
     const cwd = toBoxCwd(options.workingDirectory);
     const timeoutMs = timeoutFromOptions(this.options, options);
-    if (cwd !== undefined) commandInput.cwd = cwd;
+    commandInput.cwd = cwd;
     if (timeoutMs !== undefined) commandInput.timeoutMs = timeoutMs;
     const result = await this.client.command(this.boxId, commandInput);
     return { exitCode: commandResultExitCode(result), stdout: result.stdout ?? "", stderr: result.stderr ?? "" } as SandboxCommandResult;
@@ -286,26 +326,26 @@ class EveBoxSession implements SandboxSession {
     const stderrPath = `${SPAWN_DIR}/${spawnId}.stderr`;
     const statusPath = `${SPAWN_DIR}/${spawnId}.status`;
     const pidPath = `${SPAWN_DIR}/${spawnId}.pid`;
-    const cwd = toBoxCwd(options.workingDirectory) ?? ".";
+    const cwdRelative = toWorkspaceRelativePath(options.workingDirectory ?? ".");
+    const workspaceRoot = `"$PWD"/${shq(BOX_WORKSPACE_DIR)}`;
+    const shellPath = (path: string) => `"$workspace_root"/${shq(path)}`;
+    const shellCwd = cwdRelative === "." ? `"$workspace_root"` : shellPath(cwdRelative);
     const command = [
-      `mkdir -p ${shq(SPAWN_DIR)}`,
-      `rm -f ${shq(stdoutPath)} ${shq(stderrPath)} ${shq(statusPath)} ${shq(pidPath)}`,
-      `touch ${shq(stdoutPath)} ${shq(stderrPath)}`,
-      `(`,
-      `  cd ${shq(cwd)} && ${envPrefix(options.env)}( ${options.command} ) > ${shq(resolveWorkspacePath(stdoutPath))} 2> ${shq(resolveWorkspacePath(stderrPath))}`,
-      `  code=$?`,
-      `  cd - >/dev/null 2>&1 || true`,
-      `  echo "$code" > ${shq(statusPath)}`,
-      `) & echo $! | tee ${shq(pidPath)}`,
+      `workspace_root=${workspaceRoot}`,
+      `mkdir -p ${shellPath(SPAWN_DIR)}`,
+      `rm -f ${shellPath(stdoutPath)} ${shellPath(stderrPath)} ${shellPath(statusPath)} ${shellPath(pidPath)}`,
+      `touch ${shellPath(stdoutPath)} ${shellPath(stderrPath)}`,
+      `( cd ${shellCwd} && ${envPrefix(options.env)}( ${options.command} ) > ${shellPath(stdoutPath)} 2> ${shellPath(stderrPath)}; code=$?; echo "$code" > ${shellPath(statusPath)} ) & echo $! | tee ${shellPath(pidPath)}`,
     ].join("; ");
     const started = await this.client.command(this.boxId, { command, timeoutMs: 10_000 });
+    if (commandResultExitCode(started) !== 0) throw new Error(`Failed to spawn process in Box ${this.boxId}: ${started.stderr || started.stdout}`);
     const pid = Number.parseInt((started.stdout ?? "").trim().split(/\s+/).at(-1) ?? "", 10);
     const signal = options.abortSignal;
     let killed = false;
     const kill = async () => {
       if (killed) return;
       killed = true;
-      await this.client.command(this.boxId, { command: `if test -f ${shq(pidPath)}; then kill -TERM $(cat ${shq(pidPath)}) 2>/dev/null || true; fi`, timeoutMs: 5_000 });
+      await this.client.command(this.boxId, { command: `if test -f ${shq(toBoxPath(pidPath))}; then kill -TERM $(cat ${shq(toBoxPath(pidPath))}) 2>/dev/null || true; fi`, timeoutMs: 5_000 });
     };
     if (signal) {
       if (signal.aborted) await kill();
@@ -314,7 +354,7 @@ class EveBoxSession implements SandboxSession {
     const wait = async (): Promise<{ exitCode: number }> => {
       for (;;) {
         if (signal?.aborted) throw signal.reason ?? new Error("spawn aborted");
-        const status = await maybeMissing(this.client.readFile(this.boxId, statusPath));
+        const status = await maybeMissing(this.client.readFile(this.boxId, toBoxPath(statusPath)));
         if (status !== null) return { exitCode: Number.parseInt(status.trim(), 10) || 0 };
         await new Promise((resolve) => setTimeout(resolve, this.options.pollMs));
       }
@@ -436,6 +476,7 @@ export function asciiBox(options: EveBoxBackendOptions = {}): SandboxBackend<Eve
         box = await client.create({ name, ttlSeconds: options.ttlSeconds ?? 3600 });
       }
       box = await waitForReady(client, box);
+      await ensureEveWorkspace(client, box.id);
       const sessionOptions: { pollMs: number; networkPolicyMode: EveBoxNetworkPolicyMode; commandTimeoutMs?: number } = { pollMs, networkPolicyMode };
       if (options.commandTimeoutMs !== undefined) sessionOptions.commandTimeoutMs = options.commandTimeoutMs;
       const session = new EveBoxSession(input.sessionKey, client, box.id, sessionOptions);

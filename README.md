@@ -134,11 +134,15 @@ export default defineSandbox({
 
 See [`docs/eve-box-backend.md`](./docs/eve-box-backend.md) for capability mapping, examples, and current Box/Eve feature gaps. See [`docs/release.md`](./docs/release.md) for first-version npm release steps for `@asciidev/eve-box`.
 
-## Running the repo
+## Running the Eve Box adapter tests
+
+These are the only tests that establish Eve adapter correctness in this PR:
+
+- `test/eve-box-backend.test.ts`
+
+They require a real `BOX_API_KEY`. They do not use a fake Box client, mocks, stubs, dry-runs, or per-test Boxes. The test process creates one shared Box with `ttlSeconds: 300` and reuses that Box across every Eve adapter assertion in the file.
 
 ```bash
 npm install
-BOX_API_KEY=box_... npm test
+BOX_API_KEY=box_... npm run test:eve-box
 ```
-
-`npm test` includes the real Eve Box adapter tests. To run only those adapter tests, use `BOX_API_KEY=box_... npm run test:eve-box`; the test process creates one shared Box with a five-minute TTL and reuses it across all Eve assertions.

@@ -57,13 +57,22 @@ Box also does not expose cloneable Eve template snapshots. `prewarm()` records s
 
 ## Real API tests
 
-The Eve backend tests intentionally use the real Box API. They require `BOX_API_KEY` and create one shared Box per test process with `ttlSeconds: 300` (five minutes), then reuse that Box for every Eve adapter assertion in the file. No fake Box client, mocks, stubs, or per-test Boxes are used for this adapter.
+The only Eve correctness tests in this PR are in `test/eve-box-backend.test.ts`. They intentionally use the real Box API and require `BOX_API_KEY`. No fake Box client, mocks, stubs, dry-runs, or per-test Boxes are used in these Eve adapter tests.
+
+The test process creates one shared Box with `ttlSeconds: 300` (five minutes), then reuses that same Box for every Eve adapter assertion in the file.
 
 ```bash
 BOX_API_KEY=box_... npm run test:eve-box
-# or run the full suite, which includes the real Eve Box adapter tests:
-BOX_API_KEY=box_... npm test
 ```
+
+Assertions covered by `test/eve-box-backend.test.ts`:
+
+- real `asciiBox` sessions run commands and resolve `/workspace` paths;
+- real `asciiBox` sessions read, write, slice, and remove text and binary files;
+- real `asciiBox` `spawn()` streams stdout/stderr, waits, and reports exit code;
+- real `asciiBox` reconnects to the same Box metadata and preserves workspace files;
+- real `asciiBox` rejects unsupported Eve network policies with `EveBoxUnsupportedError`;
+- `BoxHttpClient` talks to the same real Box API used by the adapter.
 
 The implementation was aligned with the current Box docs index (`https://docs.ascii.dev/llms.txt`), the TypeScript SDK guide, and the Box v1 create/command/file endpoint references.
 

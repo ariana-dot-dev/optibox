@@ -1,1 +1,0 @@
-import{b as o,G as s}from"./index-9kInBaGv.js";import{i}from"./loading-dots-bDqR0ONi.js";var u=s[" useId ".trim().toString()]||(()=>{}),c=0;function f(r){const[t,e]=o.useState(u());return i(()=>{e(a=>a??String(c++))},[r]),t?`radix-${t}`:""}export{f as u};

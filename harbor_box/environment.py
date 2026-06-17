@@ -327,6 +327,22 @@ class BoxEnvironment(BaseEnvironment):
         return await self._client.create(name=f"harbor-{self.environment_name}-{self.session_id}"[:120], ttl_seconds=self._ttl_seconds)
 
     @override
+    async def ensure_dirs(self, dirs: Sequence[Any], *, chmod: bool = True) -> ExecResult | None:
+        if not dirs:
+            return None
+        # Harbor calls ensure_dirs() during start() to create the configured
+        # workdir. Do not route that command through exec(), because exec()
+        # intentionally applies the configured workdir and would try to cd into
+        # the directory before it exists.
+        return await self._client.command(
+            self.box_id,
+            f"sudo -n bash -lc {shlex.quote(self._ensure_dirs_command(dirs, chmod=chmod))}",
+            cwd=None,
+            env=None,
+            timeout_seconds=120,
+        )
+
+    @override
     async def start(self, force_build: bool = False) -> None:
         if force_build:
             self.logger.debug("force_build=True has no effect for BoxEnvironment because Box does not expose build templates yet.")
@@ -368,8 +384,12 @@ class BoxEnvironment(BaseEnvironment):
         user: str | int | None = None,
     ) -> ExecResult:
         effective_user = self._resolve_user(user)
-        if effective_user is not None and str(effective_user) != "root":
-            command = f"su {shlex.quote(str(effective_user))} -c {shlex.quote(command)}"
+        if effective_user is not None:
+            user_str = str(effective_user)
+            if user_str == "root":
+                command = f"sudo -n bash -lc {shlex.quote(command)}"
+            elif user_str != "user":
+                command = f"sudo -n -u {shlex.quote(user_str)} bash -lc {shlex.quote(command)}"
         effective_cwd = cwd or self.task_env_config.workdir or self._dockerfile_workdir
         box_cwd: str | None = effective_cwd
         if effective_cwd and effective_cwd.startswith("/"):

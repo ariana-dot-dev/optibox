@@ -5,3 +5,9 @@ evidence/
 .env.*
 !.env.example
 .DS_Store
+
+# Python local artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/

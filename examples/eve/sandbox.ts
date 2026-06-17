@@ -1,4 +1,6 @@
 import { defineSandbox } from "eve/sandbox";
+// Published package users should import from "@asciidev/eve-box".
+// This repo example imports local source so `npm run build` works before `dist/` exists.
 import { asciiBox } from "../../src/index.js";
 
 export default defineSandbox({

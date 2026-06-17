@@ -1,9 +1,23 @@
 {
-  "name": "@ascii-prototypes/consumer-box-agents",
+  "name": "@asciidev/eve-box",
   "version": "0.1.0",
-  "private": true,
+  "description": "Eve sandbox backend for Ascii Box.",
   "type": "module",
-  "description": "Prototype orchestration library for consumer agents on top of Box: shared prewarm, restricted safe mode, per-user Box handoff, and lifecycle control.",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/src",
+    "dist/examples/eve",
+    "README.md",
+    "docs/eve-box-backend.md",
+    "docs/release.md"
+  ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js",
@@ -19,5 +33,8 @@
   },
   "peerDependencies": {
     "eve": "^0.11.2"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

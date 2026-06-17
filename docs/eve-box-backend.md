@@ -1,10 +1,16 @@
 # Eve sandbox backend for Ascii Box
 
-Optibox exports an Eve `SandboxBackend` factory for running Eve sandboxes on Ascii Box (`box.ascii.dev` / the Box public API).
+`@asciidev/eve-box` exports an Eve `SandboxBackend` factory for running Eve sandboxes on Ascii Box (`box.ascii.dev` / the Box public API).
+
+Install from npm:
+
+```bash
+npm install @asciidev/eve-box eve
+```
 
 ```ts title="agent/sandbox.ts"
 import { defineSandbox } from "eve/sandbox";
-import { asciiBox } from "@ascii-prototypes/consumer-box-agents";
+import { asciiBox } from "@asciidev/eve-box";
 
 export default defineSandbox({
   backend: asciiBox({
@@ -18,7 +24,7 @@ Folder layout with seeded files works too:
 
 ```ts title="agent/sandbox/sandbox.ts"
 import { defineSandbox } from "eve/sandbox";
-import { asciiBox } from "@ascii-prototypes/consumer-box-agents";
+import { asciiBox } from "@asciidev/eve-box";
 
 export default defineSandbox({
   backend: asciiBox({
@@ -60,3 +66,7 @@ BOX_API_KEY=box_... npm test
 ```
 
 The implementation was aligned with the current Box docs index (`https://docs.ascii.dev/llms.txt`), the TypeScript SDK guide, and the Box v1 create/command/file endpoint references.
+
+## Publishing
+
+Release instructions for the first public npm version of `@asciidev/eve-box` live in [`release.md`](./release.md).

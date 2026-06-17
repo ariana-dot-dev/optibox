@@ -1,5 +1,7 @@
 # Optibox
 
+Published npm package: `@asciidev/eve-box`.
+
 Optibox is a small TypeScript orchestration layer for consumer agents on Box. It gives users an instant shared response while starting or resuming their private Box, then hands off tool work to your real harness running inside that Box.
 
 ## Minimal wiring
@@ -11,7 +13,7 @@ import {
   BoxHttpClient,
   ConsumerBoxAgentOrchestrator,
   InMemorySessionStore,
-} from "@ascii-prototypes/consumer-box-agents";
+} from "@asciidev/eve-box";
 import { providerEnvForBox } from "./examples/shared.js";
 import { harness as claude } from "./examples/claude-sdk/adapter.js";
 
@@ -113,18 +115,24 @@ stateDiagram-v2
 
 ## Eve sandbox backend
 
+Install the published package as `@asciidev/eve-box`:
+
+```bash
+npm install @asciidev/eve-box eve
+```
+
 Optibox also exports an Eve sandbox backend for Ascii Box:
 
 ```ts
 import { defineSandbox } from "eve/sandbox";
-import { asciiBox } from "@ascii-prototypes/consumer-box-agents";
+import { asciiBox } from "@asciidev/eve-box";
 
 export default defineSandbox({
   backend: asciiBox({ apiKey: process.env.BOX_API_KEY! }),
 });
 ```
 
-See [`docs/eve-box-backend.md`](./docs/eve-box-backend.md) for capability mapping, examples, and current Box/Eve feature gaps.
+See [`docs/eve-box-backend.md`](./docs/eve-box-backend.md) for capability mapping, examples, and current Box/Eve feature gaps. See [`docs/release.md`](./docs/release.md) for first-version npm release steps for `@asciidev/eve-box`.
 
 ## Running the repo
 

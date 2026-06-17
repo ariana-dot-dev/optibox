@@ -5,7 +5,7 @@ async function main() {
   const apiKey = process.env.BOX_API_KEY;
   if (!apiKey) throw new Error("Set BOX_API_KEY for real Box smoke test");
   const box = new BoxHttpClient({ apiKey });
-  const created = await box.create({ name: `consumer-box-agents-smoke-${Date.now()}`, ttlSeconds: 300 });
+  const created = await box.create({ name: `eve-box-smoke-${Date.now()}`, ttlSeconds: 300 });
   console.log(`created ${created.id}`);
   try {
     let current = created;
@@ -21,8 +21,8 @@ async function main() {
       console.log(`command ok on ${created.id}: ${result.stdout}`);
     }
     if (box.writeFile && box.readFile) {
-      await box.writeFile(created.id, "consumer-box-agents-smoke.txt", "box-file-ok\n");
-      const content = await box.readFile(created.id, "consumer-box-agents-smoke.txt");
+      await box.writeFile(created.id, "eve-box-smoke.txt", "box-file-ok\n");
+      const content = await box.readFile(created.id, "eve-box-smoke.txt");
       assert.match(content, /box-file-ok/);
       console.log(`file write/read ok on ${created.id}`);
     }

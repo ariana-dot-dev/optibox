@@ -237,6 +237,8 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly orphanSightings = new Map<string, number>();
   /** In-flight template build (deduped); resolves to the archived template or undefined on failure. */
   private templateBuild: Promise<BoxInfo | undefined> | undefined;
+  /** Per-conversation abort controllers of in-flight turns (a new message aborts priors). */
+  private readonly turnAborts = new Map<string, AbortController[]>();
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -692,6 +694,12 @@ export class ConsumerBoxAgentOrchestrator {
     const key = `${input.userId}:${input.conversationId}`;
     const turnId = randomUUID();
     const turnSequence = this.bumpTurnSequence(key);
+    // A new user message INTERRUPTS any in-flight turn for this conversation:
+    // abort signals flow to the running harnesses (SIGINT, like a human "stop"),
+    // their streams end, and this message runs as the fresh authoritative turn.
+    for (const prior of this.turnAborts.get(key) ?? []) prior.abort();
+    const turnAbort = new AbortController();
+    this.turnAborts.set(key, [...(this.turnAborts.get(key) ?? []), turnAbort]);
     this.lastActivityAt.set(key, Date.now());
     this.registerUnansweredPrompt(key, turnId);
     this.activeTurnCounts.set(key, (this.activeTurnCounts.get(key) ?? 0) + 1);
@@ -736,6 +744,7 @@ export class ConsumerBoxAgentOrchestrator {
         turnSequence,
         statusPromise,
         lockBusyAtSubmit,
+        turnAbort.signal,
       )) {
         if (ev.type === "trace" && ev.stage === "user-box.response.end") boxAgentSettled = true;
         if (ev.type === "turn.done" && Boolean(ev.boxId) && (ev.route === "direct" || ev.route === "bridge") && ev.settled === true) boxAgentSettled = true;
@@ -760,6 +769,8 @@ export class ConsumerBoxAgentOrchestrator {
       // / bootInFlight gates, not by holding the prompt "unanswered".
       this.markPromptAnswered(key, turnId);
       this.lastActivityAt.set(key, Date.now());
+      const aborts = (this.turnAborts.get(key) ?? []).filter((c) => c !== turnAbort);
+      if (aborts.length === 0) this.turnAborts.delete(key); else this.turnAborts.set(key, aborts);
       // If the browser closes/aborts the SSE stream after the shared bridge but
       // before the private handoff completes, the generator is returned early.
       // Always clear the active stream count so a canceled preview request cannot
@@ -841,6 +852,7 @@ export class ConsumerBoxAgentOrchestrator {
     turnSequence: number,
     statusPromise: Promise<UserBoxStatus>,
     lockBusyAtSubmit: boolean,
+    signal?: AbortSignal,
   ): AsyncIterable<ConsumerTurnEvent> {
     const userMessage: TranscriptMessage = {
       role: "user",
@@ -1080,6 +1092,7 @@ export class ConsumerBoxAgentOrchestrator {
       hiddenContext: sharedHidden,
       machine: sharedMachine,
       ...(knownSharedSessionId ? { sessionId: knownSharedSessionId } : {}),
+      ...(signal ? { signal } : {}),
       onSessionId: (id: string) => this.harnessSessions.set(sharedSessionKey, id),
       onComplete: (info: HarnessCompletion) => { sharedCompletion = info; },
     })) {
@@ -1097,6 +1110,15 @@ export class ConsumerBoxAgentOrchestrator {
     if (!emittedSharedText && sharedText) {
       emittedSharedText = sharedText;
       yield { type: "shared.delta", text: sharedText, harness: harness.name, final: false };
+    }
+    if (!emittedSharedText && (signal?.aborted || sharedCompletion?.reason === "aborted")) {
+      // Interrupted by a newer user message: end quietly — the newer turn owns
+      // the conversation now. Not a failure, so no loud throw.
+      if (candidateRound.state === "needed") this.markPrivateRound(key, candidateRound, "suppressed");
+      this.discardPreparedPrivateRuntime(privateReady);
+      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared", settled: false };
+      adaptiveTurnCompleted = true;
+      return;
     }
     if (!emittedSharedText) {
       // Rule 1: the shared agent must always answer something — a full reply or a
@@ -1154,6 +1176,14 @@ export class ConsumerBoxAgentOrchestrator {
       // earlier round's output is never suppressed as stale mid-stream.
       privateResult = await privateReady;
       privateReadyConsumed = true;
+      if (signal?.aborted) {
+        // Superseded while queued: the newer message's turn owns the box now.
+        this.markPrivateRound(key, round, "suppressed");
+        privateResult.release();
+        yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared", settled: false };
+        adaptiveTurnCompleted = true;
+        return;
+      }
       this.markPrivateRound(key, round, "active");
     } catch (error) {
       this.markPrivateRound(key, round, "suppressed");

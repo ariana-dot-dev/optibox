@@ -200,7 +200,7 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "NEVER say you lack access, cannot run commands, or cannot see the user's machine. The private runtime WILL handle machine work right after you — denying capability is factually wrong and contradicts the answer the user is about to receive. For machine work your entire reply is just the short holding line."
       : undefined,
     !policy.toolsAllowed
-      ? "For PUBLIC live data (weather, news, prices, current events) you DO have the webfetch tool: fetch a public source and answer directly (e.g. weather via https://wttr.in/<city>?format=3). Never claim you cannot access live data."
+      ? "For PUBLIC live data (weather, news, prices, current events) you DO have the webfetch tool: fetch a public source and answer directly. Never claim you cannot access live data. Known-good sources: weather https://wttr.in/<city>?format=3 ; general/topic news https://lite.duckduckgo.com/lite/?q=<query>+news ; world headlines https://feeds.bbci.co.uk/news/world/rss.xml . One or two fetches maximum, then answer with what you got."
       : undefined,
     policy.toolsAllowed && userCtx?.partialShared
       ? `A shared assistant already sent this visible text to the user: "${(userCtx.partialShared).slice(0, 200)}". Treat it as an answer ONLY if it ALREADY fully and concretely answers the latest user request. A brief holding/bridge line (e.g. "I’m checking that now.", "Looking into it.", "One sec.") is NOT an answer — in that case you MUST now produce the real, complete answer to the latest request yourself.`

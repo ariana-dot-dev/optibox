@@ -191,6 +191,26 @@ try {
     record("S4 box STOPS after concurrent turns settle", !boxId || stoppedState(finalState), `box=${boxId} state=${finalState}`);
   }
 
+  // ---- S6: follow-up DURING ARCHIVAL — inconvenient, never broken ----
+  {
+    const user = `qa6-${runTag}`;
+    const t1 = await sendTurn(user, "conv", "hey!", TOOL_MODEL);
+    const boxId = t1.billingStarts[0];
+    if (!boxId) {
+      record("S6 mid-archival follow-up", false, "no box booted for the first turn");
+    } else {
+      // Wait for the auto-stop to actually begin archiving, then fire the tool ask.
+      const archState = await waitForBoxState(boxId, (s) => s === "archiving" || s === "archived", 60_000);
+      const t2 = await sendTurn(user, "conv", "use your shell to find your public ipv4 and tell me the exact address", TOOL_MODEL, 420_000);
+      const ip = t2.box.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/)?.[0];
+      record("S6 shared answers immediately during archival", t2.shared.trim().length > 0, `stateAtSend=${archState} shared=${JSON.stringify(t2.shared.slice(0, 60))}`);
+      record("S6 mid-archival tool ask still gets a real box answer", Boolean(ip), `ip=${ip ?? "none"} timedOut=${t2.timedOut} blocked=${t2.blocked.length} errors=${t2.errors.length} in ${(t2.durationMs / 1000).toFixed(1)}s box=${JSON.stringify(t2.box.slice(0, 80))}`);
+      const boxId2 = t2.billingStarts[0] ?? boxId;
+      const finalState = await waitForBoxState(boxId2, stoppedState, 90_000);
+      record("S6 box STOPS again afterwards", stoppedState(finalState), `box=${boxId2} state=${finalState}`);
+    }
+  }
+
   // ---- S5: orphan sweep — a stray running consumer-agent box gets reaped ----
   {
     const created = await boxApi("/boxes", { method: "POST", body: JSON.stringify({ ttlSeconds: 3600 }) });

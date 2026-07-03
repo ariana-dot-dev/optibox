@@ -1698,25 +1698,23 @@ test("a box-bound turn whose box agent has not settled never auto-stops the box"
   await waitFor(() => first.some((e) => e.type === "billing.start"), 200);
 
   // Fire the second tool turn while the first round is still active/unsettled.
+  // It queues its OWN round behind the box lock (never dropped, never duplicated).
   const d2 = (async () => { for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection })) second.push(e); })();
-  await d2;
+  await waitFor(() => second.some((e) => e.type === "shared.delta"), 500);
+  await new Promise((r) => setTimeout(r, 30));
 
-  // The second turn routed to private (it was blocked behind the active round)
-  // but did NOT settle a Box answer, so it must not stop the Box.
-  assert.equal(second.filter((e) => e.type === "user-box.delta").length, 0, "second turn produced no Box answer");
-  assert.ok(!second.some((e) => e.type === "billing.stop"), "blocked second turn must NOT stop the still-needed Box");
-  assert.ok(!second.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "blocked second turn must NOT arm the idle auto-stop");
+  // While the first round is unsettled, NOTHING may stop the box.
+  assert.ok(![...first, ...second].some((e) => e.type === "billing.stop"), "no stream stops the still-needed Box while the first round is unsettled");
+  assert.ok(![...first, ...second].some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "no idle auto-stop is armed while the first round is unsettled");
+  assert.notEqual((await box.get([...box.boxes.keys()][0]!)).state, "archived", "Box is still running under the pending round");
 
-  // Once the first round settles and BOTH streams have ended, nothing genuine is
-  // still pending: the idle countdown may start and the Box stops. A follow-up
-  // whose stream already closed (answered, abandoned, or blocked) must NOT pin a
-  // VM open forever — that permanent-unanswered-prompt leak is exactly why boxes
-  // stayed running for days. Box-settling mid-answer is still protected by the
-  // active-round gate (asserted above), not by holding the prompt "unanswered".
+  // Release the first round: it answers, then the queued second round runs on
+  // the same box, and only after BOTH settle may the box auto-stop.
   releaseFirst();
-  await d1;
+  await Promise.all([d1, d2]);
   assert.ok(first.some((e) => e.type === "user-box.delta" && /first box answer/.test(e.text)), "first box round answers");
-  assert.ok(first.some((e) => e.type === "billing.stop"), "with the round settled and all streams ended, the Box auto-stops instead of leaking");
+  assert.ok(second.some((e) => e.type === "user-box.delta"), "queued second round runs after the first settles (never dropped)");
+  assert.ok([...first, ...second].some((e) => e.type === "billing.stop"), "with both rounds settled and all streams ended, the Box auto-stops instead of leaking");
 });
 
 test("a warm box small-talk follow-up settles via the box <end> sentinel and auto-stops", async () => {

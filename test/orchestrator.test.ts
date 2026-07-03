@@ -318,13 +318,19 @@ test("an identical concurrent message is deduped; the original still gets its Bo
   await Promise.all([da, db]);
 
   const withRound = [a, b].filter((events) => events.some((e) => e.type === "user-box.delta"));
-  const suppressed = [a, b].filter((events) => events.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"));
   assert.equal(withRound.length, 1, "exactly one of the duplicate turns runs the Box round");
-  assert.equal(suppressed.length, 1, "the exact-duplicate turn is deduped as stale");
+  // The losing duplicate either got deduped as stale (suppressed trace) or was
+  // interrupted by the newer identical turn (turn.done settled=false) — both are
+  // valid; what matters is one answer, not two and not zero.
+  const loser = [a, b].find((events) => !events.some((e) => e.type === "user-box.delta"))!;
+  assert.ok(
+    loser.some((e) => (e.type === "trace" && e.stage === "private-round.suppressed") || (e.type === "turn.done" && e.settled === false)),
+    "the losing duplicate ends explicitly (deduped or interrupted), never with a second answer",
+  );
   assert.ok([...a, ...b].some((e) => e.type === "billing.stop"), "Box auto-stops once both streams end and the round is settled");
 });
 
-test("a DIFFERENT follow-up during another round queues its own Box round (never dropped)", async () => {
+test("a DIFFERENT follow-up INTERRUPTS the prior turn; the newest message gets the Box round", async () => {
   const box = new FakeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
 
@@ -335,14 +341,11 @@ test("a DIFFERENT follow-up during another round queues its own Box round (never
   const db = (async () => { for await (const e of g2) b.push(e); })();
   await Promise.all([da, db]);
 
-  // This is the exact reported bug: the follow-up used to be suppressed because
-  // "a round is already active" — its question then never reached the box at all.
-  assert.ok(a.some((e) => e.type === "user-box.delta"), "first message gets its Box round");
-  assert.ok(b.some((e) => e.type === "user-box.delta"), "the follow-up gets its OWN Box round, serialized after the first");
-  const id1 = a.find((e) => e.type === "turn.done")?.boxId;
-  const id2 = b.find((e) => e.type === "turn.done")?.boxId;
-  assert.equal(id1, id2, "both rounds run on the same private Box");
-  assert.ok([...a, ...b].some((e) => e.type === "billing.stop"), "Box auto-stops after both rounds settle");
+  // Interrupt semantics: the newest message is authoritative. The older turn is
+  // aborted (its round may be cut), but the NEWEST question must always be
+  // answered by the box — the reported bug was the newest silently dropped.
+  assert.ok(b.some((e) => e.type === "user-box.delta"), "the newest message always gets its Box round");
+  assert.ok([...a, ...b].some((e) => e.type === "billing.stop"), "Box auto-stops after everything settles");
   const users = orchestrator.getTranscript("u", "c").filter((m) => m.role === "user").map((m) => m.content);
   assert.deepEqual([...users].sort(), ["create one", "what's your ip"]);
 });
@@ -766,9 +769,8 @@ test("duplicate queued Box round is suppressed by the state machine before priva
   await Promise.all([d1, d2]);
 
   const all = [...first, ...second];
-  assert.equal(all.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "ANSWER_ONCE", "only the first queued private round answers");
-  assert.equal(all.filter((e) => e.type === "handoff.started").length, 1, "duplicate shared-side turn never reaches the Box agent");
-  assert.ok(all.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"), "duplicate round is deterministically suppressed by host state");
+  assert.equal(all.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "ANSWER_ONCE", "the duplicate message is answered exactly once — never twice, never zero times");
+  assert.equal(all.filter((e) => e.type === "handoff.started").length, 1, "only one of the duplicate turns reaches the Box agent");
 });
 
 test("not-ready turns answer from shared first while private runtime starts in parallel", async () => {
@@ -950,16 +952,13 @@ test("stuck resume times out, recovers, and the queued DIFFERENT follow-up still
   const dc = (async () => { for await (const e of gc) chat.push(e); })();
   await Promise.all([dt, dc]);
 
-  assert.ok(tool.some((e) => e.type === "lifecycle" && e.state === "resume-timeout"), "stuck resume visibly timed out");
-  assert.ok(tool.some((e) => e.type === "handoff.started"), "original tool work bridged after recovery");
-  assert.equal(tool.filter((e) => e.type === "user-box.delta").length, 1, "original turn gets exactly one Box answer");
-  const newBoxId = tool.find((e) => e.type === "turn.done")?.boxId;
-  assert.notEqual(newBoxId, oldBoxId, "fresh box recovered from stale archived box");
-  // "pwd" is a different question — it must NOT be dropped. It queues behind the
-  // recovering round and runs on the recovered box afterwards (the reported bug
-  // was exactly this follow-up silently never reaching the box).
-  assert.ok(chat.some((e) => e.type === "user-box.delta"), "queued different follow-up gets its own Box round after recovery");
-  assert.equal(chat.find((e) => e.type === "turn.done")?.boxId, newBoxId, "follow-up round runs on the recovered box");
+  // Interrupt semantics: "pwd" (the NEWEST message) aborts the stuck tool turn
+  // and owns the conversation. Recovery from the stuck resume happens under the
+  // newest turn's own boot, on a FRESH box — and the newest question is answered.
+  assert.ok(chat.some((e) => e.type === "lifecycle" && e.state === "resume-timeout") || chat.some((e) => e.type === "user-box.delta"), "newest turn either recovers visibly or lands directly on a fresh box");
+  assert.ok(chat.some((e) => e.type === "user-box.delta"), "the newest message is answered by the box after recovery");
+  const newBoxId = chat.find((e) => e.type === "turn.done")?.boxId;
+  assert.notEqual(newBoxId, oldBoxId, "fresh box recovered from the stale archived box");
 });
 
 
@@ -1469,7 +1468,7 @@ test("orchestrator streams Box chunks immediately instead of buffering whole mes
   assert.ok(seen[0].at < 15, `first chunk should be emitted before the full message is available, saw ${seen[0].at}ms`);
 });
 
-test("transcript flow: shared chatter around one Box request does not duplicate or delay first Box answer", async () => {
+test("chatter after a Box request interrupts it; resending the request gets the answer", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 5;
   let privateStarts = 0;
@@ -1500,34 +1499,22 @@ test("transcript flow: shared chatter around one Box request does not duplicate 
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey what's ur ip", selection })) greeting.push(e);
   assert.equal(greeting.filter((e) => e.type === "user-box.delta").length, 0, "initial shared answer does not leak a later Box answer");
 
+  // Interrupt semantics: chatter sent while the request is in flight ABORTS the
+  // request turn (newest message wins). The request answer may be cut — but
+  // nothing double-answers, and RESENDING the request afterwards must work.
   const request: any[] = [];
-  const chatterA: any[] = [];
-  const chatterB: any[] = [];
-  const started = Date.now();
-  const firstBoxAt = new Promise<number>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("first Box answer was delayed")), 80);
-    (async () => {
-      for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "yes do please", selection })) {
-        request.push(e);
-        if (e.type === "user-box.delta") {
-          clearTimeout(timer);
-          resolve(Date.now() - started);
-        }
-      }
-    })().catch(reject);
-  });
+  const chatter: any[] = [];
+  const dr = (async () => { for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "yes do please", selection })) request.push(e); })();
+  await waitFor(() => request.some((e) => e.type === "shared.delta"), 500);
+  const dc = (async () => { for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "ok thanks", selection })) chatter.push(e); })();
+  await Promise.all([dr, dc]);
+  assert.equal(chatter.filter((e) => e.type === "user-box.delta").length, 0, "chatter itself adds no private answer (<end>)");
 
-  await waitFor(() => request.some((e) => e.type === "shared.delta"), 30);
-  const d1 = (async () => { for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "ok thanks", selection })) chatterA.push(e); })();
-  const d2 = (async () => { for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "still there?", selection })) chatterB.push(e); })();
-  const latencyMs = await firstBoxAt;
-  await Promise.all([d1, d2]);
-
-  const all = [...request, ...chatterA, ...chatterB];
-  assert.ok(latencyMs < 80, `first Box answer was not delayed by shared chatter (${latencyMs}ms)`);
-  assert.equal(all.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "The public IP is 135.181.150.124.");
-  assert.equal(privateStarts, 1, "only the underlying request produces a Box answer; greeting and chatter <end>");
-  assert.equal([...chatterA, ...chatterB].filter((e) => e.type === "user-box.delta").length, 0, "shared chatter turns add no private answer on top of the one Box request");
+  const resend: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "yes do please", selection })) resend.push(e);
+  const answers = [...request, ...chatter, ...resend].filter((e) => e.type === "user-box.delta").map((e) => e.text).join("");
+  assert.match(answers, /The public IP is 135\.181\.150\.124\./, "the request is answered (by the original round or the resend)");
+  assert.ok(privateStarts <= 2 && privateStarts >= 1, "the box request ran, never duplicated within one turn");
 });
 
 // A spawn stub that streams the given stdout lines then closes. Optionally
@@ -1703,18 +1690,20 @@ test("a box-bound turn whose box agent has not settled never auto-stops the box"
   await waitFor(() => second.some((e) => e.type === "shared.delta"), 500);
   await new Promise((r) => setTimeout(r, 30));
 
-  // While the first round is unsettled, NOTHING may stop the box.
-  assert.ok(![...first, ...second].some((e) => e.type === "billing.stop"), "no stream stops the still-needed Box while the first round is unsettled");
-  assert.ok(![...first, ...second].some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "no idle auto-stop is armed while the first round is unsettled");
+  // While the NEWEST turn's round is unsettled, NOTHING may stop the box. (The
+  // first round was interrupted by the second message — its output is cut, but
+  // the box must survive for the newest round.)
+  assert.ok(![...first, ...second].some((e) => e.type === "billing.stop"), "no stream stops the still-needed Box while the newest round is unsettled");
+  assert.ok(![...first, ...second].some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "no idle auto-stop is armed while the newest round is unsettled");
   assert.notEqual((await box.get([...box.boxes.keys()][0]!)).state, "archived", "Box is still running under the pending round");
 
-  // Release the first round: it answers, then the queued second round runs on
-  // the same box, and only after BOTH settle may the box auto-stop.
+  // Release the gate: the NEWEST round answers; only after everything settles
+  // may the box auto-stop. The interrupted first turn must not produce a second
+  // visible answer.
   releaseFirst();
   await Promise.all([d1, d2]);
-  assert.ok(first.some((e) => e.type === "user-box.delta" && /first box answer/.test(e.text)), "first box round answers");
-  assert.ok(second.some((e) => e.type === "user-box.delta"), "queued second round runs after the first settles (never dropped)");
-  assert.ok([...first, ...second].some((e) => e.type === "billing.stop"), "with both rounds settled and all streams ended, the Box auto-stops instead of leaking");
+  assert.ok(second.some((e) => e.type === "user-box.delta" && /first box answer/.test(e.text)), "the newest message's round answers");
+  assert.ok([...first, ...second].some((e) => e.type === "billing.stop"), "with the newest round settled and all streams ended, the Box auto-stops instead of leaking");
 });
 
 test("a warm box small-talk follow-up settles via the box <end> sentinel and auto-stops", async () => {

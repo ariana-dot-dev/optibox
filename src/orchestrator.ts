@@ -883,6 +883,21 @@ export class ConsumerBoxAgentOrchestrator {
     // questions: the active round carried the OLDER message, so the newer one
     // never reached the box at all.) Only an exact duplicate of a message the box
     // already answered (or one still pending) is stale.
+    // If this turn is the NEWEST for the conversation, every pending round
+    // belongs to a turn we just interrupted — suppress them so (a) their late
+    // output is discarded as stale and (b) they free the fingerprint space
+    // (otherwise a resend of the same text would dedupe against a dead round and
+    // be answered by NOBODY). An older turn racing through here skips this and
+    // instead dedupes against the newest turn's fresh round — both orders
+    // converge on exactly one live round owned by the newest message.
+    if (this.turnSequences.get(key) === turnSequence) {
+      const state = this.privateRequests.get(key);
+      if (state) {
+        for (const round of state.rounds.values()) {
+          if (round.state === "needed" || round.state === "active") this.markPrivateRound(key, round, "suppressed");
+        }
+      }
+    }
     const pendingBeforeSubmit = this.activePrivateRound(key);
     const candidateRound: PrivateRequestRound | undefined = this.reservePrivateRound(key, input.message);
     const roundBlockedAtSubmit = candidateRound.state === "stale";
@@ -1033,6 +1048,7 @@ export class ConsumerBoxAgentOrchestrator {
             "",
             privateResult.status,
             round,
+            signal,
           );
           adaptiveTurnCompleted = true;
           return;
@@ -1234,6 +1250,7 @@ export class ConsumerBoxAgentOrchestrator {
         sharedText,
         privateResult.status,
         round,
+        signal,
       );
       adaptiveTurnCompleted = true;
     } finally {
@@ -1265,6 +1282,7 @@ export class ConsumerBoxAgentOrchestrator {
     sharedText: string,
     resolvedStatus: UserBoxStatus,
     round: PrivateRequestRound,
+    signal?: AbortSignal,
   ): AsyncIterable<ConsumerTurnEvent> {
     // This round may have queued behind an earlier one; the conversation moved
     // on meanwhile (the earlier round's box answer, newer shared replies). Run
@@ -1339,6 +1357,7 @@ export class ConsumerBoxAgentOrchestrator {
       sharedText,
       resolvedStatus.kind === "ready" ? "direct" : "bridge",
       round,
+      signal,
     );
   }
 
@@ -1725,6 +1744,7 @@ export class ConsumerBoxAgentOrchestrator {
     partialShared: string,
     route: "direct" | "bridge",
     round: PrivateRequestRound,
+    signal?: AbortSignal,
   ): AsyncIterable<ConsumerTurnEvent> {
     const recap = this.lastRecap(transcript);
     const staleDuplicateRequest = round.state === "stale";
@@ -1803,6 +1823,7 @@ export class ConsumerBoxAgentOrchestrator {
       machine: userMachine,
       partialShared,
       ...(knownUserBoxSessionId ? { sessionId: knownUserBoxSessionId } : {}),
+      ...(signal ? { signal } : {}),
       onSessionId: (id: string) => this.harnessSessions.set(userBoxSessionKey, id),
       onComplete: (info: HarnessCompletion) => { completion = info; },
     });

@@ -113,6 +113,12 @@ export interface RealCliHarnessSpec {
   prepare?: (runtime: HarnessRuntime) => Promise<void>;
   /** Override the env vars this harness requires (defaults to the provider key vars). */
   requiredEnv?: string[];
+  /**
+   * Model override for the SHARED (no-tools) surface only. The shared line needs
+   * speed, not depth — e.g. box on sonnet, shared on haiku (measured: ~4.2s vs
+   * ~7.2s to first text). The Box surface always uses the user's selection.
+   */
+  sharedModel?: { provider?: string; model: string };
 }
 
 export interface RealCliHarnessDeps {
@@ -147,7 +153,11 @@ function providerRequiredEnv(provider: string): string {
  */
 export function opencodeNoToolEnv(toolsAllowed: boolean): Record<string, string> {
   if (toolsAllowed) return { OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { "*": "allow" } }) };
-  return { OPENCODE_CONFIG_CONTENT: JSON.stringify({ tools: { "*": false } }) };
+  // Shared surface: all PRIVATE-machine tools structurally removed, but webfetch
+  // stays enabled — public live data (weather, news, prices) is not user-machine
+  // state, and the shared agent answering it directly beats a pointless bridge.
+  // permission allow is required or the surviving tool hangs on a TTY-less prompt.
+  return { OPENCODE_CONFIG_CONTENT: JSON.stringify({ tools: { "*": false, webfetch: true }, permission: { "*": "allow" } }) };
 }
 
 export function buildCommonAssistantKnowledge(): string {
@@ -186,6 +196,12 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "For that holding line, do not apologize, do not claim results, do not over-explain, and do not mention Box, sandboxes, framework/runtime internals, fixed IPs, or being a conversational AI."
       : undefined,
     !policy.toolsAllowed ? "A holding line is ONLY ever for private-machine work in flight. Never use one for anything you could answer yourself — when in doubt, just answer." : undefined,
+    !policy.toolsAllowed
+      ? "NEVER say you lack access, cannot run commands, or cannot see the user's machine. The private runtime WILL handle machine work right after you — denying capability is factually wrong and contradicts the answer the user is about to receive. For machine work your entire reply is just the short holding line."
+      : undefined,
+    !policy.toolsAllowed
+      ? "For PUBLIC live data (weather, news, prices, current events) you DO have the webfetch tool: fetch a public source and answer directly (e.g. weather via https://wttr.in/<city>?format=3). Never claim you cannot access live data."
+      : undefined,
     policy.toolsAllowed && userCtx?.partialShared
       ? `A shared assistant already sent this visible text to the user: "${(userCtx.partialShared).slice(0, 200)}". Treat it as an answer ONLY if it ALREADY fully and concretely answers the latest user request. A brief holding/bridge line (e.g. "I’m checking that now.", "Looking into it.", "One sec.") is NOT an answer — in that case you MUST now produce the real, complete answer to the latest request yourself.`
       : undefined,
@@ -396,6 +412,9 @@ export function realCliHarness(spec: RealCliHarnessSpec, deps: RealCliHarnessDep
       const runtime = createSharedRuntime();
       if (runtime.location !== "shared-infra") throw new Error("shared runtime must report location 'shared-infra'");
       const policy: HarnessPhasePolicy = { phase: "shared", toolsAllowed: false, runtime: "shared-infra" };
+      if (spec.sharedModel) {
+        ctx = { ...ctx, selection: { ...ctx.selection, ...(spec.sharedModel.provider ? { provider: spec.sharedModel.provider } : {}), model: spec.sharedModel.model } };
+      }
       for await (const chunk of runHarnessTurn(spec, runtime, ctx, policy)) {
         yield typeof chunk === "string" ? chunk : chunk.text;
       }

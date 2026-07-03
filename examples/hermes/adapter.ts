@@ -19,6 +19,9 @@ export const spec: RealCliHarnessSpec = {
     { provider: "openrouter", model: "nousresearch/hermes-4-70b", label: "Hermes 4 70B (chat only, no tools)" },
   ],
   outputMode: "opencode-json",
+  // The shared holding/answer line needs speed, not depth: haiku reaches first
+  // text in ~4.2s vs sonnet's ~7.2s (measured via openrouter).
+  sharedModel: { model: "anthropic/claude-haiku-4.5" },
   // Same OpenCode session model: capture `sessionID` on turn 1, resume with `-s`.
   sessionStrategy: "capture",
   buildArgv: ({ prompt, model, resumeSessionId, toolsAllowed }) => [

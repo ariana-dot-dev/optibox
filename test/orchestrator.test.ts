@@ -1347,7 +1347,7 @@ test("every adapter structurally disables tools when toolsAllowed is false", asy
       provider: "openai",
       assertNoTools: (_argv, env) => {
         assert.ok(env?.OPENCODE_CONFIG_CONTENT, "opencode no-tool env present");
-        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { tools: { "*": false } });
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { tools: { "*": false, webfetch: true }, permission: { "*": "allow" } });
       },
       assertTools: (_argv, env) => {
         // Tools on: must auto-approve so `opencode run` doesn't block on a TTY-less
@@ -1361,7 +1361,7 @@ test("every adapter structurally disables tools when toolsAllowed is false", asy
       provider: "openrouter",
       assertNoTools: (_argv, env) => {
         assert.ok(env?.OPENCODE_CONFIG_CONTENT, "hermes no-tool env present");
-        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { tools: { "*": false } });
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { tools: { "*": false, webfetch: true }, permission: { "*": "allow" } });
       },
       assertTools: (_argv, env) => {
         assert.ok(env?.OPENCODE_CONFIG_CONTENT, "hermes tools-on env present");

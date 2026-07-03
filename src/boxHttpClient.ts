@@ -104,12 +104,23 @@ export class BoxHttpClient implements BoxClient {
     return json.box ?? { ok: json.ok };
   }
 
+  async fork(boxId: string): Promise<BoxInfo> {
+    const json = await this.request<{ box?: BoxInfo; id?: string }>(`/boxes/${encodeURIComponent(boxId)}/fork`, { method: "POST", body: JSON.stringify({}) });
+    const box = json.box ?? (json.id ? await this.get(json.id) : undefined);
+    if (!box) throw new BoxApiError(500, "fork_no_box", `fork of ${boxId} returned no box`);
+    return box;
+  }
+
   async command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number; env?: Record<string, string> }): Promise<CommandResult> {
     const prefix = input.env && Object.keys(input.env).length
       ? Object.entries(input.env).map(([k, v]) => `export ${k}=${shq(v)}; `).join("")
       : "";
     const command = prefix ? `${prefix}${input.command}` : input.command;
-    const json = await this.request<{ result?: CommandResult; exitCode?: number; stdout?: string; stderr?: string }>(`/boxes/${encodeURIComponent(boxId)}/commands`, { method: "POST", body: JSON.stringify({ command, cwd: input.cwd, timeoutSeconds: input.timeoutMs ? Math.ceil(input.timeoutMs / 1000) : undefined }) });
+    // The Box API documents timeoutSeconds range 1-60 (default 30). Clamp instead
+    // of sending an out-of-range value; anything longer must run detached (nohup)
+    // and be polled — which is exactly how runHarness executes agent loops.
+    const timeoutSeconds = input.timeoutMs ? Math.min(60, Math.max(1, Math.ceil(input.timeoutMs / 1000))) : undefined;
+    const json = await this.request<{ result?: CommandResult; exitCode?: number; stdout?: string; stderr?: string }>(`/boxes/${encodeURIComponent(boxId)}/commands`, { method: "POST", body: JSON.stringify({ command, cwd: input.cwd, timeoutSeconds }) });
     return json.result ?? { exitCode: json.exitCode ?? 0, stdout: json.stdout ?? "", stderr: json.stderr ?? "" };
   }
 

@@ -88,11 +88,3 @@ export function stripHiddenContext(text: string): string {
 function escapeXml(s: string): string {
   return s.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c] as string));
 }
-
-/**
- * Legacy helper for callers that still need a cheap UI hint. The orchestrator's
- * primary routing is shared-model selected, not this regexp.
- */
-export function detectToolIntent(message: string): boolean {
-  return /\b(run|execute|shell|bash|terminal|command|file|create|write|edit|read|inspect|check|list|install|curl|hostname|ip address|ipv[46]|cpu|core|nproc|pwd|directory)\b/i.test(message);
-}

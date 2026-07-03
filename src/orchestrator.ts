@@ -32,7 +32,6 @@ export type ConsumerTurnEventBody =
   | { type: "trace"; stage: string; message: string; harness?: string; model?: string; boxId?: string; data?: Record<string, unknown> }
   | { type: "turn.blocked"; stage: string; message: string; retryable: boolean; harness?: string; model?: string; boxId?: string }
   | { type: "shared.delta"; text: string; harness: string; final?: boolean }
-  | { type: "shared.larp"; harness: string; toolIntent: boolean; note: string }
   | {
       type: "context.injected";
       scope: "shared" | "user-box";
@@ -148,6 +147,7 @@ export type UserBoxStatus =
 type UserBoxBootAction =
   | "already-ready"
   | "create-requested"
+  | "fork-requested"
   | "resume-requested"
   | "existing-boot"
   | "adopt-ready"
@@ -207,7 +207,6 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly transcripts = new Map<string, TranscriptMessage[]>();
   /** boxId -> epoch ms when billing started (set once while running, cleared on stop). */
   private readonly billing = new Map<string, number>();
-  private sharedBoxPromise?: Promise<BoxInfo>;
   /** Per-conversation in-flight private-box startup/resume, used to dedupe foreground handoffs. */
   private readonly userBoxStarts = new Map<string, Promise<BoxInfo>>();
   /** Per-conversation FIFO mutex for private Box work. */
@@ -228,6 +227,16 @@ export class ConsumerBoxAgentOrchestrator {
    * the id the CLI emits on turn 1 (capture strategy).
    */
   private readonly harnessSessions = new Map<string, string>();
+  /** boxId -> the conversation that owns it, so the reaper can stop it by user/conversation. */
+  private readonly boxOwners = new Map<string, { userId: string; conversationId: string; key: string }>();
+  /** key -> last time this conversation had any turn activity (submit or stream end). */
+  private readonly lastActivityAt = new Map<string, number>();
+  /** Background idle-box reaper handle (see OrchestratorOptions.idleReaperIntervalMs). */
+  private reaper: ReturnType<typeof setInterval> | undefined;
+  /** Orphan candidates first sighted by the reaper (boxId -> epoch ms), for the grace window. */
+  private readonly orphanSightings = new Map<string, number>();
+  /** In-flight template build (deduped); resolves to the archived template or undefined on failure. */
+  private templateBuild: Promise<BoxInfo | undefined> | undefined;
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -235,6 +244,97 @@ export class ConsumerBoxAgentOrchestrator {
     this.harnesses = new Map(options.harnesses.map((h) => [h.name, h]));
     if (this.harnesses.size === 0)
       throw new Error("At least one harness adapter is required");
+    const reaperMs = options.idleReaperIntervalMs;
+    if (typeof reaperMs === "number" && reaperMs > 0) {
+      this.reaper = setInterval(() => { void this.reapIdleBoxes(); }, reaperMs);
+      this.reaper.unref?.();
+    }
+  }
+
+  /** Stop the background reaper (call when disposing a long-lived orchestrator). */
+  dispose(): void {
+    if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
+  }
+
+  /**
+   * Force-stop any billable Box whose conversation has been idle past
+   * autoStopIdleMs. Runs on a timer, independent of any request stream, so a box
+   * cannot be left running by an abandoned/blocked/hung turn. Idempotent with the
+   * request-driven auto-stop: whichever fires first wins; stop is a no-op after.
+   */
+  private async reapIdleBoxes(): Promise<void> {
+    const now = Date.now();
+    const idleThreshold = this.options.autoStopIdleMs ?? 5000;
+    const hardCeilingMs = this.options.maxBillingAgeMs ?? 30 * 60_000;
+    for (const [boxId, owner] of [...this.boxOwners]) {
+      const since = this.billing.get(boxId);
+      if (since === undefined) { this.boxOwners.delete(boxId); continue; }
+      const key = owner.key;
+      // A box billing past the absolute ceiling is force-stopped no matter what:
+      // a turn that has "run" for half an hour is stuck, not working, and must
+      // never pin a VM for hours/days. This is the last-resort leak guard.
+      const overHardCeiling = now - since >= hardCeilingMs;
+      if (!overHardCeiling) {
+        // Otherwise never reap a genuinely busy conversation: an active stream, an
+        // owed private round, or an in-flight boot all mean real work is happening.
+        if (this.activeTurnCounts.has(key) || this.activePrivateRound(key) || this.userBoxStarts.has(key)) continue;
+        if (now - (this.lastActivityAt.get(key) ?? now) < idleThreshold) continue;
+      }
+      await this.reapBox(boxId, key, overHardCeiling);
+    }
+    await this.reapOrphanBoxes(now);
+  }
+
+  /**
+   * Stop running boxes this PROCESS doesn't know about but that match our naming
+   * (options.orphanBoxName). These exist after a server restart (in-memory billing
+   * is gone) or from older builds that leaked never-stopping boxes. A box must be
+   * sighted running-and-unbilled twice, a grace window apart, before it is stopped
+   * — so a box another code path is actively booting right now is never sniped.
+   */
+  private async reapOrphanBoxes(now: number): Promise<void> {
+    const isOurs = this.options.orphanBoxName;
+    if (!isOurs || !this.options.box.list) return;
+    // Two sweep intervals (or the idle window, whichever is longer): long enough
+    // that a box WE are booting right now has registered billing (that happens at
+    // boot-ack, before the box is even ready), short enough to matter.
+    const graceMs = Math.max(2 * (this.options.idleReaperIntervalMs ?? 15_000), this.options.autoStopIdleMs ?? 5000);
+    const boxes = await this.options.box.list().catch(() => []);
+    const seenIds = new Set<string>();
+    for (const box of boxes) {
+      if (!box.name || !isOurs(box.name)) continue;
+      // Never reap the template: it legitimately runs unbilled during its
+      // one-time background build (its own TTL is the leak backstop).
+      if (this.options.userBoxTemplate && box.name === this.options.userBoxTemplate.name) continue;
+      if (box.state === "archived" || box.state === "archiving" || box.state === "stopped") continue;
+      if (this.billing.has(box.id)) { this.orphanSightings.delete(box.id); continue; }
+      seenIds.add(box.id);
+      const firstSeen = this.orphanSightings.get(box.id);
+      if (firstSeen === undefined) { this.orphanSightings.set(box.id, now); continue; }
+      if (now - firstSeen < graceMs) continue;
+      this.orphanSightings.delete(box.id);
+      await this.options.box.stop(box.id).catch(() => undefined);
+    }
+    // Drop sightings for boxes that disappeared or stopped on their own.
+    for (const id of [...this.orphanSightings.keys()]) if (!seenIds.has(id)) this.orphanSightings.delete(id);
+  }
+
+  /** Force-stop one specific billable box under the conversation lock. */
+  private async reapBox(boxId: string, key: string, force = false): Promise<void> {
+    const release = await this.acquireLock(this.boxLocks, key);
+    try {
+      // Re-check under the lock: a turn may have started using the box while we
+      // waited. Stop the box directly by id — it may be an orphaned prior box
+      // (e.g. a stuck resume), not the conversation's current session box. When
+      // `force` (over the hard billing ceiling) we stop even a "busy" conversation.
+      if (!force && (this.activeTurnCounts.has(key) || this.activePrivateRound(key) || this.userBoxStarts.has(key))) return;
+      if (!this.billing.has(boxId)) return;
+      this.billing.delete(boxId);
+      this.boxOwners.delete(boxId);
+      await this.options.box.stop(boxId).catch(() => undefined);
+    } finally {
+      release();
+    }
   }
 
   listHarnesses(): HarnessAdapter[] {
@@ -274,21 +374,6 @@ export class ConsumerBoxAgentOrchestrator {
         `Unknown harness '${name}'. Registered: ${[...this.harnesses.keys()].join(", ")}`,
       );
     return h;
-  }
-
-  async ensureSharedBox(): Promise<BoxInfo> {
-    this.sharedBoxPromise ??= this.options.box
-      .create({
-        name: this.options.sharedBoxName ?? "consumer-agent-shared-prewarm",
-        ttlSeconds: null,
-      })
-      .then((box) => this.waitUntilReady(box.id, "shared"))
-      .then((box) =>
-        box.archiveAfter === null
-          ? box
-          : this.options.box.update(box.id, { ttlSeconds: null }),
-      );
-    return this.sharedBoxPromise;
   }
 
   /**
@@ -457,11 +542,26 @@ export class ConsumerBoxAgentOrchestrator {
     conversationId: string,
     onBootAck?: (ack: UserBoxBootAck) => void,
   ): Promise<BoxInfo> {
-    const created = await this.options.box.create({
-      name:
-        this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`,
-      ttlSeconds: this.options.userBoxTtlSeconds ?? 3600,
-    });
+    const name = this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`;
+    const ttlSeconds = this.options.userBoxTtlSeconds ?? 3600;
+    // A brand-new box has a brand-new harness session store. Carrying an old
+    // box's native session id onto it makes `opencode run -s <unknown-id>` hang
+    // forever (cross-store resume). Drop user-box session ids for this
+    // conversation; the full transcript still rides in the hidden context.
+    const key = `${userId}:${conversationId}`;
+    for (const sessionKey of [...this.harnessSessions.keys()]) {
+      if (sessionKey.startsWith(`${key}:`) && sessionKey.endsWith(":user-box")) this.harnessSessions.delete(sessionKey);
+    }
+    // Fast path: fork the pre-installed template snapshot (restore ≈ constant
+    // ~16s) instead of creating an empty box and npm-installing the harness
+    // inside it (~15-40s, npm-registry variant). Falls back to plain create on
+    // any fork problem — the per-turn bin check still installs on demand.
+    const forked = await this.forkFromTemplate(name, ttlSeconds, onBootAck).catch(() => undefined);
+    if (forked) {
+      await this.sessions.put({ userId, conversationId, boxId: forked.id, lastSeenAt: Date.now() });
+      return forked;
+    }
+    const created = await this.options.box.create({ name, ttlSeconds });
     onBootAck?.({ action: "create-requested", box: created });
     const ready = await this.waitUntilReady(created.id, "create");
     await this.sessions.put({
@@ -471,6 +571,59 @@ export class ConsumerBoxAgentOrchestrator {
       lastSeenAt: Date.now(),
     });
     return ready;
+  }
+
+  /** Fork a new user box from the template snapshot; undefined when unavailable. */
+  private async forkFromTemplate(
+    name: string,
+    ttlSeconds: number | null,
+    onBootAck?: (ack: UserBoxBootAck) => void,
+  ): Promise<BoxInfo | undefined> {
+    const template = this.options.userBoxTemplate;
+    if (!template || !this.options.box.fork || !this.options.box.list) return undefined;
+    // Only an ARCHIVED/STOPPED template may serve forks: its snapshot then
+    // provably contains the finished install. A still-running template can
+    // report snapshotAvailable from a snapshot taken BEFORE the install.
+    const existing = (await this.options.box.list().catch(() => []))
+      .find((b) => b.name === template.name && (b.state === "archived" || b.state === "stopped"));
+    if (!existing) {
+      // No template yet: build it in the background (deduped) and let THIS boot
+      // take the legacy path — the user should not wait on a template build.
+      this.templateBuild ??= this.buildTemplateBox().catch(() => undefined);
+      return undefined;
+    }
+    const forked = await this.options.box.fork(existing.id);
+    await this.options.box.update(forked.id, { name, ttlSeconds }).catch(() => undefined);
+    onBootAck?.({ action: "fork-requested", box: forked });
+    return this.waitUntilReady(forked.id, "fork");
+  }
+
+  /** One-time background build: create -> install harness deps -> stop (snapshot). */
+  private async buildTemplateBox(): Promise<BoxInfo | undefined> {
+    const template = this.options.userBoxTemplate;
+    if (!template) return undefined;
+    let boxId: string | undefined;
+    try {
+      const created = await this.options.box.create({ name: template.name, ttlSeconds: 3600 });
+      boxId = created.id;
+      const ready = await this.waitUntilReady(created.id, "template-create");
+      const installed = await this.options.box.command(ready.id, { command: template.installCmd, timeoutMs: 55_000 });
+      if (installed.exitCode !== 0) {
+        throw new Error(`template install failed (exit=${installed.exitCode}): ${installed.stderr.trim().slice(-300)}`);
+      }
+      // The platform refuses to stop a box until it has a successful snapshot
+      // ("no successful snapshot in the last 30 minutes" on young boxes), so a
+      // single stop right after install can be rejected. Retry until accepted.
+      await this.stopWithRetry(ready.id, "template-stop");
+      return await this.waitUntilArchived(ready.id, "template-snapshot", 300_000);
+    } catch (error) {
+      // This runs detached from any turn stream, so "loud" = the server log, and
+      // the box must ALWAYS be stopped on failure or it runs until its TTL.
+      if (boxId) await this.options.box.stop(boxId).catch(() => undefined);
+      this.templateBuild = undefined; // allow a later boot to retry the build
+      console.error(`[optibox] template box build failed${boxId ? ` (box ${boxId}, stop requested)` : ""}:`, error instanceof Error ? (error.stack ?? error.message) : String(error));
+      throw error instanceof Error ? error : new Error(String(error));
+    }
   }
 
   private async clearSession(userId: string, conversationId: string): Promise<void> {
@@ -539,6 +692,7 @@ export class ConsumerBoxAgentOrchestrator {
     const key = `${input.userId}:${input.conversationId}`;
     const turnId = randomUUID();
     const turnSequence = this.bumpTurnSequence(key);
+    this.lastActivityAt.set(key, Date.now());
     this.registerUnansweredPrompt(key, turnId);
     this.activeTurnCounts.set(key, (this.activeTurnCounts.get(key) ?? 0) + 1);
     // Do not await the remote Box status before emitting. A slow Box API check
@@ -597,7 +751,15 @@ export class ConsumerBoxAgentOrchestrator {
         yield { ...ev, turnId };
       }
     } finally {
-      if (promptAnswered || boxAgentSettled) this.markPromptAnswered(key, turnId);
+      // The turn's stream has ended — clean turn.done, a block, an abort, or a
+      // client disconnect. Whatever happened, the user is no longer waiting on
+      // THIS prompt, so it must never keep blocking idle auto-stop. (A prompt
+      // that dangled forever — e.g. a turn queued behind an active round whose
+      // SSE the client abandoned — was exactly what kept boxes running for days.)
+      // Box-settling is protected separately by the roundOwed / activePrivateRound
+      // / bootInFlight gates, not by holding the prompt "unanswered".
+      this.markPromptAnswered(key, turnId);
+      this.lastActivityAt.set(key, Date.now());
       // If the browser closes/aborts the SSE stream after the shared bridge but
       // before the private handoff completes, the generator is returned early.
       // Always clear the active stream count so a canceled preview request cannot
@@ -693,7 +855,6 @@ export class ConsumerBoxAgentOrchestrator {
     this.transcripts.set(key, [...transcript]);
 
     const harness = this.harness(input.selection.harness);
-    void this.ensureSharedBox().catch(() => undefined);
 
     yield {
       type: "trace",
@@ -703,23 +864,26 @@ export class ConsumerBoxAgentOrchestrator {
       model: input.selection.model,
     };
 
-    const activeAtSubmit = this.activePrivateRound(key);
-    const candidateRound = activeAtSubmit ? undefined : this.reservePrivateRound(key, input.message);
-    const roundBlockedAtSubmit = Boolean(activeAtSubmit || candidateRound?.state === "stale");
+    // EVERY user message reserves its OWN private round (rule 2: the box always
+    // runs on top and decides for itself). An earlier round still running does
+    // NOT suppress this one — it only serializes it behind the box lock. (The old
+    // "a round is already active -> suppress" shortcut silently dropped follow-up
+    // questions: the active round carried the OLDER message, so the newer one
+    // never reached the box at all.) Only an exact duplicate of a message the box
+    // already answered (or one still pending) is stale.
+    const pendingBeforeSubmit = this.activePrivateRound(key);
+    const candidateRound: PrivateRequestRound | undefined = this.reservePrivateRound(key, input.message);
+    const roundBlockedAtSubmit = candidateRound.state === "stale";
     yield this.traceState(
       key,
       "private-round.reserved",
-      activeAtSubmit
-        ? `private round ${activeAtSubmit.id} was already active; this turn will not reserve another private round`
-        : candidateRound
-          ? `private round ${candidateRound.id} reserved with state=${candidateRound.state}`
-          : "no private round reserved",
+      `private round ${candidateRound.id} reserved with state=${candidateRound.state}${pendingBeforeSubmit ? `; will run after pending round ${pendingBeforeSubmit.id}` : ""}`,
       input,
       turnSequence,
       {
-        activeRoundId: activeAtSubmit?.id ?? null,
-        candidateRoundId: candidateRound?.id ?? null,
-        candidateRoundState: candidateRound?.state ?? null,
+        pendingRoundId: pendingBeforeSubmit?.id ?? null,
+        candidateRoundId: candidateRound.id,
+        candidateRoundState: candidateRound.state,
         roundBlockedAtSubmit,
       },
     );
@@ -787,15 +951,13 @@ export class ConsumerBoxAgentOrchestrator {
       },
     };
 
-    if (roundBlockedAtSubmit || lockBusyAtSubmit) {
+    if (roundBlockedAtSubmit || lockBusyAtSubmit || pendingBeforeSubmit) {
       yield {
         type: "trace",
-        stage: activeAtSubmit ? "private-round.active" : candidateRound?.state === "stale" ? "private-round.stale" : "box.boot.queued",
-        message: activeAtSubmit
-          ? `private round ${activeAtSubmit.id} is already active for this conversation; this shared turn will not enqueue another Box round`
-          : candidateRound?.state === "stale"
-            ? "this request was already answered by the private runtime; no Box round will be queued"
-            : "private Box boot/resume is queued behind an active private runtime or stop; no Box API start/resume has been confirmed for this turn yet",
+        stage: candidateRound.state === "stale" ? "private-round.stale" : "box.boot.queued",
+        message: candidateRound.state === "stale"
+          ? "this request was already answered by (or is already pending at) the private runtime; no new Box round will be queued"
+          : "private Box round is queued behind an earlier round or stop; it runs with the full transcript once the lock frees",
         harness: harness.name,
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
@@ -814,23 +976,25 @@ export class ConsumerBoxAgentOrchestrator {
       });
       if (bootAck) {
         confirmedBootEmitted = true;
-        yield* this.emitConfirmedBootStart(bootAck, harness, input.selection.model);
+        yield* this.emitConfirmedBootStart(bootAck, harness, input.selection.model, { userId: input.userId, conversationId: input.conversationId });
       }
     }
 
     // True fast path: if the private runtime is known warm and no stop/turn has
     // the private lock, route directly. This preserves the adaptive behavior
     // that avoids unnecessary shared bridge text for a ready Box.
-    if (resolvedStatus.kind === "ready" && !lockBusyAtSubmit && !activeAtSubmit && privateReady && candidateRound) {
+    if (resolvedStatus.kind === "ready" && !lockBusyAtSubmit && !pendingBeforeSubmit && privateReady && candidateRound.state !== "stale") {
       const privateResult = await privateReady;
       privateReadyConsumed = true;
       try {
         if (privateResult.status.kind === "ready") {
           yield {
-            type: "shared.larp",
+            type: "trace",
+            stage: "route.direct",
+            message: "private box is warm and holds no other work; routing this message directly to it (rule 5: no shared bridge needed)",
             harness: harness.name,
-            toolIntent: true,
-            note: "private environment already warm; skipping shared bridge and continuing directly",
+            model: input.selection.model,
+            boxId: privateResult.box.id,
           };
           const round = candidateRound;
           if (round.state === "stale") {
@@ -891,18 +1055,19 @@ export class ConsumerBoxAgentOrchestrator {
       hidden: sharedHidden,
     };
     yield {
-      type: "shared.larp",
-      harness: harness.name,
-      toolIntent: true,
-      note:
+      type: "trace",
+      stage: "shared.bridge.start",
+      message:
         bridgeStatus === "resuming"
-          ? "private environment is resuming; shared assistant is covering latency"
-          : "private environment is starting; shared assistant is covering latency",
+          ? "private box is resuming; the shared no-tools agent answers first (full answer or a short wait line — its own choice)"
+          : "private box is starting; the shared no-tools agent answers first (full answer or a short wait line — its own choice)",
+      harness: harness.name,
+      model: input.selection.model,
     };
 
     let rawSharedText = "";
     let emittedSharedText = "";
-    const bufferSharedUntilRouted = sharedNeedsPrivate("", input.message);
+    let sharedCompletion: HarnessCompletion | undefined;
     const sharedSessionKey = this.sessionKey(key, harness.name, "shared");
     const knownSharedSessionId = this.harnessSessions.get(sharedSessionKey);
     for await (const text of harness.shared({
@@ -914,65 +1079,59 @@ export class ConsumerBoxAgentOrchestrator {
       capabilities: createRestrictedSharedCapabilities(),
       hiddenContext: sharedHidden,
       machine: sharedMachine,
-      toolIntent: false,
       ...(knownSharedSessionId ? { sessionId: knownSharedSessionId } : {}),
       onSessionId: (id: string) => this.harnessSessions.set(sharedSessionKey, id),
+      onComplete: (info: HarnessCompletion) => { sharedCompletion = info; },
     })) {
       rawSharedText += String(text ?? "");
-      if (bufferSharedUntilRouted) continue;
-      const visible = visibleSharedText(rawSharedText);
-      if (visible.length > emittedSharedText.length) {
-        const delta = visible.slice(emittedSharedText.length);
-        emittedSharedText = visible;
+      // Stream the shared answer verbatim as it arrives — full reply or brief
+      // holding line. No routing tag, no control markers, no message inspection.
+      if (rawSharedText.length > emittedSharedText.length) {
+        const delta = rawSharedText.slice(emittedSharedText.length);
+        emittedSharedText = rawSharedText;
         if (delta) yield { type: "shared.delta", text: delta, harness: harness.name, final: false };
       }
     }
 
-    const sharedText = sanitizeSharedBridgeText(stripSharedControl(rawSharedText) || emittedSharedText);
+    const sharedText = rawSharedText.trim() || emittedSharedText;
     if (!emittedSharedText && sharedText) {
       emittedSharedText = sharedText;
       yield { type: "shared.delta", text: sharedText, harness: harness.name, final: false };
     }
-    if (sharedText) {
-      const sharedMessage: TranscriptMessage = {
-        role: "assistant",
-        content: sharedText,
-        mode: "shared",
-        harness: harness.name,
-        model: input.selection.model,
-        at: new Date().toISOString(),
-      };
-      transcript.push(sharedMessage);
-      this.appendTranscript(key, sharedMessage);
+    if (!emittedSharedText) {
+      // Rule 1: the shared agent must always answer something — a full reply or a
+      // short wait line. No visible output is a real failure; fail loudly (with the
+      // harness' own exit/stderr) instead of substituting a canned bridge line.
+      const why = sharedCompletion
+        ? ` (reason=${sharedCompletion.reason}${typeof sharedCompletion.exitCode === "number" ? `, exit=${sharedCompletion.exitCode}` : ""}${sharedCompletion.diagnostic ? `, diagnostic=${sharedCompletion.diagnostic}` : ""})`
+        : "";
+      throw new Error(
+        `shared agent for harness ${harness.name} produced no visible answer${why}; refusing to fabricate a fallback`,
+      );
     }
+    const sharedMessage: TranscriptMessage = {
+      role: "assistant",
+      content: sharedText,
+      mode: "shared",
+      harness: harness.name,
+      model: input.selection.model,
+      at: new Date().toISOString(),
+    };
+    transcript.push(sharedMessage);
+    this.appendTranscript(key, sharedMessage);
 
-    const needsPrivate = sharedNeedsPrivate(rawSharedText, input.message);
-    if (!needsPrivate) {
-      if (candidateRound) this.markPrivateRound(key, candidateRound, "suppressed");
-      this.discardPreparedPrivateRuntime(privateReady);
-      yield {
-        type: "trace",
-        stage: "private-round.suppressed",
-        message: "authoritative request state marked this turn suppressed because the shared answer did not require a private Box round",
-        harness: harness.name,
-        model: input.selection.model,
-        ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
-      };
-      yield { type: "turn.done", harness: harness.name, model: input.selection.model, route: "shared", settled: true };
-      adaptiveTurnCompleted = true;
-      return;
-    }
+    // The private Box always runs on top (rule 2): its own agent decides whether
+    // to add anything or emit <end> to stay silent (rule 6). The shared agent
+    // never decides routing — it only ever answers (rule 3).
 
     const round = candidateRound;
-    if (!round || round.state === "stale" || activeAtSubmit || !privateReady) {
-      if (round) this.markPrivateRound(key, round, "stale");
+    if (round.state === "stale" || !privateReady) {
+      this.markPrivateRound(key, round, "stale");
       this.discardPreparedPrivateRuntime(privateReady);
       yield {
         type: "trace",
         stage: "private-round.suppressed",
-        message: activeAtSubmit
-          ? `private round ${activeAtSubmit.id} is already active; not enqueueing another Box round for this shared-side message`
-          : "private Box output suppressed because this request is stale or already answered",
+        message: "private Box round suppressed: this exact request was already answered by (or is already pending at) the private runtime",
         harness: harness.name,
         model: input.selection.model,
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
@@ -982,17 +1141,20 @@ export class ConsumerBoxAgentOrchestrator {
         harness: harness.name,
         model: input.selection.model,
         route: "shared",
-        settled: !activeAtSubmit,
+        settled: true,
       };
       adaptiveTurnCompleted = true;
       return;
     }
-    this.markPrivateRound(key, round, "active");
 
     let privateResult: { box: BoxInfo; status: UserBoxStatus; release: () => void };
     try {
+      // Serialization point: waits for any earlier round to finish and release
+      // the box lock. Only THEN does this round become the active one, so the
+      // earlier round's output is never suppressed as stale mid-stream.
       privateResult = await privateReady;
       privateReadyConsumed = true;
+      this.markPrivateRound(key, round, "active");
     } catch (error) {
       this.markPrivateRound(key, round, "suppressed");
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
@@ -1029,7 +1191,7 @@ export class ConsumerBoxAgentOrchestrator {
         const bootAck = await bootAckPromise.catch(() => undefined);
         if (bootAck) {
           confirmedBootEmitted = true;
-          yield* this.emitConfirmedBootStart(bootAck, harness, input.selection.model);
+          yield* this.emitConfirmedBootStart(bootAck, harness, input.selection.model, { userId: input.userId, conversationId: input.conversationId });
         }
       }
       while (recoveryEvents.length) yield recoveryEvents.shift()!;
@@ -1074,6 +1236,12 @@ export class ConsumerBoxAgentOrchestrator {
     resolvedStatus: UserBoxStatus,
     round: PrivateRequestRound,
   ): AsyncIterable<ConsumerTurnEvent> {
+    // This round may have queued behind an earlier one; the conversation moved
+    // on meanwhile (the earlier round's box answer, newer shared replies). Run
+    // the box against the FRESHEST transcript, not this turn's submit snapshot —
+    // the global store is an append-only superset of the snapshot.
+    const globalTranscript = this.transcripts.get(key);
+    if (globalTranscript && globalTranscript.length > transcript.length) transcript = [...globalTranscript];
     yield {
       type: "trace",
       stage: "runtime.owner.selected",
@@ -1082,7 +1250,7 @@ export class ConsumerBoxAgentOrchestrator {
       model: input.selection.model,
       boxId: box.id,
     };
-    const { since, fresh } = this.startBilling(box.id);
+    const { since, fresh } = this.startBilling(box.id, { userId: input.userId, conversationId: input.conversationId });
     if (fresh) {
       yield {
         type: "billing.start",
@@ -1148,6 +1316,7 @@ export class ConsumerBoxAgentOrchestrator {
     bootAck: UserBoxBootAck,
     harness: HarnessAdapter,
     model: string,
+    owner: { userId: string; conversationId: string },
   ): Iterable<ConsumerTurnEventBody> {
     const bootState = bootLifecycleState(bootAck);
     yield {
@@ -1165,7 +1334,7 @@ export class ConsumerBoxAgentOrchestrator {
       boxId: bootAck.box.id,
     };
     if (bootState !== "archived") {
-      const { since, fresh } = this.startBilling(bootAck.box.id);
+      const { since, fresh } = this.startBilling(bootAck.box.id, owner);
       if (fresh) {
         yield {
           type: "billing.start",
@@ -1197,9 +1366,16 @@ export class ConsumerBoxAgentOrchestrator {
     return `${key}:${harness}:${surface}`;
   }
 
+  /** Any round still owed to the box (reserved-but-queued or currently running). */
   private activePrivateRound(key: string): PrivateRequestRound | undefined {
-    const active = this.privateRequests.get(key)?.active;
-    return active && (active.state === "needed" || active.state === "active") ? active : undefined;
+    const state = this.privateRequests.get(key);
+    if (!state) return undefined;
+    const running = state.active;
+    if (running && (running.state === "needed" || running.state === "active")) return running;
+    for (const round of state.rounds.values()) {
+      if (round.state === "needed" || round.state === "active") return round;
+    }
+    return undefined;
   }
 
   private registerUnansweredPrompt(key: string, turnId: string): void {
@@ -1300,17 +1476,21 @@ export class ConsumerBoxAgentOrchestrator {
     const state = this.requestState(key);
     const fingerprint = requestFingerprint(message) || randomUUID();
     const now = Date.now();
-    const existingActive = this.activePrivateRound(key);
+    // Stale ONLY for an exact duplicate: the same message text already answered
+    // by the box, or identical text already reserved/running. A DIFFERENT
+    // message always gets its own round (it serializes behind the box lock).
+    const duplicatePending = [...state.rounds.values()].some(
+      (r) => (r.state === "needed" || r.state === "active") && r.fingerprint === fingerprint,
+    );
     const round: PrivateRequestRound = {
       id: randomUUID(),
       fingerprint,
       message,
-      state: existingActive || state.answeredFingerprints.has(fingerprint) ? "stale" : "needed",
+      state: duplicatePending || state.answeredFingerprints.has(fingerprint) ? "stale" : "needed",
       createdAt: now,
       updatedAt: now,
     };
     state.rounds.set(round.id, round);
-    if (round.state === "needed") state.active = round;
     return round;
   }
 
@@ -1319,6 +1499,9 @@ export class ConsumerBoxAgentOrchestrator {
     round.state = state;
     round.updatedAt = Date.now();
     conversation.rounds.set(round.id, round);
+    // The active slot is claimed at ACTIVATION (after the box lock is held), so
+    // a newly reserved round can never steal it from one still streaming.
+    if (state === "active") conversation.active = round;
     if (state === "answered") {
       conversation.answeredFingerprints.add(round.fingerprint);
       if (conversation.active?.id === round.id) delete conversation.active;
@@ -1594,7 +1777,6 @@ export class ConsumerBoxAgentOrchestrator {
       onComplete: (info: HarnessCompletion) => { completion = info; },
     });
     let userText = "";
-    let lastToolStdout = "";
     let sawToolUse = false;
     let heldEndCandidate = "";
     const itc = continued[Symbol.asyncIterator]();
@@ -1605,8 +1787,6 @@ export class ConsumerBoxAgentOrchestrator {
         const ev = execEvents.shift()!;
         if (ev.type === "harness.tool") {
           if (ev.phase === "tool_use") sawToolUse = true;
-          if (ev.phase === "tool_result" && typeof ev.stdout === "string" && ev.stdout.trim())
-            lastToolStdout = ev.stdout.trim();
           // Surface tool activity in traces so the scheduler/UI can see the box
           // agent is actively working (NOT idle) even before any visible text.
           yield {
@@ -1720,19 +1900,6 @@ export class ConsumerBoxAgentOrchestrator {
       };
       return;
     }
-    if (!userText.trim() && sawToolUse && lastToolStdout) {
-      const fallback = buildToolResultFallback(input.message, lastToolStdout);
-      userText += fallback;
-      yield {
-        type: "user-box.delta",
-        text: fallback,
-        boxId: box.id,
-        harness: harness.name,
-        model: input.selection.model,
-        messageId: "fallback-0",
-        messageIndex: 0,
-      };
-    }
     if (userText) {
       const assistantMessage: TranscriptMessage = {
         role: "assistant",
@@ -1746,7 +1913,24 @@ export class ConsumerBoxAgentOrchestrator {
       this.appendTranscript(key, assistantMessage);
       this.markPrivateRound(key, round, "answered");
     }
-    if (!userText) this.markPrivateRound(key, round, "suppressed");
+    if (!userText) {
+      this.markPrivateRound(key, round, "suppressed");
+      // The box agent produced NOTHING — no answer, no <end>. That is a real
+      // failure, never a legitimate silence (rule 6: intentional silence is
+      // exactly "<end>", nothing else). Fail loudly with the harness' own exit
+      // code and raw output tail instead of leaving the user staring at nothing.
+      if (completion.reason !== "aborted") {
+        yield {
+          type: "turn.blocked",
+          stage: "box.runtime.no-answer",
+          message: `private box agent for harness ${harness.name} ended (reason=${completion.reason}${typeof completion.exitCode === "number" ? `, exit=${completion.exitCode}` : ""}) without any visible answer and without <end>${completion.diagnostic ? `; harness output tail: ${completion.diagnostic}` : ""}`,
+          retryable: true,
+          harness: harness.name,
+          model: input.selection.model,
+          boxId: box.id,
+        };
+      }
+    }
     // The box agent only "settled" this prompt if its loop ended of its own accord
     // (clean stream end / safety timeout / process gone) — never if it was aborted
     // out from under an in-flight turn. Only a settled answer may arm the idle stop.
@@ -1786,13 +1970,16 @@ export class ConsumerBoxAgentOrchestrator {
     return "";
   }
 
-  private startBilling(boxId: string): { since: number; fresh: boolean } {
+  private startBilling(boxId: string, owner?: { userId: string; conversationId: string }): { since: number; fresh: boolean } {
     let since = this.billing.get(boxId);
     const fresh = since === undefined;
     if (since === undefined) {
       since = Date.now();
       this.billing.set(boxId, since);
     }
+    // Remember which conversation owns this billable box so the background reaper
+    // can stop it by user/conversation even with no request stream attached.
+    if (owner) this.boxOwners.set(boxId, { ...owner, key: `${owner.userId}:${owner.conversationId}` });
     return { since, fresh };
   }
 
@@ -1926,12 +2113,22 @@ export class ConsumerBoxAgentOrchestrator {
     };
   }
 
-  async stopIdleUserBox(userId: string, conversationId: string): Promise<void> {
-    const session = await this.sessions.get(userId, conversationId);
-    if (session?.boxId) {
-      await this.options.box.stop(session.boxId);
-      this.billing.delete(session.boxId);
+  /** Stop a box, retrying while the platform refuses (e.g. no snapshot yet on a young box). */
+  private async stopWithRetry(boxId: string, label: string, attempts = 15, delayMs = 20_000): Promise<void> {
+    let lastError: unknown;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        await this.options.box.stop(boxId);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+      await new Promise((resolve) => {
+        const t = setTimeout(resolve, delayMs);
+        (t as any).unref?.();
+      });
     }
+    throw new Error(`stop for ${label} (${boxId}) kept being refused after ${attempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
   }
 
   private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -1971,6 +2168,13 @@ export class ConsumerBoxAgentOrchestrator {
     );
   }
 
+  /**
+   * A box is "ready" when it actually EXECUTES a command — rule 5's definition of
+   * responsive. The reported `state` field lags real usability by many seconds
+   * (measured: fork commands succeed at ~1-4s while state says 'ready' only at
+   * ~13s), so waiting on the state alone silently costs ~8s on every boot. The
+   * state is still polled alongside, but only to detect terminal error/stopped.
+   */
   private async waitUntilReady(
     boxId: string,
     label: string,
@@ -1981,8 +2185,11 @@ export class ConsumerBoxAgentOrchestrator {
       timeoutOverrideMs ?? this.options.handoffTimeoutMs ?? 120_000;
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
+      const probe = await this.options.box
+        .command(boxId, { command: "echo __BOX_UP__", timeoutMs: 10_000 })
+        .catch(() => undefined);
       const box = await this.options.box.get(boxId);
-      if (isReady(box.state)) return box;
+      if (probe && probe.exitCode === 0 && probe.stdout.includes("__BOX_UP__")) return box;
       if (box.state === "error")
         throw new Error(
           `Box ${boxId} entered error while waiting for ${label}`,
@@ -1992,7 +2199,7 @@ export class ConsumerBoxAgentOrchestrator {
       await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
     throw new Error(
-      `Timed out waiting for Box ${boxId} to become ready for ${label}`,
+      `Timed out waiting for Box ${boxId} to become responsive for ${label}`,
     );
   }
 }
@@ -2010,36 +2217,6 @@ function normalizeHarnessChunk(value: unknown): { text: string; messageId?: stri
     return out;
   }
   return { text: String(value ?? ""), messageId: "assistant-0", messageIndex: 0 };
-}
-
-const SHARED_ROUTING_RE = /<shared-routing>\s*({[\s\S]*?})\s*<\/shared-routing>/i;
-
-function visibleSharedText(text: string): string {
-  const raw = String(text ?? "");
-  const controlStart = raw.search(/<shared-routing>/i);
-  const withoutPartial = controlStart >= 0 ? raw.slice(0, controlStart) : raw;
-  return stripSharedControl(withoutPartial);
-}
-
-function stripSharedControl(text: string): string {
-  return String(text ?? "")
-    .replace(SHARED_ROUTING_RE, "")
-    .replace(/\s+\n/g, "\n")
-    .trim();
-}
-
-function sharedNeedsPrivate(rawSharedText: string, message: string): boolean {
-  const match = SHARED_ROUTING_RE.exec(String(rawSharedText ?? ""));
-  if (match?.[1]) {
-    try {
-      const parsed = JSON.parse(match[1]) as { needsPrivate?: unknown };
-      if (typeof parsed.needsPrivate === "boolean") return parsed.needsPrivate;
-    } catch {
-      // Fall back to the deterministic message heuristic below if a harness
-      // emits malformed routing metadata.
-    }
-  }
-  return /\b(run|execute|shell|bash|terminal|command|file|files|filesystem|fs|create|write|edit|read|inspect|check|list|install|curl|hostname|ip|ip address|ipv[46]|cpu|core|nproc|pwd|directory|directories)\b/i.test(message);
 }
 
 const PRIVATE_END_SENTINEL = "<end>";
@@ -2067,36 +2244,9 @@ function requestFingerprint(message: string): string {
     .replace(/\s+/g, " ");
 }
 
-function sanitizeSharedBridgeText(text: string): string {
-  const trimmed = String(text ?? "").replace(/\s+/g, " ").trim();
-  const fallback = nextBridgeText();
-  if (!trimmed) return fallback;
-  if (isLeakySharedBridge(trimmed)) return fallback;
-  return trimmed;
-}
-
-function isLeakySharedBridge(text: string): boolean {
-  return /\b(can't|cannot|can not|don't have|do not have|no access|no tools|lack|limited|unable|not able|conversation only|inspect hardware|can't inspect|cannot inspect|fixed ip|persistent network identity|machine presence|conversational ai|chatbot|as an ai|box environment|inside (a|the|your) box|box is (booting|starting|resuming|ready))\b/i.test(text);
-}
-
-function nextBridgeText(): string {
-  const options = [
-    "I’m checking that now.",
-    "I’m looking into it.",
-    "On it — I’ll take a look.",
-    "Got it, I’m checking.",
-  ];
-  return options[Math.floor(Math.random() * options.length)]!;
-}
-
-function buildToolResultFallback(message: string, stdout: string): string {
-  const marker = /\breply\s+(?:exactly\s+)?(?:with\s+)?([A-Z][A-Z0-9_]{2,})\b/.exec(message)?.[1];
-  const value = stdout.trim();
-  return marker ? `${marker} ${value}` : `Done — observed: ${value}`;
-}
-
 function bootLifecycleState(ack: UserBoxBootAck): string {
   if (ack.action === "resume-requested" || ack.action === "adopt-resume-requested") return "resuming";
+  if (ack.action === "fork-requested") return "forking";
   if (ack.action === "already-ready" || ack.action === "adopt-ready" || isReady(ack.box.state)) return "ready";
   return ack.box.state === "provisioning" || ack.box.state === "cloning" || ack.box.state === "provisioned"
     ? ack.box.state
@@ -2117,6 +2267,8 @@ function bootLifecycleNote(ack: UserBoxBootAck): string {
       return `private Box already exists and is still booting (${ack.box.state})`;
     case "create-requested":
       return `private Box create was accepted by Box API (${ack.box.state})`;
+    case "fork-requested":
+      return `private Box was forked from the pre-installed template snapshot (${ack.box.state})`;
   }
 }
 
@@ -2132,6 +2284,8 @@ function bootTraceMessage(ack: UserBoxBootAck): string {
       return "private Box already exists and is booting";
     case "create-requested":
       return "private Box create request was accepted by Box API";
+    case "fork-requested":
+      return "private Box fork from template snapshot was accepted by Box API";
   }
 }
 

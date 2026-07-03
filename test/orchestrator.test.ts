@@ -7,7 +7,7 @@ import {
   createUserBoxCapabilities,
   assertNoBoxAgent,
   buildHiddenContext,
-  detectToolIntent,
+
   stripHiddenContext,
   type BoxClient,
   type BoxInfo,
@@ -38,7 +38,17 @@ class FakeBoxClient implements BoxClient {
   }
   async stop(boxId: string): Promise<BoxInfo> { const box = { ...(await this.get(boxId)), state: "archived" }; this.boxes.set(boxId, box); return box; }
   async resume(boxId: string): Promise<BoxInfo> { const box = { ...(await this.get(boxId)), state: "idle" }; this.boxes.set(boxId, box); return box; }
-  async command(_boxId: string, input: { command: string }): Promise<CommandResult> { this.commands.push(input.command); return { exitCode: 0, stdout: `ran:${input.command}`, stderr: "" }; }
+  async command(boxId: string, input: { command: string }): Promise<CommandResult> {
+    // Model the real substrate: commands execute only on a usable box. The
+    // orchestrator's readiness = "a command runs", so a fake that answered
+    // commands on provisioning/archived boxes would make every box look ready.
+    const state = (await this.get(boxId)).state;
+    if (!["ready", "idle", "running", "provisioned"].includes(state)) {
+      throw new Error(`fake box ${boxId} cannot run commands in state ${state}`);
+    }
+    this.commands.push(input.command);
+    return { exitCode: 0, stdout: `ran:${input.command}`, stderr: "" };
+  }
   async readFile(_boxId: string, path: string): Promise<string> { return `file:${path}`; }
   async writeFile(_boxId: string, path: string, content: string): Promise<void> { this.writes.push(`${path}:${content}`); }
 }
@@ -70,6 +80,7 @@ class StreamingLogBoxClient extends FakeBoxClient {
   catReads = 0;
   constructor(private snapshots: string[]) { super(); }
   override async command(_boxId: string, input: { command: string }): Promise<CommandResult> {
+    if (input.command === "echo __BOX_UP__") return super.command(_boxId, input);
     this.commands.push(input.command);
     if (/^cat\s/.test(input.command)) {
       const index = Math.min(this.catReads++, this.snapshots.length - 1);
@@ -94,6 +105,7 @@ class GatedToolLogBoxClient extends FakeBoxClient {
   answerReleased = false;
   releaseAnswer(): void { this.answerReleased = true; }
   override async command(_boxId: string, input: { command: string }): Promise<CommandResult> {
+    if (input.command === "echo __BOX_UP__") return super.command(_boxId, input);
     this.commands.push(input.command);
     if (/^cat\s/.test(input.command)) {
       const toolUse = { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "sleep 1 && echo done", description: "long command" } }] } };
@@ -130,9 +142,9 @@ function probeHarness(name: string): HarnessAdapter {
     async *shared({ capabilities, message }) {
       await assert.rejects(capabilities.bash("whoami"));
       if (/^(hello|hi|hey)\b|capab|surprise/i.test(message)) {
-        yield `shared:${name}:I can answer simple chat here and use the private runtime for tool work.\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+        yield `shared:${name}:I can answer simple chat here and use the private runtime for tool work.`;
       } else {
-        yield `shared:${name}:I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+        yield `shared:${name}:I’m checking that now.`;
       }
     },
     async *userBox({ capabilities, recap, hiddenContext, machine, partialShared, latestUserMessage }) {
@@ -201,7 +213,7 @@ test("tool turns resume the Box and auto-stop after answering", async () => {
   const second: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
   assert.equal(second.find((e) => e.type === "turn.done")?.boxId, boxId, "same Box is resumed for tool follow-up");
-  assert.ok(second.some((e) => e.type === "shared.larp" && /resuming/.test(e.note)), "tool follow-up bridges during resume");
+  assert.ok(second.some((e) => e.type === "trace" && e.stage === "shared.bridge.start" && /resuming/.test(e.message)), "tool follow-up bridges during resume");
   assert.ok(second.some((e) => e.type === "user-box.delta"), "tool follow-up is answered by the Box");
   assert.ok(second.some((e) => e.type === "billing.stop"), "follow-up auto-stops billing");
   assert.equal((await box.get(boxId)).state, "archived", "Box is archived again after follow-up");
@@ -294,29 +306,45 @@ test("accepted prompt during auto-stop shutdown resumes and preserves the answer
   assert.equal(second.find((e) => e.type === "turn.done")?.boxId, boxId, "follow-up continues on the same resumed Box");
 });
 
-test("concurrent shared-side turns do not enqueue duplicate Box rounds", async () => {
+test("an identical concurrent message is deduped; the original still gets its Box round", async () => {
   const box = new FakeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
 
   const a: any[] = [], b: any[] = [];
   const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
-  const g2 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
+  const g2 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
   const da = (async () => { for await (const e of g1) a.push(e); })();
   const db = (async () => { for await (const e of g2) b.push(e); })();
   await Promise.all([da, db]);
 
+  const withRound = [a, b].filter((events) => events.some((e) => e.type === "user-box.delta"));
+  const suppressed = [a, b].filter((events) => events.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"));
+  assert.equal(withRound.length, 1, "exactly one of the duplicate turns runs the Box round");
+  assert.equal(suppressed.length, 1, "the exact-duplicate turn is deduped as stale");
+  assert.ok([...a, ...b].some((e) => e.type === "billing.stop"), "Box auto-stops once both streams end and the round is settled");
+});
+
+test("a DIFFERENT follow-up during another round queues its own Box round (never dropped)", async () => {
+  const box = new FakeBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 1, autoStopIdleMs: 1 });
+
+  const a: any[] = [], b: any[] = [];
+  const g1 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
+  const g2 = orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's your ip", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } });
+  const da = (async () => { for await (const e of g1) a.push(e); })();
+  const db = (async () => { for await (const e of g2) b.push(e); })();
+  await Promise.all([da, db]);
+
+  // This is the exact reported bug: the follow-up used to be suppressed because
+  // "a round is already active" — its question then never reached the box at all.
+  assert.ok(a.some((e) => e.type === "user-box.delta"), "first message gets its Box round");
+  assert.ok(b.some((e) => e.type === "user-box.delta"), "the follow-up gets its OWN Box round, serialized after the first");
   const id1 = a.find((e) => e.type === "turn.done")?.boxId;
   const id2 = b.find((e) => e.type === "turn.done")?.boxId;
-  assert.ok(id1, "first turn runs the private Box round");
-  assert.equal(id2, undefined, "concurrent follow-up completes on shared route without a duplicate Box round");
-  assert.ok(a.some((e) => e.type === "user-box.delta"));
-  assert.equal(b.filter((e) => e.type === "user-box.delta").length, 0);
-  assert.ok(b.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"));
-  assert.ok(!a.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "unanswered concurrent follow-up blocks the original idle countdown");
-  assert.ok(!a.some((e) => e.type === "billing.stop"), "original private round cannot stop while the follow-up is unanswered");
-  assert.equal((await box.get(id1)).state, "idle", "Box stays warm because a prompt is still unanswered");
+  assert.equal(id1, id2, "both rounds run on the same private Box");
+  assert.ok([...a, ...b].some((e) => e.type === "billing.stop"), "Box auto-stops after both rounds settle");
   const users = orchestrator.getTranscript("u", "c").filter((m) => m.role === "user").map((m) => m.content);
-  assert.deepEqual(users, ["create one", "run two"]);
+  assert.deepEqual([...users].sort(), ["create one", "what's your ip"]);
 });
 
 test("a stop waits behind an in-flight turn (no archive mid-harness)", async () => {
@@ -341,7 +369,7 @@ test("userBoxStatus reports precise, non-mutating state", async () => {
   assert.equal((await orchestrator.userBoxStatus("u", "c")).kind, "none");
   for await (const _ of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) void _;
   assert.equal((await orchestrator.userBoxStatus("u", "c")).kind, "archived");
-  await orchestrator.stopIdleUserBox("u", "c");
+  for await (const _ of orchestrator.stopUserBox("u", "c")) void _;
   assert.equal((await orchestrator.userBoxStatus("u", "c")).kind, "archived");
 });
 
@@ -366,10 +394,10 @@ test("resume path bridges as 'resuming' and reuses the same box", async () => {
   const first: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
   const boxId = first.find((e) => e.type === "turn.done")?.boxId;
-  await orchestrator.stopIdleUserBox("u", "c");
+  for await (const _ of orchestrator.stopUserBox("u", "c")) void _;
   const second: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
-  assert.ok(second.some((e) => e.type === "shared.larp" && /resuming/.test(e.note)), "resume bridges as resuming");
+  assert.ok(second.some((e) => e.type === "trace" && e.stage === "shared.bridge.start" && /resuming/.test(e.message)), "resume bridges as resuming");
   assert.ok(second.some((e) => e.type === "handoff.started"), "resume bridges back into the box");
   assert.equal(second.find((e) => e.type === "turn.done")?.boxId, boxId, "same box reused on resume");
 });
@@ -390,12 +418,6 @@ test("hidden context envelope carries transcript + machine state, strips cleanly
   assert.match(hidden, /<stale-duplicate-request action="output-exact-end">/);
   // wrapped text is stripped entirely from anything user-visible
   assert.equal(stripHiddenContext(`before ${hidden} after`), "before  after".trim());
-});
-
-test("legacy detectToolIntent is only a cheap UI hint", () => {
-  assert.equal(detectToolIntent("create a file foo.txt"), true);
-  assert.equal(detectToolIntent("hello, how are you today?"), false);
-  assert.equal(detectToolIntent("surprise me with a color"), false);
 });
 
 test("runHarness extracts real Claude stream-json text deltas without duplicating final result", async () => {
@@ -543,37 +565,30 @@ test("CPU request during archiving gets shared response before private resume", 
 
 
 
-test("shared-only cold greeting does not later answer a follow-up private turn", async () => {
+test("cold greeting box round stays silent via <end>; follow-up answers privately", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 80;
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 5, autoStopIdleMs: 100_000 });
 
   const greeting: any[] = [];
-  const dg = (async () => {
-    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
-      greeting.push(e);
-      if (e.type === "turn.done") break;
-    }
-  })();
-  await waitFor(() => greeting.some((e) => e.type === "shared.delta"), 50);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
+    greeting.push(e);
+    if (e.type === "turn.done") break;
+  }
+  assert.ok(greeting.some((e) => e.type === "shared.delta"), "greeting gets an immediate shared answer");
+  assert.ok(greeting.some((e) => e.type === "handoff.started"), "the private Box round always runs — the box agent decides on top");
+  assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "user-box.response.end"), "greeting box round stays silent via the <end> sentinel, not a shared-side routing gate");
+  assert.equal(greeting.filter((e) => e.type === "user-box.delta").length, 0, "greeting does not emit a private answer");
 
   const ip: any[] = [];
-  const di = (async () => {
-    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "whats ur ip", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
-      ip.push(e);
-      if (e.type === "turn.done") break;
-    }
-  })();
-  await Promise.all([dg, di]);
-
-  assert.ok(!greeting.some((e) => e.type === "handoff.started"), "shared-only greeting is suppressed by the request state machine before a Box round runs");
-  assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"), "shared-only greeting is structurally suppressed without relying on <end>");
-  assert.equal(greeting.filter((e) => e.type === "user-box.delta").length, 0, "greeting does not emit a private answer");
-  assert.equal(ip.filter((e) => e.type === "user-box.delta").length, 1, "follow-up gets exactly one private answer");
-  assert.ok(ip.some((e) => e.type === "shared.delta"), "follow-up still receives immediate shared bridge while Box is not ready/busy");
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "whats ur ip", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
+    ip.push(e);
+    if (e.type === "turn.done") break;
+  }
+  assert.equal(ip.filter((e) => e.type === "user-box.delta").length, 1, "the tool follow-up gets exactly one private answer");
 });
 
-test("tool requests while booting get sanitized holding text", async () => {
+test("shared text is streamed verbatim — never rewritten, filtered, or replaced", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 40;
   const leakyHarness: HarnessAdapter = {
@@ -583,7 +598,7 @@ test("tool requests while booting get sanitized holding text", async () => {
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared() {
       yield "Good question! I don't have a fixed IP address the way a server does — I'm a conversational AI.\n";
-      yield '<shared-routing>{"needsPrivate":true}</shared-routing>';
+      yield '';
     },
     async *userBox() {
       yield "private runtime answer";
@@ -597,9 +612,10 @@ test("tool requests while booting get sanitized holding text", async () => {
   }
 
   const sharedText = events.filter((e) => e.type === "shared.delta").map((e) => e.text).join("");
-  assert.match(sharedText, /checking|looking|On it|Got it/i);
-  assert.doesNotMatch(sharedText, /fixed IP|conversational AI|don't have|Box|runtime/i);
-  assert.equal(events.filter((e) => e.type === "shared.delta").length, 1, "leaky shared text is buffered and replaced once");
+  // The host shows the agent's words verbatim — no fallback, no leak filter.
+  assert.match(sharedText, /fixed IP address the way a server does — I'm a conversational AI/);
+  // The <shared-routing> control tag is the ONLY thing stripped from visible text.
+  assert.doesNotMatch(sharedText, /shared-routing/);
   assert.equal(events.filter((e) => e.type === "user-box.delta").length, 1, "private runtime still completes the request");
 });
 
@@ -630,28 +646,31 @@ test("first greeting eagerly starts private Box before shared-only answer is fin
   assert.equal([...box.boxes.values()].filter((b) => /user/.test(b.name || "")).length, 1, "one private user Box was started for the first greeting");
 });
 
-test("shared routing can structurally suppress unnecessary private Box output", async () => {
+test("box round always runs on top of a sufficient shared answer; box stays silent only via <end>", async () => {
   const box = new SlowUserBoxClient();
   box.delayMs = 5;
   const harness: HarnessAdapter = {
-    name: "no-shared-suppression",
+    name: "box-decides",
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared() {
-      yield `shared says enough\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+      yield `shared says enough`;
     },
     async *userBox() {
-      yield "PRIVATE_BOX_DECIDED_TO_ANSWER";
+      // The box agent alone decides whether to add anything; here it has nothing
+      // to add on top of the shared answer, so it emits the <end> sentinel.
+      yield "<end>";
     },
   };
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [harness], readinessPollMs: 1, autoStopIdleMs: 1 });
 
   const events: any[] = [];
-  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "no-shared-suppression", provider: "anthropic", model: "m-1" } })) events.push(e);
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "box-decides", provider: "anthropic", model: "m-1" } })) events.push(e);
 
-  assert.ok(events.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"), "state machine suppresses the private round when shared routing says it is unnecessary");
-  assert.ok(!events.some((e) => e.type === "handoff.started"), "private Box agent is not invoked for a suppressed round");
-  assert.equal(events.filter((e) => e.type === "user-box.delta").length, 0, "private answer is not surfaced when the round is suppressed");
+  assert.ok(events.some((e) => e.type === "shared.delta" && /shared says enough/.test(e.text)), "shared answer is shown verbatim");
+  assert.ok(events.some((e) => e.type === "handoff.started"), "the private Box round always runs — the shared agent never gates it out");
+  assert.ok(events.some((e) => e.type === "trace" && e.stage === "user-box.response.end"), "box stays silent via its own <end>, not a shared-side routing gate");
+  assert.equal(events.filter((e) => e.type === "user-box.delta").length, 0, "an <end> box round surfaces no extra text");
 });
 
 
@@ -662,7 +681,7 @@ test("private Box answer chunks stream before final completion", async () => {
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared() {
-      yield `I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+      yield `I’m checking that now.`;
     },
     async *userBox() {
       yield "Hel";
@@ -700,7 +719,7 @@ test("only exact private Box <end> sentinel suppresses private output", async ()
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared() {
-      yield `shared\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+      yield `shared`;
     },
     async *userBox({ latestUserMessage }) {
       yield latestUserMessage.includes("newline") ? "<end>\n" : "<end>";
@@ -726,7 +745,7 @@ test("duplicate queued Box round is suppressed by the state machine before priva
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared() {
-      yield `I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+      yield `I’m checking that now.`;
     },
     async *userBox({ hiddenContext }) {
       if (hiddenContext.includes("<stale-duplicate-request")) {
@@ -794,7 +813,7 @@ test("lifecycle stop and resume reuses session Box", async () => {
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
   const boxId = first.find((e) => e.type === "handoff.started")?.boxId;
   assert.ok(boxId);
-  await orchestrator.stopIdleUserBox("u", "c");
+  for await (const _ of orchestrator.stopUserBox("u", "c")) void _;
   assert.equal((await box.get(boxId)).state, "archived");
   const second: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run two", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) second.push(e);
@@ -853,13 +872,16 @@ test("filesystem follow-up during boot-in-flight is not suppressed and terminal 
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared({ message }) {
       if (/^hey\b/i.test(message)) {
-        yield `Hey! How can I help you today?\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+        yield `Hey! How can I help you today?`;
         return;
       }
       // Exact failure shape: bridge text only, no routing control metadata.
       yield "On it — I’ll take a look.";
     },
-    async *userBox() {
+    async *userBox({ latestUserMessage }) {
+      // Greeting: box round runs but has nothing to add on top -> <end>.
+      if (/^hey\b/i.test(latestUserMessage)) { yield "<end>"; return; }
+      // Filesystem prompt: this must never run because the resume terminally stops.
       yield "SHOULD_NOT_RUN";
     },
   };
@@ -870,22 +892,27 @@ test("filesystem follow-up during boot-in-flight is not suppressed and terminal 
     resumeTimeoutMs: 200,
     handoffTimeoutMs: 200,
     autoStopIdleMs: 1,
+    // The greeting's "box always runs" resume leaves box-resume stuck cloning and
+    // billing — an orphan the request-driven stop can't reach. The reaper must.
+    idleReaperIntervalMs: 20,
   });
   const selection = { harness: "bridge-only", provider: "anthropic", model: "m-1" };
 
+  // Drain the whole greeting turn (not just up to turn.done): the greeting now
+  // runs a box round that <end>s, and its billing.stop / autostop fire in the
+  // post-turn phase — exactly as a real SSE consumer drains until stream end.
   const greeting: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection })) {
     greeting.push(e);
-    if (e.type === "turn.done") break;
   }
   assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "box.boot.start"), "first greeting eagerly starts/resumes the Box");
-  assert.ok(greeting.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"), "greeting itself can be shared-only");
+  assert.equal(greeting.filter((e) => e.type === "user-box.delta").length, 0, "greeting stays silent (box <end>s or resume is still in-flight)");
   box.stopNow = true;
 
   const followup: any[] = [];
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "xhat's in your filesystem", selection })) followup.push(e);
 
-  assert.ok(followup.some((e) => e.type === "trace" && e.stage === "box.boot.queued"), "follow-up is queued behind the in-flight boot/resume");
+  assert.ok(followup.some((e) => e.type === "trace" && (e.stage === "box.lock.acquired" || e.stage === "box.boot.start")), "filesystem follow-up really attempts private work (boots / acquires the lock), never gated out by the shared answer");
   assert.equal(followup.filter((e) => e.type === "trace" && e.stage === "private-round.suppressed").length, 0, "filesystem prompt is not suppressed by bridge text alone");
   assert.ok(followup.some((e) => e.type === "turn.blocked" && e.retryable && e.stage === "box.runtime.unavailable"), "terminal stopped resume surfaces a retryable blocker");
   assert.equal(followup.filter((e) => e.type === "user-box.delta").length, 0, "private runtime never runs after terminal stopped state");
@@ -897,10 +924,14 @@ test("filesystem follow-up during boot-in-flight is not suppressed and terminal 
   assert.equal(final?.data?.conversation?.boxLockQueued, false);
   assert.equal(final?.data?.conversation?.privateRoundStates?.needed, 0);
   assert.equal(final?.data?.conversation?.privateRoundStates?.active, 0);
-  assert.deepEqual(final?.data?.conversation?.billableBoxIds, []);
+  // The greeting left box-resume stuck+billing; the background reaper force-stops it.
+  const stoppedStates = new Set(["archived", "stopped"]);
+  for (let i = 0; i < 1000 && !stoppedStates.has((await box.get("box-resume")).state); i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(stoppedStates.has((await box.get("box-resume")).state), "background reaper force-stops the orphaned stuck box so it cannot run forever");
+  orchestrator.dispose();
 });
 
-test("stuck resume times out, recovers, and queued follow-up is suppressed while active", async () => {
+test("stuck resume times out, recovers, and the queued DIFFERENT follow-up still gets its own round", async () => {
   const box = new StuckResumeBoxClient();
   const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [probeHarness("alpha")], readinessPollMs: 2, resumeTimeoutMs: 20, handoffTimeoutMs: 200, autoStopIdleMs: 1 });
 
@@ -908,7 +939,7 @@ test("stuck resume times out, recovers, and queued follow-up is suppressed while
   for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "create one", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) first.push(e);
   const oldBoxId = first.find((e) => e.type === "turn.done")?.boxId;
   assert.ok(oldBoxId);
-  await orchestrator.stopIdleUserBox("u", "c");
+  for await (const _ of orchestrator.stopUserBox("u", "c")) void _;
   assert.equal((await box.get(oldBoxId)).state, "archived");
 
   const tool: any[] = [], chat: any[] = [];
@@ -924,8 +955,11 @@ test("stuck resume times out, recovers, and queued follow-up is suppressed while
   assert.equal(tool.filter((e) => e.type === "user-box.delta").length, 1, "original turn gets exactly one Box answer");
   const newBoxId = tool.find((e) => e.type === "turn.done")?.boxId;
   assert.notEqual(newBoxId, oldBoxId, "fresh box recovered from stale archived box");
-  assert.equal(chat.filter((e) => e.type === "user-box.delta").length, 0, "queued shared-side follow-up does not enqueue a duplicate Box round while the original is active");
-  assert.ok(chat.some((e) => e.type === "trace" && e.stage === "private-round.suppressed"), "queued follow-up is suppressed by the request state machine");
+  // "pwd" is a different question — it must NOT be dropped. It queues behind the
+  // recovering round and runs on the recovered box afterwards (the reported bug
+  // was exactly this follow-up silently never reaching the box).
+  assert.ok(chat.some((e) => e.type === "user-box.delta"), "queued different follow-up gets its own Box round after recovery");
+  assert.equal(chat.find((e) => e.type === "turn.done")?.boxId, newBoxId, "follow-up round runs on the recovered box");
 });
 
 
@@ -953,7 +987,7 @@ test("aborted shared bridge releases prepared Box round so next message is not a
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared() {
-      yield `I’m checking that now.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+      yield `I’m checking that now.`;
     },
     async *userBox({ latestUserMessage }) {
       yield `BOX_HANDLED:${latestUserMessage}`;
@@ -1156,7 +1190,7 @@ test("realCliHarness uses one phase-aware prompt builder for shared and user-box
     message: "hello",
     capabilities: createRestrictedSharedCapabilities(),
     machine: { location: "shared-box", tools: false, status: "prewarming" },
-    toolIntent: false,
+
   }, { phase: "shared", toolsAllowed: false, runtime: "shared-infra" });
   const userBundle = buildHarnessPromptBundle({
     ...base,
@@ -1187,8 +1221,10 @@ class CapturingRuntime {
   constructor(location: "shared-infra" | "user-box") { this.location = location; }
   async command(cmd: string): Promise<CommandResult> {
     this.commands.push(cmd);
-    if (/^mktemp -d \/tmp\/consumer-agent-/.test(cmd)) {
-      return { exitCode: 0, stdout: "/tmp/consumer-agent-test-xyz\n", stderr: "" };
+    // Emulate the real shell contract of the batched workspace-prep command:
+    // it ends with a bin check echoing __BIN_OK__ / __BIN_MISSING__.
+    if (cmd.includes("__BIN_OK__")) {
+      return { exitCode: 0, stdout: "__BIN_OK__\n", stderr: "" };
     }
     return { exitCode: 0, stdout: "ok\n", stderr: "" };
   }
@@ -1211,7 +1247,7 @@ function sharedCtx(message: string) {
     capabilities: createRestrictedSharedCapabilities(),
     hiddenContext: "<consumer-context></consumer-context>",
     machine: { location: "shared-box" as const, tools: false, status: "prewarming" as const },
-    toolIntent: false,
+
   };
 }
 
@@ -1311,18 +1347,26 @@ test("every adapter structurally disables tools when toolsAllowed is false", asy
       provider: "openai",
       assertNoTools: (_argv, env) => {
         assert.ok(env?.OPENCODE_CONFIG_CONTENT, "opencode no-tool env present");
-        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "deny" } });
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { tools: { "*": false } });
       },
-      assertTools: (_argv, env) => assert.equal(env, undefined, "opencode tools on -> no override env"),
+      assertTools: (_argv, env) => {
+        // Tools on: must auto-approve so `opencode run` doesn't block on a TTY-less
+        // permission prompt the first time the agent calls a tool.
+        assert.ok(env?.OPENCODE_CONFIG_CONTENT, "opencode tools-on env present");
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "allow" } });
+      },
     },
     {
       mod: "../examples/hermes/adapter.js",
       provider: "openrouter",
       assertNoTools: (_argv, env) => {
         assert.ok(env?.OPENCODE_CONFIG_CONTENT, "hermes no-tool env present");
-        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "deny" } });
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { tools: { "*": false } });
       },
-      assertTools: (_argv, env) => assert.equal(env, undefined, "hermes tools on -> no override env"),
+      assertTools: (_argv, env) => {
+        assert.ok(env?.OPENCODE_CONFIG_CONTENT, "hermes tools-on env present");
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "allow" } });
+      },
     },
   ];
 
@@ -1404,7 +1448,7 @@ test("orchestrator streams Box chunks immediately instead of buffering whole mes
     name: "chunked-box",
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
-    async *shared() { yield `Checking.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *shared() { yield `Checking.`; },
     async *userBox() {
       yield { messageId: "first", text: "Hel" };
       await new Promise((r) => setTimeout(r, 15));
@@ -1435,12 +1479,15 @@ test("transcript flow: shared chatter around one Box request does not duplicate 
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared({ message }) {
       if (/^hey.*ip/i.test(message)) {
-        yield `I don't have a fixed IP address myself. If you want your Box public IP, say so.\n<shared-routing>{"needsPrivate":false}</shared-routing>`;
+        yield `I don't have a fixed IP address myself. If you want your Box public IP, say so.`;
         return;
       }
-      yield `Still working on getting that for you — your Box is finishing provisioning.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+      yield `Still working on getting that for you — your Box is finishing provisioning.`;
     },
-    async *userBox() {
+    async *userBox({ latestUserMessage }) {
+      // The box runs every turn, but only the real request produces an answer;
+      // the greeting and the shared chatter have nothing to add, so they <end>.
+      if (!/yes do please/i.test(latestUserMessage)) { yield "<end>"; return; }
       privateStarts++;
       await new Promise((r) => setTimeout(r, 35));
       yield "The public IP is 135.181.150.124.";
@@ -1479,8 +1526,8 @@ test("transcript flow: shared chatter around one Box request does not duplicate 
   const all = [...request, ...chatterA, ...chatterB];
   assert.ok(latencyMs < 80, `first Box answer was not delayed by shared chatter (${latencyMs}ms)`);
   assert.equal(all.filter((e) => e.type === "user-box.delta").map((e) => e.text).join(""), "The public IP is 135.181.150.124.");
-  assert.equal(privateStarts, 1, "only one Box harness round is invoked for the underlying request");
-  assert.ok([...chatterA, ...chatterB].some((e) => e.type === "trace" && e.stage === "private-round.suppressed"), "shared chatter is suppressed instead of queued behind the active round");
+  assert.equal(privateStarts, 1, "only the underlying request produces a Box answer; greeting and chatter <end>");
+  assert.equal([...chatterA, ...chatterB].filter((e) => e.type === "user-box.delta").length, 0, "shared chatter turns add no private answer on top of the one Box request");
 });
 
 // A spawn stub that streams the given stdout lines then closes. Optionally
@@ -1633,7 +1680,7 @@ test("a box-bound turn whose box agent has not settled never auto-stops the box"
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
     async *shared() {
-      yield `I’m looking into it.\n<shared-routing>{"needsPrivate":true}</shared-routing>`;
+      yield `I’m looking into it.`;
     },
     async *userBox() {
       await firstGate; // hold the first private round open so the second turn is blocked behind it
@@ -1660,14 +1707,16 @@ test("a box-bound turn whose box agent has not settled never auto-stops the box"
   assert.ok(!second.some((e) => e.type === "billing.stop"), "blocked second turn must NOT stop the still-needed Box");
   assert.ok(!second.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "blocked second turn must NOT arm the idle auto-stop");
 
-  // The first turn still completes normally, but the unanswered second prompt is
-  // a hard blocker: no countdown may start while any accepted prompt lacks its
-  // final answer.
+  // Once the first round settles and BOTH streams have ended, nothing genuine is
+  // still pending: the idle countdown may start and the Box stops. A follow-up
+  // whose stream already closed (answered, abandoned, or blocked) must NOT pin a
+  // VM open forever — that permanent-unanswered-prompt leak is exactly why boxes
+  // stayed running for days. Box-settling mid-answer is still protected by the
+  // active-round gate (asserted above), not by holding the prompt "unanswered".
   releaseFirst();
   await d1;
   assert.ok(first.some((e) => e.type === "user-box.delta" && /first box answer/.test(e.text)), "first box round answers");
-  assert.ok(!first.some((e) => e.type === "autostop.timer" && (e.phase === "started" || e.phase === "stopping")), "unanswered follow-up blocks the first turn's idle countdown");
-  assert.ok(!first.some((e) => e.type === "billing.stop"), "unanswered follow-up keeps the Box running");
+  assert.ok(first.some((e) => e.type === "billing.stop"), "with the round settled and all streams ended, the Box auto-stops instead of leaking");
 });
 
 test("a warm box small-talk follow-up settles via the box <end> sentinel and auto-stops", async () => {
@@ -1757,7 +1806,7 @@ test("a long tool-running box prompt surfaces tool traces and only auto-stops af
     name: "cli",
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
-    async *shared() { yield `On it.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *shared() { yield `On it.`; },
     async *userBox(ctx) {
       yield* ctx.capabilities.runHarness({
         argv: ["claude", "-p", "hi"],
@@ -1796,7 +1845,7 @@ test("filesystem question answered when Claude final text arrives as assistant s
     name: "claude-real-shape",
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
-    async *shared() { yield `On it.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *shared() { yield `On it.`; },
     async *userBox(ctx) {
       yield* ctx.capabilities.runHarness({
         argv: ["claude", "-p", "what is in your filesystem"],
@@ -1825,7 +1874,7 @@ test("a box turn whose harness loop is interrupted (aborted) does not arm the id
     name: "abrt",
     requiredEnv: [],
     models: [{ provider: "anthropic", model: "m-1" }],
-    async *shared() { yield `On it.\n<shared-routing>{"needsPrivate":true}</shared-routing>`; },
+    async *shared() { yield `On it.`; },
     async *userBox(ctx) {
       yield "partial working note";
       ctx.onComplete?.({ reason: "aborted", sawText: true });
@@ -1860,4 +1909,96 @@ test("aborting a shared-infra harness run interrupts the process (SIGINT then SI
   controller.abort();
   await run;
   assert.ok(signals.includes("SIGINT"), "abort sends SIGINT to the harness process");
+});
+
+test("box run that ends with no answer and no <end> fails loudly, never silently", async () => {
+  const box = new FakeBoxClient();
+  const silent: HarnessAdapter = {
+    name: "silent-fail",
+    requiredEnv: [],
+    models: [{ provider: "anthropic", model: "m-1" }],
+    async *shared() { yield "I’m checking that now."; },
+    // Emulates a harness whose provider call errored: the loop ends cleanly but
+    // yields no visible text and no <end> sentinel.
+    async *userBox({ onComplete }) {
+      onComplete?.({ reason: "completed", exitCode: 1, sawText: false, diagnostic: "Error: No endpoints found that support tool use." });
+    },
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({ box, harnesses: [silent], readinessPollMs: 1, autoStopIdleMs: 1 });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's your ip?", selection: { harness: "silent-fail", provider: "anthropic", model: "m-1" } })) events.push(e);
+  const blocked = events.find((e) => e.type === "turn.blocked" && e.stage === "box.runtime.no-answer");
+  assert.ok(blocked, "no-answer box run must surface a loud turn.blocked");
+  assert.match(blocked.message, /exit=1/, "blocker carries the harness exit code");
+  assert.match(blocked.message, /No endpoints found/, "blocker carries the harness output tail");
+  assert.equal(events.filter((e) => e.type === "user-box.delta").length, 0, "nothing was fabricated");
+  assert.ok(events.some((e) => e.type === "billing.stop"), "failed round still releases the box");
+});
+
+test("reaper orphan sweep stops running consumer-agent boxes this process is not billing", async () => {
+  const box = new FakeBoxClient();
+  box.boxes.set("box-orphan", { id: "box-orphan", name: "consumer-agent-user-ghost", state: "running" } as any);
+  box.boxes.set("box-foreign", { id: "box-foreign", name: "someone-elses-box", state: "running" } as any);
+  const orchestrator = new ConsumerBoxAgentOrchestrator({
+    box,
+    harnesses: [probeHarness("alpha")],
+    readinessPollMs: 1,
+    autoStopIdleMs: 1,
+    idleReaperIntervalMs: 5,
+    orphanBoxName: (name) => name.startsWith("consumer-agent-"),
+  });
+  try {
+    // First sighting arms the grace window; a later sweep stops the orphan.
+    await waitFor(async () => (await box.get("box-orphan")).state === "archived", 2000);
+    assert.equal((await box.get("box-foreign")).state, "running", "boxes with foreign names are never touched");
+  } finally {
+    orchestrator.dispose();
+  }
+});
+
+test("fresh user box is forked from the pre-installed template when its snapshot exists", async () => {
+  const box = new FakeBoxClient() as any;
+  box.boxes.set("box-template", { id: "box-template", name: "tpl", state: "archived", snapshotAvailable: true } as any);
+  let forkedFrom: string | undefined;
+  box.fork = async (boxId: string) => {
+    forkedFrom = boxId;
+    const forked = { id: "box-forked", state: "idle", name: "" };
+    box.boxes.set(forked.id, forked);
+    return forked;
+  };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({
+    box,
+    harnesses: [probeHarness("alpha")],
+    readinessPollMs: 1,
+    autoStopIdleMs: 1,
+    userBoxTemplate: { name: "tpl", installCmd: "echo install" },
+  });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's your CPU count", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) events.push(e);
+  assert.equal(forkedFrom, "box-template", "new box is forked from the template snapshot");
+  assert.equal(events.find((e) => e.type === "turn.done")?.boxId, "box-forked", "the forked box serves the turn");
+  assert.ok(events.some((e) => e.type === "lifecycle" && e.state === "forking"), "boot surfaces honestly as forking");
+  const renamed = await box.get("box-forked");
+  assert.match(String(renamed.name), /consumer-agent-user-u/, "forked box is renamed to the user box name");
+});
+
+test("missing template kicks off a background build and this boot falls back to create", async () => {
+  const box = new FakeBoxClient() as any;
+  const forkCalls: string[] = [];
+  box.fork = async (boxId: string) => { forkCalls.push(boxId); throw new Error("no snapshot"); };
+  const orchestrator = new ConsumerBoxAgentOrchestrator({
+    box,
+    harnesses: [probeHarness("alpha")],
+    readinessPollMs: 1,
+    autoStopIdleMs: 1,
+    userBoxTemplate: { name: "tpl-being-built", installCmd: "echo install" },
+  });
+  const events: any[] = [];
+  for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "what's your CPU count", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) events.push(e);
+  assert.equal(forkCalls.length, 0, "no fork without a template snapshot");
+  assert.ok(events.some((e) => e.type === "user-box.delta"), "legacy create path still answers");
+  await waitFor(async () => [...box.boxes.values()].some((b: any) => b.name === "tpl-being-built"), 2000);
+  const tpl = [...box.boxes.values()].find((b: any) => b.name === "tpl-being-built") as any;
+  assert.ok(box.commands.some((c: string) => c === "echo install"), "background build ran the template installCmd");
+  await waitFor(async () => (await box.get(tpl.id)).state === "archived", 2000);
 });

@@ -45,6 +45,8 @@ export interface BoxClient {
   update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo>;
   stop(boxId: string): Promise<BoxInfo | { ok: boolean }>;
   resume(boxId: string): Promise<BoxInfo | { ok: boolean }>;
+  /** Fork a box from its latest snapshot (POST /boxes/{id}/fork). Optional: legacy clients may lack it. */
+  fork?(boxId: string): Promise<BoxInfo>;
   command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number; env?: Record<string, string> }): Promise<CommandResult>;
   readFile(boxId: string, path: string): Promise<string>;
   writeFile(boxId: string, path: string, content: string): Promise<void>;
@@ -123,6 +125,8 @@ export interface HarnessCompletion {
   exitCode?: number;
   /** Whether any user-visible assistant text was streamed during this turn. */
   sawText?: boolean;
+  /** Spawn error / trailing stderr, surfaced so a no-output failure explains itself. */
+  diagnostic?: string;
 }
 
 /** User-visible text emitted by a harness, with optional native assistant-message identity. */
@@ -195,8 +199,6 @@ export interface SharedContext {
   hiddenContext: string;
   /** Current machine/tool state — here: shared box, tools=false. */
   machine: MachineState;
-  /** Whether the user asked for real tool work (=> LARP a brief holding reply). */
-  toolIntent: boolean;
   /** Last known native session id for this conversation+harness (resume target). */
   sessionId?: string;
   /** Persist the native session id captured from the harness stream this turn. */
@@ -273,7 +275,6 @@ export interface OrchestratorOptions {
   harnesses: HarnessAdapter[];
   sessions?: SessionStore;
   recapper?: Recapper;
-  sharedBoxName?: string;
   userBoxName?: (userId: string) => string;
   userBoxTtlSeconds?: number;
   readinessPollMs?: number;
@@ -284,4 +285,42 @@ export interface OrchestratorOptions {
   providerEnv?: Record<string, string>;
   /** Delay after a Box answer before auto-stopping, unless a newer user turn arrives. Defaults to 5000ms. */
   autoStopIdleMs?: number;
+  /**
+   * If set (>0), a background reaper runs on this interval and force-stops any
+   * billable Box whose conversation has been idle (no active stream, owed round,
+   * or in-flight boot) for longer than autoStopIdleMs. This is the safety net for
+   * boxes the request-driven auto-stop can't reach — abandoned SSE streams, hung
+   * turns, or a browser tab closed mid-answer. Disabled (undefined) in tests.
+   */
+  idleReaperIntervalMs?: number;
+  /**
+   * Absolute ceiling on how long any Box may bill before the reaper force-stops
+   * it, even if the conversation still looks "active". This is the last-resort
+   * guard against a stuck turn pinning a VM for hours/days. Defaults to 30 min
+   * when the reaper is enabled. Set higher if you run genuinely long box work.
+   */
+  maxBillingAgeMs?: number;
+  /**
+   * Ownership test for the reaper's orphan sweep: given a box name, return true
+   * if this orchestrator is responsible for stopping it when it runs unbilled
+   * (e.g. name => name.startsWith("consumer-agent-")). Orphans appear after a
+   * server restart wipes the in-memory billing map. Requires box.list. Assumes a
+   * single server process owns these names; unset disables the sweep.
+   */
+  orphanBoxName?: (name: string) => boolean;
+  /**
+   * Pre-baked template Box. When set, brand-new user boxes are FORKED from this
+   * template's snapshot instead of created empty + harness-installed — a restore
+   * (~16s, constant) instead of an in-VM npm install (~15-40s, registry-variant).
+   * The template is built lazily in the background (create → installCmd → stop =
+   * snapshot); until its snapshot exists, fresh boxes use the legacy create path
+   * and each turn's own bin-check still installs on demand. Version drift note:
+   * the template pins whatever `installCmd` fetched at build time; delete the
+   * template box to force a rebuild with current versions.
+   */
+  userBoxTemplate?: {
+    name: string;
+    /** Command run inside the template box to pre-install harness dependencies. */
+    installCmd: string;
+  };
 }

@@ -5,3 +5,4 @@ evidence/
 .env.*
 !.env.example
 .DS_Store
+e2e-qa-server-*.log

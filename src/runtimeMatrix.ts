@@ -82,8 +82,8 @@ export const RUNTIME_FEASIBILITY: RuntimeFeasibility[] = [
     streaming: "stdout-chunks",
     proofPath: "opencode run --format json --model openrouter/nousresearch/hermes-4-70b (OPENCODE_CONFIG_CONTENT permission map)",
     blocker: "Direct Hermes token-event schema is not stable in this prototype; Hermes via OpenCode inherits OpenCode JSON event granularity.",
-    source: "Hermes runs through OpenCode's OpenRouter provider; OpenCode docs describe raw JSON events and the permission system.",
-    noToolMechanism: "Inherits OpenCode's structural permission map: OPENCODE_CONFIG_CONTENT={\"permission\":{\"*\":\"deny\"}} denies every tool. Box run sets no override.",
+    source: "Hermes runs through OpenCode's OpenRouter provider; OpenCode docs describe raw JSON events and the tools config map. NOTE: OpenRouter's Hermes endpoints report tools:false (no OpenAI-style tool-use API), so Hermes cannot drive Box tools through OpenCode — chat only.",
+    noToolMechanism: "OPENCODE_CONFIG_CONTENT={\"tools\":{\"*\":false}} structurally removes every tool (permission:deny would hang on a TTY-less approval prompt). Box run sets permission:{\"*\":\"allow\"} plus `opencode run --auto` so tool calls are never blocked on interactive approval.",
   },
   {
     runtime: "OpenCode",
@@ -92,7 +92,7 @@ export const RUNTIME_FEASIBILITY: RuntimeFeasibility[] = [
     streaming: "native-json-events",
     proofPath: "opencode run --format json --model provider/model (OPENCODE_CONFIG_CONTENT permission map)",
     blocker: "OpenCode JSON events are model/text events, not guaranteed one event per provider token; the UI relays each emitted JSON text event immediately.",
-    source: "OpenCode CLI docs describe --format json raw JSON events and the framework-enforced permission system.",
-    noToolMechanism: "OPENCODE_CONFIG_CONTENT={\"permission\":{\"*\":\"deny\"}} denies bash/edit/read/webfetch/all tools (framework-enforced). Box run sets no override, keeping defaults.",
+    source: "OpenCode CLI docs describe --format json raw JSON events and the framework-enforced tools config map.",
+    noToolMechanism: "OPENCODE_CONFIG_CONTENT={\"tools\":{\"*\":false}} structurally removes every tool (permission:deny would hang on a TTY-less approval prompt). Box run sets permission:{\"*\":\"allow\"} so tool calls are never blocked on interactive approval.",
   },
 ];

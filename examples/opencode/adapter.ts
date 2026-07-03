@@ -19,15 +19,17 @@ export const spec: RealCliHarnessSpec = {
   // SAME session with `-s <sessionID>` (verified, opencode 1.16.2 —
   // docs/harness-interrupt-resume-evidence.md).
   sessionStrategy: "capture",
-  buildArgv: ({ prompt, model, provider, resumeSessionId }) => [
+  buildArgv: ({ prompt, model, provider, resumeSessionId, toolsAllowed }) => [
     "opencode", "run", "--format", "json",
+    // Box run: auto-approve tool permissions; a TTY-less `opencode run` would
+    // otherwise hang forever on the first tool call's approval prompt.
+    ...(toolsAllowed ? ["--auto"] : []),
     ...(resumeSessionId ? ["-s", resumeSessionId] : []),
     "--model", `${provider}/${model}`, prompt,
   ],
-  // Structural no-tool mode (shared infra): OpenCode's permission system is
-  // framework-enforced. We inject an inline config via OPENCODE_CONFIG_CONTENT
-  // that denies every tool (`permission: { "*": "deny" }`), so the agent cannot
-  // run bash/edit/read/webfetch. The Box run sets no override, keeping defaults.
+  // Structural tool policy via OPENCODE_CONFIG_CONTENT (see opencodeNoToolEnv):
+  // shared run removes every tool with tools:{"*":false}; Box run auto-approves
+  // permissions so a TTY-less `opencode run` never hangs on an approval prompt.
   buildEnv: ({ toolsAllowed }) => opencodeNoToolEnv(toolsAllowed),
 };
 

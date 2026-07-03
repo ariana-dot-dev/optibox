@@ -148,13 +148,29 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
     harnesses,
     sessions: new InMemorySessionStore(),
     providerEnv,
-    sharedBoxName: `consumer-agent-shared-prewarm-${cacheKey.slice(0, 8)}`,
     userBoxName: (userId) => `consumer-agent-user-${userId}-${cacheKey.slice(0, 8)}`,
     userBoxTtlSeconds: 900,
-    readinessPollMs: 2000,
+    // Readiness is now a live command probe (boxes execute commands seconds
+    // before their state field reports ready), so poll fast to actually collect
+    // that win instead of sleeping through it.
+    readinessPollMs: 750,
     handoffTimeoutMs: 120_000,
     resumeTimeoutMs: 60_000,
     autoStopIdleMs: 10_000,
+    // Safety net: force-stop idle boxes on a timer even if a request stream was
+    // abandoned or a turn hung, so a VM can never be left running for hours/days.
+    idleReaperIntervalMs: 15_000,
+    // Orphan sweep: after a server restart the in-memory billing map is empty, so
+    // running consumer-agent boxes from the previous process would bill until TTL.
+    // The reaper stops any running box with our naming that this process isn't
+    // billing (after a grace window). Assumes one server process per Box account.
+    orphanBoxName: (name) => name.startsWith("consumer-agent-"),
+    // Fresh user boxes fork this pre-installed snapshot (~16s restore) instead of
+    // creating an empty box and npm-installing opencode inside it (~15-40s).
+    userBoxTemplate: {
+      name: "consumer-agent-template",
+      installCmd: "npm i -g opencode-ai@latest >/tmp/opencode-install.log 2>&1",
+    },
   });
   orchestrators.set(cacheKey, orchestrator);
   return orchestrator;
@@ -530,7 +546,8 @@ function routeEvent(ev){
   if(ev.type==='stream.end')return;
   if(ev.type==='error'||ev.type==='turn.blocked'){routeState.phase='error';setRoute('error','Route error: private runtime did not complete; see trace for the real event.');return;}
   if(ev.type==='trace'&&/backend|submit/.test(ev.stage||'')){routeState.phase='accepted';setRoute('shared','Route: backend accepted the message; shared bridge is live while Box status resolves.');return;}
-  if(ev.type==='shared.larp'){if(routeIsPrivate()){setRoute('private','Route: shared bridge is covering latency while private Box status continues'+boxLabel(routeState.boxId)+'.');return;}routeState.phase='shared-bridge';setRoute('shared','Route: shared bridge is covering latency while the private Box starts/resumes.');return;}
+  if(ev.type==='trace'&&ev.stage==='route.direct'){routeState.phase='user-box';setRoute('private','Route: private Box is warm; message routed directly to it (no shared bridge).');return;}
+  if(ev.type==='trace'&&ev.stage==='shared.bridge.start'){if(routeIsPrivate()){setRoute('private','Route: shared agent is answering first while private Box status continues'+boxLabel(routeState.boxId)+'.');return;}routeState.phase='shared-bridge';setRoute('shared','Route: shared agent answers first while the private Box starts/resumes.');return;}
   if(ev.type==='context.injected'&&ev.scope==='shared'){if(routeIsPrivate()){setRoute('private','Route: private Box is active'+boxLabel(routeState.boxId)+'; shared bridge is only covering latency.');return;}routeState.phase='shared';setRoute('shared','Route: shared infra is answering while the private Box boots in parallel.');return;}
   if(ev.type==='shared.delta'&&routeState.phase!=='handoff'&&routeState.phase!=='user-box'){if(routeIsPrivate()){setRoute('private','Route: private Box path is active'+boxLabel(routeState.boxId)+'; shared text is just the bridge response.');return;}routeState.phase='shared-delta';setRoute('shared','Route: shared infra is streaming the bridge response; private Box events will take over when ready.');return;}
   if(ev.type==='billing.start'){routeState.boxId=ev.boxId||routeState.boxId;routeState.billing=true;routeState.phase='billing';setRoute('private','Route: private Box billing is live'+boxLabel(routeState.boxId)+'; handoff/runtime events are active.');return;}
@@ -612,7 +629,6 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);routeEvent
   if(ev.type==='trace'){addMsg('trace','trace · '+(ev.stage||'event'),(ev.message||JSON.stringify(ev))+'\\n',keyFor(ev,localId,'trace')+':'+(ev.stage||Math.random()));if(/bridge/.test(ev.stage||''))setState('Shared bridge active · private Box booting');else if(/backend|submit/.test(ev.stage||''))setState('Request received · shared bridge starting');}
   else if(ev.type==='turn.blocked'){addMsg('trace','blocker · '+(ev.stage||'runtime'),(ev.message||'Private runtime unavailable')+'\\n',keyFor(ev,localId,'blocked')+':'+(ev.stage||Math.random()));addMsg('assistant','assistant','Private runtime is not ready yet. This turn stayed on the shared bridge; retry when Box status is ready.');setState('Private runtime unavailable · retry after Box is ready');}
   else if(ev.type==='shared.delta'){addMsg('assistant','assistant · shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
-  else if(ev.type==='shared.larp'){setState('Shared bridge active · private Box starting/resuming');}
   else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private Box booting in parallel');}
   else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}

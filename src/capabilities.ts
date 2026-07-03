@@ -330,11 +330,16 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     const timeoutMs = spec.timeoutMs ?? DEFAULT_HARNESS_TIMEOUT_MS;
     const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent, spec.onSessionId);
     let sawText = false;
+    let rawTail = "";
     let completionReported = false;
     const reportCompletion = (info: HarnessCompletion): void => {
       if (completionReported) return;
       completionReported = true;
-      spec.onComplete?.({ ...info, sawText });
+      // When the loop ended with no visible text, surface the raw log tail so a
+      // no-answer failure explains itself (e.g. a provider error the JSON parser
+      // rightly did not treat as assistant text).
+      const diagnostic = !sawText && rawTail.trim() ? rawTail.trim().slice(-500) : undefined;
+      spec.onComplete?.({ ...info, sawText, ...(diagnostic ? { diagnostic } : {}) });
     };
     const noteChunk = (chunk: HarnessTextChunk): HarnessTextChunk => {
       if (chunk.text && chunk.text.trim()) sawText = true;
@@ -367,12 +372,19 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
       if (aborted) { reportCompletion({ reason: "aborted" }); return; }
       await new Promise((r) => setTimeout(r, effectivePollMs));
       if (aborted) { reportCompletion({ reason: "aborted" }); return; }
+      // ONE round trip per poll: read the log AND the process aliveness together.
+      // (A separate `kill -0` command doubled the HTTP polls for zero benefit.)
       let content = "";
+      let alive = "unknown";
       try {
-        content = (await box.command(boxId, { command: `cat ${shq(log)} 2>/dev/null || true`, timeoutMs: 15_000 })).stdout;
-      } catch { /* not created yet */ }
+        const polled = (await box.command(boxId, { command: `cat ${shq(log)} 2>/dev/null || true; printf '\\n__CBA_ALIVE__:%s\\n' "$(kill -0 ${pid || "0"} 2>/dev/null && echo up || echo down)"`, timeoutMs: 15_000 })).stdout;
+        const aliveMatch = polled.match(/\n?__CBA_ALIVE__:(\w+)\s*$/);
+        alive = aliveMatch?.[1] ?? "unknown";
+        content = polled.replace(/\n?__CBA_ALIVE__:\w+\s*$/g, "");
+      } catch { /* transient command failure; retry next poll */ }
       const exitMatch = content.match(/__CBA_EXIT__:(\d+)\s*$/);
       const visible = content.replace(/\n?__CBA_EXIT__:\d+\s*$/g, "");
+      rawTail = visible.slice(-600);
       if (visible.length > offset) {
         const rawDelta = visible.slice(offset);
         for (const chunk of parseHarnessOutput(rawDelta, parser)) yield noteChunk(chunk);
@@ -389,13 +401,10 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
         return;
       }
       // process gone but no exit marker -> stop polling (crash/kill, not a clean end)
-      if (pid) {
-        const alive = (await box.command(boxId, { command: `kill -0 ${pid} 2>/dev/null && echo up || echo down`, timeoutMs: 15_000 })).stdout.trim();
-        if (alive === "down") {
-          if (visible.length > offset) yield noteChunk({ text: visible.slice(offset), messageId: "stdout-0", messageIndex: 0 });
-          reportCompletion({ reason: "process-exited" });
-          return;
-        }
+      if (pid && alive === "down") {
+        if (visible.length > offset) yield noteChunk({ text: visible.slice(offset), messageId: "stdout-0", messageIndex: 0 });
+        reportCompletion({ reason: "process-exited" });
+        return;
       }
     }
     if (aborted) { reportCompletion({ reason: "aborted" }); return; }
@@ -465,33 +474,83 @@ export function createSharedInfraCapabilities(options: SharedInfraCapabilityOpti
   async function* runHarness(spec: HarnessRunSpec): AsyncIterable<HarnessTextChunk> {
     options.onExec?.({ kind: "harness", argv: spec.argv });
     const parser = createHarnessOutputParser(spec.outputMode ?? "raw-stdout", options.onHarnessEvent, spec.onSessionId);
-    const bin = spec.argv[0] ?? "";
-    const args = spec.argv.slice(1);
-    const child = spawnFn(bin, args, { cwd: spec.cwd, env: baseEnv(spec.env), stdio: ["ignore", "pipe", "pipe"] });
+    // Launch through a login shell instead of spawning argv[0] directly. npm CLIs
+    // are launcher shims (extensionless shell shims resolved by Git Bash, plus
+    // *.cmd on Windows); a bare spawn() bypasses PATHEXT and dies with ENOENT on
+    // the exact CLIs this surface must run. bash resolves them the same way
+    // `command -v` does, and shq() keeps each argv element (incl. the prompt) intact.
+    // Enter the workspace via `cd` INSIDE bash rather than Node's spawn cwd.
+    // spec.cwd is an MSYS path (e.g. /tmp/consumer-agent-...). On Windows, Node
+    // resolves a spawn cwd against the Win32 filesystem (C:\tmp\...), which does
+    // not exist, and spawn then fails with a misleading `spawn bash ENOENT`. bash
+    // resolves the MSYS path correctly, so let bash change into it.
+    const cdPrefix = spec.cwd ? `cd ${shq(spec.cwd)} && ` : "";
+    const commandLine = cdPrefix + spec.argv.map(shq).join(" ");
+    const child = spawnFn("bash", ["-lc", commandLine], { env: baseEnv(spec.env), stdio: ["ignore", "pipe", "pipe"] });
     const timeoutMs = spec.timeoutMs ?? DEFAULT_HARNESS_TIMEOUT_MS;
     let timedOut = false;
     let aborted = false;
     let sawText = false;
+    let spawnError: Error | undefined;
+    // A subprocess that never launches must degrade to an empty shared bridge,
+    // never crash the server with an unhandled 'error' event.
+    child.on("error", (err) => { spawnError = err instanceof Error ? err : new Error(String(err)); });
     const noteChunk = (chunk: HarnessTextChunk): HarnessTextChunk => {
       if (chunk.text && chunk.text.trim()) sawText = true;
       return chunk;
     };
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    // KILL THE TREE, not just the immediate child. We launch via `bash -lc`, so
+    // the real harness (opencode/claude/…) is a GRANDCHILD. On Windows,
+    // child.kill() terminates only bash; the orphaned grandchild keeps the stdout
+    // pipe open, the `for await (child.stdout)` loop never ends, the turn stays
+    // "active" forever, and idle auto-stop is blocked — the exact "no answer and
+    // the box never stops" failure. taskkill /T takes the whole tree down.
+    const killTree = (): void => {
+      if (process.platform === "win32" && child.pid) {
+        try { spawnFn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" }); } catch { /* already gone */ }
+      }
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    };
+    const timer = setTimeout(() => { timedOut = true; killTree(); }, timeoutMs);
     // Interrupt == "agent stops talking": SIGINT for a graceful stop, then a hard
-    // SIGKILL if it lingers. Completed turns are already flushed to the harness'
+    // tree-kill if it lingers. Completed turns are already flushed to the harness'
     // session file, so the conversation stays resumable by id next turn.
     const onAbort = () => {
       aborted = true;
       try { child.kill("SIGINT"); } catch { /* already gone */ }
-      setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } }, 2000);
+      setTimeout(() => killTree(), 2000);
     };
     if (spec.signal?.aborted) onAbort();
     else spec.signal?.addEventListener("abort", onAbort, { once: true });
-    child.stderr?.on("data", () => { /* surfaced via exit if non-zero; harness owns its own error text */ });
+    // Keep the harness' own error text for a loud, diagnostic failure: it is
+    // surfaced via onComplete.stderr when the run produced no visible answer.
+    let stderrBuf = "";
+    child.stderr?.on("data", (d) => { if (stderrBuf.length < 4000) stderrBuf += String(d); });
     try {
       if (child.stdout) {
-        for await (const buf of child.stdout) {
-          for (const chunk of parseHarnessOutput(String(buf), parser)) yield noteChunk(chunk);
+        // Enforce the deadline ON THE READ LOOP, not only via killTree. An
+        // orphaned grandchild (opencode shim chains) can survive the tree-kill
+        // holding the inherited stdout pipe open — then this loop would never end
+        // and the turn would stay "active" forever, blocking idle auto-stop. Race
+        // every read against a hard deadline so the TURN always terminates.
+        const deadline = new Promise<{ kind: "deadline" }>((resolve) => {
+          const t = setTimeout(() => resolve({ kind: "deadline" }), timeoutMs + 5000);
+          t.unref?.();
+        });
+        const it = child.stdout[Symbol.asyncIterator]();
+        while (true) {
+          const raced = await Promise.race([
+            it.next().then((n) => ({ kind: "next" as const, n })),
+            deadline,
+          ]);
+          if (raced.kind === "deadline") {
+            timedOut = true;
+            killTree();
+            try { child.stdout.destroy(); } catch { /* already gone */ }
+            break;
+          }
+          if (raced.n.done) break;
+          for (const chunk of parseHarnessOutput(String(raced.n.value), parser)) yield noteChunk(chunk);
         }
       }
       // Flush any trailing partial JSON line the harness emitted without a newline.
@@ -500,13 +559,30 @@ export function createSharedInfraCapabilities(options: SharedInfraCapabilityOpti
         parser.lineBuffer = "";
         if (text) yield noteChunk(text);
       }
+    } catch (err) {
+      // stdout torn down by a spawn failure: degrade to no shared output, don't propagate.
+      spawnError = spawnError ?? (err instanceof Error ? err : new Error(String(err)));
     } finally {
       clearTimeout(timer);
       spec.signal?.removeEventListener("abort", onAbort);
     }
-    await new Promise<void>((resolve) => { child.on("close", () => resolve()); if (child.exitCode !== null) resolve(); });
+    await new Promise<void>((resolve) => {
+      // Same principle for the close-wait: never block on a process whose pipes
+      // an orphan may be holding. 10s after the read loop ended is final.
+      const t = setTimeout(() => resolve(), 10_000);
+      t.unref?.();
+      child.on("close", () => { clearTimeout(t); resolve(); });
+      child.on("error", () => { clearTimeout(t); resolve(); });
+      if (child.exitCode !== null || spawnError) { clearTimeout(t); resolve(); }
+    });
     if (timedOut && !aborted) yield noteChunk({ text: `\n[shared harness safety timeout after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 });
-    spec.onComplete?.({ reason: aborted ? "aborted" : timedOut ? "timeout" : "completed", sawText, ...(typeof child.exitCode === "number" ? { exitCode: child.exitCode } : {}) });
+    const diag = spawnError ? spawnError.message : stderrBuf.trim().slice(-500);
+    spec.onComplete?.({
+      reason: aborted ? "aborted" : spawnError ? "process-exited" : timedOut ? "timeout" : "completed",
+      sawText,
+      ...(typeof child.exitCode === "number" ? { exitCode: child.exitCode } : {}),
+      ...(diag ? { diagnostic: diag } : {}),
+    });
   }
 
   async function writeFile(path: string, content: string): Promise<void> {

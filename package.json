@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/orchestrator.test.js dist/test/client-send-regression.test.js",
+    "qa:e2e": "npm run build && node --env-file=.env dist/scripts/e2e-qa.js",
     "test:real-box": "npm run build && node dist/test/real-box-smoke.js",
     "demo:real-e2e": "npm run build && node dist/scripts/real-e2e-demo.js",
     "proof:interactive": "npm run build && node dist/scripts/interactive-proof-server.js"

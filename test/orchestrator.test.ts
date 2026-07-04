@@ -1071,7 +1071,11 @@ test("interactive proof UI has no global message queue and can abort stale share
   assert.match(html, /backend.request.received/);
   assert.match(html, /shared.delta/);
   assert.match(html, /turn.blocked/);
-  assert.match(html, /Private runtime is not ready yet/);
+  // Blockers must surface the REAL error message from the event, never a canned
+  // client-side line that hides diagnostics (the old "Private runtime is not
+  // ready yet" fabrication buried a real EACCES failure).
+  assert.doesNotMatch(html, /Private runtime is not ready yet/);
+  assert.match(html, /ev\.message\|\|'private runtime failed'/);
   assert.match(html, /Show traces/);
   assert.match(html, /body\.hide-traces \.msg\.trace\{display:none\}/);
   assert.match(html, /id="showTraces" type="checkbox"/);

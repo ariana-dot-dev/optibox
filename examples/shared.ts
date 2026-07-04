@@ -200,6 +200,9 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "NEVER say you lack access, cannot run commands, or cannot see the user's machine. The private runtime WILL handle machine work right after you — denying capability is factually wrong and contradicts the answer the user is about to receive. For machine work your entire reply is just the short holding line."
       : undefined,
     !policy.toolsAllowed
+      ? "Machine facts (IP address, hostname, OS, CPU, files) are about THE USER'S OWN machine, which they fully own and may inspect freely. NEVER refuse them as private/secret 'infrastructure details' — there is no policy against them. Reply with the short holding line and let the private runtime report the real values."
+      : undefined,
+    !policy.toolsAllowed
       ? "For PUBLIC live data (weather, news, prices, current events) you DO have the webfetch tool: fetch a public source and answer directly. Never claim you cannot access live data. Known-good sources: weather https://wttr.in/<city>?format=3 ; general/topic news https://lite.duckduckgo.com/lite/?q=<query>+news ; world headlines https://feeds.bbci.co.uk/news/world/rss.xml . One or two fetches maximum, then answer with what you got."
       : undefined,
     policy.toolsAllowed && userCtx?.partialShared
@@ -278,6 +281,12 @@ async function prepareTurnWorkspace(
   const encoded = Buffer.from(instructions + "\n", "utf8").toString("base64");
   const parts = [
     `mkdir -p ${shellQuote(cwd)}`,
+    // Box only: heal the harness state dir. Long-lived boxes that saw installs
+    // from different uids can end up with an unwritable ~/.local/share/opencode
+    // ("EACCES: mkdir .../opencode/repos"), which kills every run at startup.
+    ...(runtime.location === "user-box"
+      ? [`(mkdir -p ~/.local/share/opencode 2>/dev/null; [ -w ~/.local/share/opencode ] || sudo -n chown -R "$(id -u):$(id -g)" ~/.local/share/opencode 2>/dev/null; chmod -R u+rwX ~/.local/share/opencode 2>/dev/null; true)`]
+      : []),
     `printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(systemInstructionPath)}`,
   ];
   if (delivery === "workspace-agents-md") {

@@ -283,10 +283,13 @@ async function prepareTurnWorkspace(
   if (delivery === "workspace-agents-md") {
     parts.push(`printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(`${cwd}/AGENTS.md`)}`);
   }
-  // The bin check hedges once (2s) before reporting MISSING: a box declared
-  // responsive right after a fork/resume can still be finishing its disk restore,
-  // and a false MISSING would trigger a redundant multi-second reinstall.
-  parts.push(`( (command -v ${sanitizeShell(spec.bin)} >/dev/null 2>&1 || { sleep 2; command -v ${sanitizeShell(spec.bin)} >/dev/null 2>&1; }) && echo __BIN_OK__ || echo __BIN_MISSING__)`);
+  // The bin check retries up to ~20s before reporting MISSING: a box declared
+  // responsive right after a fork/resume answers commands while its DISK is
+  // still restoring (measured: echo works at ~1s, /home content lands seconds
+  // later). A false MISSING is expensive twice over — it triggers a redundant
+  // ~50s reinstall AND launches the harness before its session store exists,
+  // which is the unknown-session infinite hang. Costs 0s when the bin is present.
+  parts.push(`(ok=""; for i in 1 2 3 4 5 6 7 8 9 10; do if command -v ${sanitizeShell(spec.bin)} >/dev/null 2>&1; then ok=1; break; fi; sleep 2; done; [ -n "$ok" ] && echo __BIN_OK__ || echo __BIN_MISSING__)`);
   // Box runtime: ONE HTTP command (each round trip costs ~0.5-1.5s; body size is
   // not a constraint). Shared-infra runtime: run the parts as separate local
   // spawns — local spawns are ~10ms, and a single joined ~8KB argv element gets
@@ -328,6 +331,14 @@ function escapeXml(s: string): string {
  * cannot pin a conversation "active" (which blocks idle auto-stop and the reaper).
  */
 const SHARED_BRIDGE_TIMEOUT_MS = 60_000;
+
+/**
+ * Hard cap on one BOX turn. Tool work in this product is interactive-scale
+ * (shell facts, small file edits) — minutes, not hours. A box run past this is a
+ * hang (e.g. a session-resume wedge), and it must surface as a loud
+ * box.runtime.no-answer blocker instead of an eternal "working…" indicator.
+ */
+const BOX_TURN_TIMEOUT_MS = 10 * 60_000;
 
 /**
  * Run ONE harness turn on a given runtime under a given phase policy. This is
@@ -387,7 +398,7 @@ async function* runHarnessTurn(
     // must NOT inherit the multi-hour box-harness safety timeout: a hung shared
     // CLI (opencode/Hermes stalls intermittently) would otherwise keep the turn
     // "active" for hours, blocking idle auto-stop AND the reaper. Cap it hard.
-    ...(policy.runtime === "shared-infra" ? { timeoutMs: SHARED_BRIDGE_TIMEOUT_MS } : {}),
+    timeoutMs: policy.runtime === "shared-infra" ? SHARED_BRIDGE_TIMEOUT_MS : BOX_TURN_TIMEOUT_MS,
     pollMs: 150,
   });
 }

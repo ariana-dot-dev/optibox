@@ -26,6 +26,11 @@ export const spec: RealCliHarnessSpec = {
   sessionStrategy: "capture",
   buildArgv: ({ prompt, model, resumeSessionId, toolsAllowed }) => [
     "opencode", "run", "--format", "json",
+    // Fixed session title. Without it, OpenCode fires a second LLM call to
+    // google/gemini-3.5-flash just to name the session (which errors "Reasoning
+    // mandatory" on that model) BEFORE the real model runs — measured ~0.8s of
+    // dead time per turn. A static title skips that side-call entirely.
+    "--title", "optibox",
     // Private Box run: auto-approve tool permissions so `opencode run` doesn't
     // block forever on a TTY-less approval prompt the first time it calls a tool.
     ...(toolsAllowed ? ["--auto"] : []),

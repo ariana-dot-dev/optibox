@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createSharedInfraCapabilities } from "../src/capabilities.js";
+import { sharedDirectStream } from "./sharedDirectStream.js";
 import type { CommandResult, HarnessAdapter, HarnessOutputChunk, HarnessOutputMode, HarnessRuntime, ModelOption, SharedContext, UserBoxContext } from "../src/index.js";
 
 /** Provider->envvar pairs to inject into the Box so the harness can call the LLM. */
@@ -434,6 +435,27 @@ export function realCliHarness(spec: RealCliHarnessSpec, deps: RealCliHarnessDep
       const policy: HarnessPhasePolicy = { phase: "shared", toolsAllowed: false, runtime: "shared-infra" };
       if (spec.sharedModel) {
         ctx = { ...ctx, selection: { ...ctx.selection, ...(spec.sharedModel.provider ? { provider: spec.sharedModel.provider } : {}), model: spec.sharedModel.model } };
+      }
+      // Direct provider streaming for OpenCode-backed harnesses. The shared surface
+      // is a stateless, no-tools chat line, so it does NOT run OpenCode at all here:
+      // `opencode run` cold-starts ~6.5s/turn and a warm `opencode serve` WEDGES
+      // under this system's rapid-message + interrupt load (one stuck generation
+      // makes every later shared turn return empty). A direct provider call is an
+      // independent request — nothing shared to wedge, an interrupt just drops it,
+      // and it streams token-by-token (~1.25s to first token). See sharedDirectStream.
+      if (spec.outputMode === "opencode-json") {
+        const bundle = buildHarnessPromptBundle(ctx, policy);
+        const argv = spec.buildArgv({ prompt: bundle.prompt, model: ctx.selection.model, provider: ctx.selection.provider, cwd: ".", systemInstructionPath: "", toolsAllowed: false });
+        const mi = argv.indexOf("--model");
+        const modelString = (mi >= 0 ? argv[mi + 1] : undefined) ?? `${ctx.selection.provider}/${ctx.selection.model}`;
+        yield* sharedDirectStream({
+          modelString,
+          prompt: bundle.prompt,
+          ...(ctx.onComplete ? { onComplete: ctx.onComplete } : {}),
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+          timeoutMs: SHARED_BRIDGE_TIMEOUT_MS,
+        });
+        return;
       }
       for await (const chunk of runHarnessTurn(spec, runtime, ctx, policy)) {
         yield typeof chunk === "string" ? chunk : chunk.text;

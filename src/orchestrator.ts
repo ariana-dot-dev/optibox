@@ -1894,22 +1894,26 @@ export class ConsumerBoxAgentOrchestrator {
       }
       yield* emitChunkEvent(chunk);
     };
-    let next = itc.next();
-    while (true) {
-      const raced = await Promise.race([
-        next.then((n) => ({ kind: "next" as const, n })),
-        sleep(50).then(() => ({ kind: "tick" as const })),
-      ]);
+    const drainIterator = async function* (iterator: AsyncIterator<unknown>): AsyncIterable<ConsumerTurnEvent> {
+      let next = iterator.next();
+      while (true) {
+        const raced = await Promise.race([
+          next.then((n) => ({ kind: "next" as const, n })),
+          sleep(50).then(() => ({ kind: "tick" as const })),
+        ]);
+        yield* flushExecEvents();
+        if (raced.kind === "tick") continue;
+        if (raced.n.done) break;
+        yield* emitPrivateChunk(raced.n.value);
+        next = iterator.next();
+      }
       yield* flushExecEvents();
-      if (raced.kind === "tick") continue;
-      if (raced.n.done) break;
-      yield* emitPrivateChunk(raced.n.value);
-      next = itc.next();
-    }
-    yield* flushExecEvents();
-    if (heldEndCandidate && heldEndCandidate !== PRIVATE_END_SENTINEL) {
-      yield* emitChunkEvent({ text: heldEndCandidate, messageId: "assistant-0", messageIndex: 0 });
-    }
+      if (heldEndCandidate && heldEndCandidate !== PRIVATE_END_SENTINEL) {
+        yield* emitChunkEvent({ text: heldEndCandidate, messageId: "assistant-0", messageIndex: 0 });
+        heldEndCandidate = "";
+      }
+    };
+    yield* drainIterator(itc);
     if (!this.isPrivateRoundCurrent(key, round)) {
       this.markPrivateRound(key, round, "stale");
       yield {
@@ -1926,6 +1930,45 @@ export class ConsumerBoxAgentOrchestrator {
       };
       yield { type: "turn.done", boxId: box.id, harness: harness.name, model: input.selection.model, route: "shared" };
       return;
+    }
+    // Rule 1 salvage: the box agent ran tools successfully but its run ended before
+    // writing a final answer (observed with opencode: `run` can exit right after a
+    // tool-call step, discarding the tool result). Rather than lose a successful
+    // result to the loud no-answer blocker, resume the SAME session ONCE and ask it
+    // to deliver the answer it already computed. Only a STILL-empty result after
+    // this genuine retry falls through to fail loudly below. Not attempted on abort
+    // (interrupted, not stuck) or when no tool ran (nothing to summarize).
+    if (!userText && sawToolUse && completion.reason !== "aborted") {
+      const resumeSessionId = this.harnessSessions.get(userBoxSessionKey);
+      yield this.traceState(
+        key,
+        "box.runtime.continue",
+        "box agent used tools but ended without a final answer; resuming its session once to deliver the answer it already computed",
+        input,
+        this.turnSequences.get(key),
+        { boxId: box.id, roundId: round.id, resume: Boolean(resumeSessionId) },
+      );
+      let continuationCompletion: HarnessCompletion = { reason: "completed" };
+      const continuation = harness.userBox({
+        userId: input.userId,
+        conversationId: input.conversationId,
+        boxId: box.id,
+        recap,
+        latestUserMessage:
+          "You already ran the necessary tools in this session and have their output. Write your final answer to the user now, in plain prose, using those results. Do not call more tools unless strictly required. If you truly have nothing to answer, return exactly <end>.",
+        transcript: userBoxTranscript,
+        selection: input.selection,
+        capabilities,
+        hiddenContext: userHidden,
+        machine: userMachine,
+        partialShared,
+        ...(resumeSessionId ? { sessionId: resumeSessionId } : {}),
+        ...(signal ? { signal } : {}),
+        onSessionId: (id: string) => this.harnessSessions.set(userBoxSessionKey, id),
+        onComplete: (info: HarnessCompletion) => { continuationCompletion = info; },
+      });
+      yield* drainIterator(continuation[Symbol.asyncIterator]());
+      completion = continuationCompletion;
     }
     if (userText === PRIVATE_END_SENTINEL) {
       yield {

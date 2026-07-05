@@ -21,6 +21,10 @@ export const spec: RealCliHarnessSpec = {
   sessionStrategy: "capture",
   buildArgv: ({ prompt, model, provider, resumeSessionId, toolsAllowed }) => [
     "opencode", "run", "--format", "json",
+    // Fixed session title: skip OpenCode's auto-title side-call to
+    // google/gemini-3.5-flash (errors "Reasoning mandatory", ~0.8s dead time
+    // before the real model runs). Verified via --print-logs DEBUG.
+    "--title", "optibox",
     // Box run: auto-approve tool permissions; a TTY-less `opencode run` would
     // otherwise hang forever on the first tool call's approval prompt.
     ...(toolsAllowed ? ["--auto"] : []),

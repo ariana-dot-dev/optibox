@@ -1056,11 +1056,12 @@ test("interactive proof UI has no global message queue and can abort stale share
   assert.match(html, /function routeEvent\(ev\)/);
   assert.match(html, /function resetRouteForTurn\(\)/);
   assert.match(html, /function routeIsPrivate\(\)/);
-  assert.match(html, /routeEvent\(ev\);const t=activeTurns/);
+  assert.match(html, /if\(isLatest\)routeEvent\(ev\)/);
+  assert.match(html, /const t=activeTurns\.get\(localId\)/);
   assert.doesNotMatch(html, /function routeForState/);
   assert.doesNotMatch(html, /Route: handed off to the user machine\./);
   assert.doesNotMatch(html, /waiting for runtime events/);
-  assert.match(html, /message accepted; checking Box state/);
+  assert.match(html, /message accepted · checking Box state/);
   assert.match(html, /shared text is just the bridge response/);
   assert.match(html, /private Box is '\+state\+boxLabel\(routeState\.boxId\)/);
   assert.match(html, /user-machine answer is streaming/);

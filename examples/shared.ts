@@ -299,7 +299,11 @@ async function prepareTurnWorkspace(
   // later). A false MISSING is expensive twice over — it triggers a redundant
   // ~50s reinstall AND launches the harness before its session store exists,
   // which is the unknown-session infinite hang. Costs 0s when the bin is present.
-  parts.push(`(ok=""; for i in 1 2 3 4 5 6 7 8 9 10; do if command -v ${sanitizeShell(spec.bin)} >/dev/null 2>&1; then ok=1; break; fi; sleep 2; done; [ -n "$ok" ] && echo __BIN_OK__ || echo __BIN_MISSING__)`);
+  // Poll FINELY (0.25s), not every 2s: after a resume opencode lands on PATH within
+  // a second or so, and a coarse 2s sleep overshoots by seconds on every turn
+  // (measured ~6.5s of dead prep just waiting on this). Same ~20s worst-case budget
+  // for a genuinely still-restoring disk, but ~0s once the bin is actually present.
+  parts.push(`(ok=""; for i in $(seq 1 80); do if command -v ${sanitizeShell(spec.bin)} >/dev/null 2>&1; then ok=1; break; fi; sleep 0.25; done; [ -n "$ok" ] && echo __BIN_OK__ || echo __BIN_MISSING__)`);
   // Box runtime: ONE HTTP command (each round trip costs ~0.5-1.5s; body size is
   // not a constraint). Shared-infra runtime: run the parts as separate local
   // spawns — local spawns are ~10ms, and a single joined ~8KB argv element gets

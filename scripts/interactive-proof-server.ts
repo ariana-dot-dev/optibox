@@ -156,7 +156,11 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
     readinessPollMs: 750,
     handoffTimeoutMs: 120_000,
     resumeTimeoutMs: 60_000,
-    autoStopIdleMs: 10_000,
+    // 3 minutes, not 10s: an archived box costs a full resume + disk restore +
+    // serve reboot on the NEXT message (~12s of pure lifecycle overhead,
+    // measured), while a warm box costs $0.036/hour. During an active
+    // conversation the box must stay warm so follow-ups answer in seconds.
+    autoStopIdleMs: 180_000,
     // Safety net: force-stop idle boxes on a timer even if a request stream was
     // abandoned or a turn hung, so a VM can never be left running for hours/days.
     idleReaperIntervalMs: 15_000,

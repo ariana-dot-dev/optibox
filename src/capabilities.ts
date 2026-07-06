@@ -93,6 +93,7 @@ function extractSessionId(j: any, mode: HarnessOutputMode): string | undefined {
     return pick(j.thread_id, j.session_id, j.session?.id);
   }
   if (mode === "opencode-json") return pick(j.sessionID, j.info?.sessionID, j.part?.sessionID, j.properties?.sessionID, j.message?.sessionID);
+  if (mode === "opencode-serve-json") return pick(j.info?.sessionID, j.sessionID, Array.isArray(j.parts) ? j.parts[0]?.sessionID : undefined);
   if (mode === "pi-json") {
     if (j.type === "session") return pick(j.id, j.session?.id);
     return pick(j.sessionId, j.session?.id);
@@ -153,6 +154,28 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): Harnes
       return emitChunk(j.result, parser);
     }
     return undefined;
+  }
+
+  if (parser.mode === "opencode-serve-json") {
+    // The whole turn arrives as ONE message object: {"info":{...},"parts":[...]}.
+    // Tool parts surface as native tool events; text parts concatenate into the
+    // visible answer. Error payloads have no parts array and are intentionally
+    // ignored so the no-answer diagnostic (raw log tail) explains the failure.
+    if (!Array.isArray(j.parts)) return undefined;
+    let text = "";
+    for (const part of j.parts) {
+      if (part?.type === "text" && typeof part.text === "string") text += part.text;
+      if (part?.type === "tool" && parser.onToolEvent) {
+        parser.onToolEvent({
+          phase: "tool_use",
+          toolName: String(part.tool ?? "tool"),
+          command: typeof part.state?.input?.command === "string" ? part.state.input.command : undefined,
+          description: typeof part.state?.title === "string" ? part.state.title : undefined,
+          stdout: typeof part.state?.output === "string" ? part.state.output : undefined,
+        });
+      }
+    }
+    return emitNewSuffix(text, parser);
   }
 
   if (parser.mode === "opencode-json" || parser.mode === "pi-json") {

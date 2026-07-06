@@ -1357,7 +1357,7 @@ test("every adapter structurally disables tools when toolsAllowed is false", asy
         // Tools on: must auto-approve so `opencode run` doesn't block on a TTY-less
         // permission prompt the first time the agent calls a tool.
         assert.ok(env?.OPENCODE_CONFIG_CONTENT, "opencode tools-on env present");
-        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "allow" } });
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "allow" }, autoupdate: false, snapshot: false });
       },
     },
     {
@@ -1369,7 +1369,7 @@ test("every adapter structurally disables tools when toolsAllowed is false", asy
       },
       assertTools: (_argv, env) => {
         assert.ok(env?.OPENCODE_CONFIG_CONTENT, "hermes tools-on env present");
-        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "allow" } });
+        assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "allow" }, autoupdate: false, snapshot: false });
       },
     },
   ];

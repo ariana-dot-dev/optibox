@@ -153,7 +153,8 @@ function providerRequiredEnv(provider: string): string {
  * of Claude's `--dangerously-skip-permissions`) so the agent loop actually runs.
  */
 export function opencodeNoToolEnv(toolsAllowed: boolean): Record<string, string> {
-  if (toolsAllowed) return { OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { "*": "allow" } }) };
+  // autoupdate/snapshot off: pure startup/turn overhead in a disposable box.
+  if (toolsAllowed) return { OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { "*": "allow" }, autoupdate: false, snapshot: false }) };
   // Shared surface: all PRIVATE-machine tools structurally removed, but webfetch
   // stays enabled — public live data (weather, news, prices) is not user-machine
   // state, and the shared agent answering it directly beats a pointless bridge.
@@ -275,7 +276,8 @@ async function prepareTurnWorkspace(
   phase: HarnessPhase,
   instructions: string,
   delivery: InstructionDelivery,
-): Promise<{ cwd: string; systemInstructionPath: string; binInstalled: boolean }> {
+  extraFiles?: Record<string, string>,
+): Promise<{ cwd: string; systemInstructionPath: string; binInstalled: boolean; binPath?: string }> {
   const conversationSlug = sanitizeShell(`${ctx.userId}-${ctx.conversationId}`).slice(0, 60);
   const cwd = `/tmp/consumer-agent-${sanitizeShell(spec.name)}-${phase}-${conversationSlug}`;
   const systemInstructionPath = `${cwd}/CONSUMER_AGENT_SYSTEM.md`;
@@ -293,6 +295,13 @@ async function prepareTurnWorkspace(
   if (delivery === "workspace-agents-md") {
     parts.push(`printf %s ${shellQuote(encoded)} | base64 -d > ${shellQuote(`${cwd}/AGENTS.md`)}`);
   }
+  // Extra per-turn payload files (e.g. the resident-serve request body) ride the
+  // SAME batched prep command: each separate box command costs a ~0.5-1.5s HTTP
+  // round trip, so never add a round trip for a file write.
+  for (const [rel, content] of Object.entries(extraFiles ?? {})) {
+    const enc = Buffer.from(content, "utf8").toString("base64");
+    parts.push(`printf %s ${shellQuote(enc)} | base64 -d > ${shellQuote(`${cwd}/${rel}`)}`);
+  }
   // The bin check retries up to ~20s before reporting MISSING: a box declared
   // responsive right after a fork/resume answers commands while its DISK is
   // still restoring (measured: echo works at ~1s, /home content lands seconds
@@ -303,7 +312,10 @@ async function prepareTurnWorkspace(
   // a second or so, and a coarse 2s sleep overshoots by seconds on every turn
   // (measured ~6.5s of dead prep just waiting on this). Same ~20s worst-case budget
   // for a genuinely still-restoring disk, but ~0s once the bin is actually present.
-  parts.push(`(ok=""; for i in $(seq 1 80); do if command -v ${sanitizeShell(spec.bin)} >/dev/null 2>&1; then ok=1; break; fi; sleep 0.25; done; [ -n "$ok" ] && echo __BIN_OK__ || echo __BIN_MISSING__)`);
+  // Echo the RESOLVED binary path: harness children spawned via `nohup bash -c`
+  // do not inherit the box shell's nvm PATH (measured: bare `opencode` is
+  // "command not found" there), so every later launch must use the absolute path.
+  parts.push(`(ok=""; for i in $(seq 1 80); do if command -v ${sanitizeShell(spec.bin)} >/dev/null 2>&1; then ok=1; break; fi; sleep 0.25; done; [ -n "$ok" ] && echo "__BIN_OK__:$(command -v ${sanitizeShell(spec.bin)})" || echo __BIN_MISSING__)`);
   // Box runtime: ONE HTTP command (each round trip costs ~0.5-1.5s; body size is
   // not a constraint). Shared-infra runtime: run the parts as separate local
   // spawns — local spawns are ~10ms, and a single joined ~8KB argv element gets
@@ -322,7 +334,8 @@ async function prepareTurnWorkspace(
   if (!prep.stdout.includes("__BIN_OK__") && !prep.stdout.includes("__BIN_MISSING__")) {
     throw new Error(`workspace prep failed (exit=${prep.exitCode}): ${prep.stderr.trim().slice(-300) || prep.stdout.trim().slice(-300) || "no output"}`);
   }
-  return { cwd, systemInstructionPath, binInstalled: prep.stdout.includes("__BIN_OK__") };
+  const binPath = prep.stdout.match(/__BIN_OK__:(\S+)/)?.[1];
+  return { cwd, systemInstructionPath, binInstalled: prep.stdout.includes("__BIN_OK__"), ...(binPath ? { binPath } : {}) };
 }
 
 function sanitizeShell(s: string): string {
@@ -355,6 +368,60 @@ const SHARED_BRIDGE_TIMEOUT_MS = 60_000;
 const BOX_TURN_TIMEOUT_MS = 10 * 60_000;
 
 /**
+ * Fixed localhost port for the resident `opencode serve` inside the user Box.
+ * Off the common 4096 default so a user process inside their own box never
+ * collides with the runtime's harness server.
+ */
+const BOX_SERVE_PORT = 4917;
+const BOX_SERVE_URL = `http://127.0.0.1:${BOX_SERVE_PORT}`;
+
+/**
+ * Per-turn box script: health-check the resident `opencode serve`, boot it if
+ * missing (~3s, measured in-box; then it lives for the box's whole warm life and
+ * even survives pause/resume as VM state), then run the turn as ONE localhost
+ * HTTP call. This kills the dominant box-turn cost: `opencode run` cold-boots a
+ * full embedded server EVERY turn (measured 9.6s for a trivial reply); through a
+ * resident serve the same turn is ~3.6s, almost all of it real model time.
+ *
+ * The serve process inherits the exported provider keys + OPENCODE_CONFIG_CONTENT
+ * (tool auto-approve) from this script's environment (runHarness env prefix).
+ * The OPENCODE_DISABLE_* vars cut its one-time boot cost. Everything noisy goes
+ * to stderr/serve log; stdout carries ONLY the final message JSON, which the
+ * opencode-serve-json parser turns into text + native tool events.
+ */
+function buildBoxServeTurnScript(args: { binPath: string; bodyPath: string; sessionId?: string; timeoutMs: number }): string {
+  const curlMaxSec = Math.max(30, Math.floor(args.timeoutMs / 1000) - 30);
+  const lines = [
+    `OC=${shellQuote(args.binPath)}`,
+    `SL="$HOME/.cba-opencode-serve.log"`,
+    `if ! curl -s -m 2 -o /dev/null ${BOX_SERVE_URL}/app 2>/dev/null; then`,
+    // cd $HOME: sessions must all live in ONE deterministic project scope; a
+    // serve started in a per-conversation dir would scope other conversations'
+    // sessions to the wrong project. Instructions ride the prompt XML anyway.
+    `  (cd "$HOME" && OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 OPENCODE_DISABLE_MODELS_FETCH=1 nohup "$OC" serve --port ${BOX_SERVE_PORT} --hostname 127.0.0.1 >> "$SL" 2>&1 &)`,
+    `  ready=""`,
+    `  for i in $(seq 1 150); do if curl -s -m 1 -o /dev/null ${BOX_SERVE_URL}/app 2>/dev/null; then ready=1; break; fi; sleep 0.2; done`,
+    `  [ -n "$ready" ] || { echo "opencode serve failed to boot: $(tail -c 300 "$SL" 2>/dev/null)" >&2; exit 7; }`,
+    `fi`,
+    args.sessionId
+      ? [
+          `SID=${shellQuote(args.sessionId)}`,
+          // Clear any in-flight generation left by an interrupted previous turn;
+          // a busy session would otherwise reject/queue the new message.
+          `curl -s -m 5 -o /dev/null -X POST "${BOX_SERVE_URL}/session/$SID/abort" 2>/dev/null || true`,
+        ].join("\n")
+      : [
+          // Fixed title: without it opencode fires a side LLM call just to name
+          // the session (same reason the CLI path passes --title).
+          `SID=$(curl -s -m 10 -X POST ${BOX_SERVE_URL}/session -H 'Content-Type: application/json' -d '{"title":"optibox"}' | grep -o '"id":"ses_[^"]*"' | head -1 | cut -d'"' -f4)`,
+          `[ -n "$SID" ] || { echo "opencode serve session create failed" >&2; exit 8; }`,
+        ].join("\n"),
+    `curl -s -m ${curlMaxSec} -X POST "${BOX_SERVE_URL}/session/$SID/message" -H 'Content-Type: application/json' -d @${shellQuote(args.bodyPath)}`,
+  ];
+  return lines.join("\n");
+}
+
+/**
  * Run ONE harness turn on a given runtime under a given phase policy. This is
  * the single code path shared by the always-on (shared infra) surface and the
  * per-user (Box) surface. The only differences are which runtime executes the
@@ -369,7 +436,26 @@ async function* runHarnessTurn(
 ): AsyncIterable<HarnessOutputChunk> {
   const bundle = buildHarnessPromptBundle(ctx, policy);
   const delivery = spec.instructionDelivery ?? "prompt-xml";
-  const { cwd, systemInstructionPath, binInstalled } = await prepareTurnWorkspace(runtime, spec, ctx, policy.phase, bundle.instructions, delivery);
+  // Resident-serve turn (box + opencode-backed harness): the request body is
+  // known before prep, so it rides the batched prep command as an extra file
+  // instead of costing its own box round trip.
+  const serveTurn = runtime.location === "user-box" && spec.outputMode === "opencode-json";
+  const serveBodyFile = ".cba-serve-body.json";
+  let extraFiles: Record<string, string> | undefined;
+  if (serveTurn) {
+    const probeArgv = spec.buildArgv({ prompt: "", model: ctx.selection.model, provider: ctx.selection.provider, cwd: ".", systemInstructionPath: "", toolsAllowed: policy.toolsAllowed });
+    const mi = probeArgv.indexOf("--model");
+    const modelString = (mi >= 0 ? probeArgv[mi + 1] : undefined) ?? `${ctx.selection.provider}/${ctx.selection.model}`;
+    const slash = modelString.indexOf("/");
+    extraFiles = {
+      [serveBodyFile]: JSON.stringify({
+        model: { providerID: modelString.slice(0, slash), modelID: modelString.slice(slash + 1) },
+        parts: [{ type: "text", text: bundle.prompt }],
+      }),
+    };
+  }
+  const { cwd, systemInstructionPath, binInstalled, binPath: preppedBinPath } = await prepareTurnWorkspace(runtime, spec, ctx, policy.phase, bundle.instructions, delivery, extraFiles);
+  let binPath = preppedBinPath;
   if (spec.installCmd && !binInstalled) {
     // NOTE: no user-visible text here. Install progress already surfaces via the
     // runtime's exec audit event; a text yield would count as the box agent's
@@ -389,22 +475,40 @@ async function* runHarnessTurn(
     assignSessionId = randomUUID();
     ctx.onSessionId?.(assignSessionId);
   }
-  const argv = spec.buildArgv({
-    prompt: bundle.prompt,
-    model: ctx.selection.model,
-    provider: ctx.selection.provider,
-    cwd,
-    systemInstructionPath,
-    toolsAllowed: policy.toolsAllowed,
-    ...(assignSessionId ? { sessionId: assignSessionId } : {}),
-    ...(knownSessionId ? { resumeSessionId: knownSessionId } : {}),
-  });
   const env = spec.buildEnv?.({ provider: ctx.selection.provider, model: ctx.selection.model, toolsAllowed: policy.toolsAllowed });
+  let argv: string[];
+  let outputMode = spec.outputMode;
+  if (serveTurn) {
+    // The bin was just installed (fresh box): resolve the absolute path the prep
+    // couldn't. One extra round trip only on that rare first-install path.
+    if (!binPath) {
+      binPath = (await runtime.command(`command -v ${sanitizeShell(spec.bin)}`)).stdout.trim().split(/\s+/).pop();
+      if (!binPath) throw new Error(`harness binary '${spec.bin}' not found in box after install`);
+    }
+    argv = ["bash", "-c", buildBoxServeTurnScript({
+      binPath,
+      bodyPath: `${cwd}/${serveBodyFile}`,
+      ...(knownSessionId ? { sessionId: knownSessionId } : {}),
+      timeoutMs: BOX_TURN_TIMEOUT_MS,
+    })];
+    outputMode = "opencode-serve-json";
+  } else {
+    argv = spec.buildArgv({
+      prompt: bundle.prompt,
+      model: ctx.selection.model,
+      provider: ctx.selection.provider,
+      cwd,
+      systemInstructionPath,
+      toolsAllowed: policy.toolsAllowed,
+      ...(assignSessionId ? { sessionId: assignSessionId } : {}),
+      ...(knownSessionId ? { resumeSessionId: knownSessionId } : {}),
+    });
+  }
   yield* runtime.runHarness({
     argv,
     cwd,
     ...(env ? { env } : {}),
-    ...(spec.outputMode ? { outputMode: spec.outputMode } : {}),
+    ...(outputMode ? { outputMode } : {}),
     ...(ctx.onSessionId ? { onSessionId: ctx.onSessionId } : {}),
     ...(ctx.onComplete ? { onComplete: ctx.onComplete } : {}),
     ...(ctx.signal ? { signal: ctx.signal } : {}),

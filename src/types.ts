@@ -65,6 +65,8 @@ export type HarnessOutputMode =
   | "claude-stream-json"
   | "codex-json"
   | "opencode-json"
+  /** One-object response from a resident `opencode serve` (POST /session/:id/message). */
+  | "opencode-serve-json"
   | "pi-json";
 
 export interface HarnessRunSpec {

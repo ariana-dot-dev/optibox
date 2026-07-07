@@ -55,6 +55,8 @@ interface HarnessOutputParser {
   onToolEvent?: (event: HarnessToolEvent) => void;
   onSessionId?: (sessionId: string) => void;
   sessionIdEmitted: boolean;
+  /** opencode-serve-json: tool part ids already surfaced (event bus + final response overlap). */
+  seenTools?: Set<string>;
 }
 
 function createHarnessOutputParser(
@@ -125,7 +127,10 @@ function* parseHarnessOutput(rawDelta: string, parser: HarnessOutputParser): Ite
 }
 
 function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): HarnessTextChunk | undefined {
-  const trimmed = line.trim();
+  let trimmed = line.trim();
+  // The serve event-bus tap writes SSE-framed lines ("data: {...}") into the
+  // run log; unwrap them so tool parts reach the parser.
+  if (parser.mode === "opencode-serve-json" && trimmed.startsWith("data:")) trimmed = trimmed.slice(5).trim();
   if (!trimmed.startsWith("{")) return undefined;
   let j: any;
   try { j = JSON.parse(trimmed); } catch { return undefined; }
@@ -157,23 +162,24 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): Harnes
   }
 
   if (parser.mode === "opencode-serve-json") {
-    // The whole turn arrives as ONE message object: {"info":{...},"parts":[...]}.
-    // Tool parts surface as native tool events; text parts concatenate into the
-    // visible answer. Error payloads have no parts array and are intentionally
-    // ignored so the no-answer diagnostic (raw log tail) explains the failure.
+    // Two line shapes interleave in the run log:
+    //   1. Live `/event` bus lines tapped during the turn — the ONLY place tool
+    //      calls are visible, because opencode chains each agent step as a
+    //      separate message (the final message's parentID points at the
+    //      tool-executing message) and POST /message returns only the last one.
+    //   2. The final message object {"info":{...},"parts":[...]} with the text.
+    // Error payloads have neither shape and are intentionally ignored so the
+    // no-answer diagnostic (raw log tail) explains the failure.
+    const evPart = j.type === "message.part.updated" ? (j.properties?.part ?? j.part) : undefined;
+    if (evPart?.type === "tool") {
+      emitServeToolPart(evPart, parser);
+      return undefined;
+    }
     if (!Array.isArray(j.parts)) return undefined;
     let text = "";
     for (const part of j.parts) {
       if (part?.type === "text" && typeof part.text === "string") text += part.text;
-      if (part?.type === "tool" && parser.onToolEvent) {
-        parser.onToolEvent({
-          phase: "tool_use",
-          toolName: String(part.tool ?? "tool"),
-          command: typeof part.state?.input?.command === "string" ? part.state.input.command : undefined,
-          description: typeof part.state?.title === "string" ? part.state.title : undefined,
-          stdout: typeof part.state?.output === "string" ? part.state.output : undefined,
-        });
-      }
+      if (part?.type === "tool") emitServeToolPart(part, parser);
     }
     return emitNewSuffix(text, parser);
   }
@@ -235,6 +241,38 @@ function emitClaudeToolEvent(j: any, parser: HarnessOutputParser): void {
   }
 }
 
+
+/**
+ * Surface one opencode tool part (event-bus `message.part.updated` or a part of
+ * the final response) as native tool_use/tool_result events, exactly once per
+ * part+phase. The event bus repeats a part across its lifecycle
+ * (pending -> running -> completed), and the final response may repeat parts the
+ * bus already delivered.
+ */
+function emitServeToolPart(part: any, parser: HarnessOutputParser): void {
+  if (!parser.onToolEvent) return;
+  const seen = parser.seenTools ?? (parser.seenTools = new Set());
+  const id = String(part.id ?? part.callID ?? "tool-part");
+  const status = String(part.state?.status ?? "completed");
+  const base = {
+    toolName: String(part.tool ?? "tool"),
+    command: typeof part.state?.input?.command === "string" ? part.state.input.command : undefined,
+    description: typeof part.state?.title === "string" ? part.state.title : undefined,
+  };
+  if (!seen.has(`${id}:use`) && status !== "pending") {
+    seen.add(`${id}:use`);
+    parser.onToolEvent({ phase: "tool_use", ...base });
+  }
+  if ((status === "completed" || status === "error") && !seen.has(`${id}:result`)) {
+    seen.add(`${id}:result`);
+    parser.onToolEvent({
+      phase: "tool_result",
+      ...base,
+      stdout: typeof part.state?.output === "string" ? part.state.output : undefined,
+      isError: status === "error",
+    });
+  }
+}
 
 function emitGenericToolEvent(j: any, parser: HarnessOutputParser): void {
   if (!parser.onToolEvent) return;

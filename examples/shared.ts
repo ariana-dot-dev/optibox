@@ -416,7 +416,19 @@ function buildBoxServeTurnScript(args: { binPath: string; bodyPath: string; sess
           `SID=$(curl -s -m 10 -X POST ${BOX_SERVE_URL}/session -H 'Content-Type: application/json' -d '{"title":"optibox"}' | grep -o '"id":"ses_[^"]*"' | head -1 | cut -d'"' -f4)`,
           `[ -n "$SID" ] || { echo "opencode serve session create failed" >&2; exit 8; }`,
         ].join("\n"),
+    // Live tool visibility: POST /message returns ONLY the final assistant
+    // message (tool calls live in earlier chained messages), so tap the serve
+    // event bus for this session's tool parts while the turn runs. Line-buffered
+    // greps append whole lines to the polled log; tool events stop flowing
+    // before the final response line is written, so interleaving is safe.
+    `curl -s -N -m ${curlMaxSec} ${BOX_SERVE_URL}/event 2>/dev/null | grep --line-buffered "\\"sessionID\\":\\"$SID\\"" | grep --line-buffered '"type":"tool"' &`,
+    `EV_PID=$!`,
     `curl -s -m ${curlMaxSec} -X POST "${BOX_SERVE_URL}/session/$SID/message" -H 'Content-Type: application/json' -d @${shellQuote(args.bodyPath)}`,
+    `RC=$?`,
+    // Tear down the event tap: kill the tail grep ($!) so the pipe collapses
+    // (curl dies on SIGPIPE at its next write; -m caps it regardless).
+    `kill $EV_PID 2>/dev/null; true`,
+    `exit $RC`,
   ];
   return lines.join("\n");
 }

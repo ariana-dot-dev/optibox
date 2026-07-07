@@ -400,8 +400,12 @@ function buildBoxServeTurnScript(args: { binPath: string; bodyPath: string; sess
     // sessions to the wrong project. Instructions ride the prompt XML anyway.
     `  (cd "$HOME" && OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 OPENCODE_DISABLE_MODELS_FETCH=1 nohup "$OC" serve --port ${BOX_SERVE_PORT} --hostname 127.0.0.1 >> "$SL" 2>&1 &)`,
     `  ready=""`,
-    `  for i in $(seq 1 150); do if curl -s -m 1 -o /dev/null ${BOX_SERVE_URL}/app 2>/dev/null; then ready=1; break; fi; sleep 0.2; done`,
-    `  [ -n "$ready" ] || { echo "opencode serve failed to boot: $(tail -c 300 "$SL" 2>/dev/null)" >&2; exit 7; }`,
+    // 90s window, not 30s: serve boots in ~3s on a warm box, but on a freshly
+    // archive-resumed box the streaming disk restore can starve the boot far
+    // past that (observed: "listening" logged AFTER a 30s poll had given up,
+    // turning a slow boot into a loud false failure).
+    `  for i in $(seq 1 450); do if curl -s -m 1 -o /dev/null ${BOX_SERVE_URL}/app 2>/dev/null; then ready=1; break; fi; sleep 0.2; done`,
+    `  [ -n "$ready" ] || { echo "opencode serve failed to boot within 90s: $(tail -c 300 "$SL" 2>/dev/null)" >&2; exit 7; }`,
     `fi`,
     args.sessionId
       ? [

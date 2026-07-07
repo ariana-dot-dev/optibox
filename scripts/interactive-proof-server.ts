@@ -451,7 +451,10 @@ function html() {
 <title>Box chat demo</title>
 <style>
 :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#fff;color:#111;line-height:1.4;font-weight:400}
-*{box-sizing:border-box}html,body{height:100%;margin:0}body{min-height:100dvh;background:#fff}body.hide-traces .msg.trace{display:none}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+/* Uniform scale-up: zoom enlarges text and elements together, preserving every
+   aspect ratio (supported in Chrome/Edge/Safari and Firefox 126+). */
+html{zoom:1.15}body{min-height:100dvh;background:#fff}body.hide-traces .msg.trace{display:none}
 .shell{height:100dvh;max-width:1180px;margin:0 auto;display:grid;grid-template-columns:minmax(380px,560px) 330px;gap:24px;align-items:stretch;padding:0 24px}.app{height:100dvh;min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e0e0e0;border-right:1px solid #e0e0e0}
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e0e0e0;padding:calc(14px + env(safe-area-inset-top)) 16px 14px;display:grid;gap:12px}
 .counters{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.counter{border:0;background:#f6f6f6;padding:11px 12px;min-width:0;border-radius:10px}.label{display:block;color:#555;letter-spacing:.01em;font-size:12px;font-weight:400}.value{display:block;margin-top:3px;font:400 21px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:0;background:transparent;color:#9a9a9a;padding:1px 2px;font-size:11px;font-weight:400;text-align:center;letter-spacing:.02em;display:flex;align-items:center;justify-content:center;gap:7px}.state:before{content:"";width:6px;height:6px;border-radius:50%;background:#cdcdcd;flex:0 0 auto;transition:background .3s ease}body[data-busy="1"] .state:before{background:#f4b93e}body[data-billing="1"] .state:before{background:#fc4b55;box-shadow:0 0 0 3px rgba(252,75,85,.16)}

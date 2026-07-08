@@ -103,6 +103,9 @@ function renderTree(paths) {
     flattenEmptyDirectories: true,
     search: true,
     stickyFolders: true,
+    // Monochrome minimal icons: the colored per-filetype set brings a palette
+    // the app doesn't use anywhere else.
+    icons: { set: "minimal", colored: false },
     onSelectionChange: (selected) => {
       const p = selected && selected[0];
       if (!p) return;

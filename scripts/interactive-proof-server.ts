@@ -202,12 +202,12 @@ function sse(res: http.ServerResponse) {
   return (event: unknown) => res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function readBody(req: http.IncomingMessage): Promise<any> {
+function readBody(req: http.IncomingMessage, maxBytes = 1_000_000): Promise<any> {
   return new Promise((resolve, reject) => {
     let raw = "";
     req.on("data", (c) => {
       raw += c;
-      if (raw.length > 1_000_000) req.destroy(new Error("body too large"));
+      if (raw.length > maxBytes) req.destroy(new Error("body too large"));
     });
     req.on("end", () => {
       try {
@@ -352,7 +352,24 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       if (live) {
         // Live files API rejects absolute paths ("relative to the Box work
         // directory" = the home dir), so home-relative tree paths pass as-is.
-        bytes = await client.readFileBytes(box.id, filePath);
+        try {
+          bytes = await client.readFileBytes(box.id, filePath);
+        } catch (e) {
+          // Reads are capped at 5MB like writes (verified: 410 under the 502).
+          // Fallback: split into 4MB parts in the box, read each, reassemble.
+          const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+          const tmp = `.cba-dl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+          const prep = await client.command(box.id, {
+            command: `cd /home/user && mkdir -p ${q(tmp)} && split -b 4000000 -d -a 4 ${q(filePath)} ${q(tmp + "/p")} && ls ${q(tmp)} | wc -l`,
+            timeoutMs: 60_000,
+          });
+          const n = Number(prep.stdout.trim());
+          if (!n) throw e;
+          const chunks: Buffer[] = [];
+          for (let i = 0; i < n; i++) chunks.push(await client.readFileBytes(box.id, `${tmp}/p${String(i).padStart(4, "0")}`));
+          void client.command(box.id, { command: `rm -rf /home/user/${tmp}`, timeoutMs: 30_000 }).catch(() => undefined);
+          bytes = Buffer.concat(chunks);
+        }
       } else {
         const snapshot = await client.latestSnapshot(box.id);
         if (!snapshot) return json(404, { ok: false, message: "no snapshot" }), true;
@@ -370,7 +387,29 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     if (pathname === "/api/fs/write") {
       if (!box || !live) return json(409, { ok: false, message: "box is stopped — snapshot files are read-only" }), true;
       if (!filePath || typeof body.contentB64 !== "string") return json(400, { ok: false, message: "path and contentB64 required" }), true;
-      await client.writeFileBytes(box.id, filePath, Buffer.from(body.contentB64, "base64"));
+      const bytes = Buffer.from(body.contentB64, "base64");
+      if (bytes.length <= 5_000_000) {
+        await client.writeFileBytes(box.id, filePath, bytes);
+      } else {
+        // The box files API caps one write at 5MB (verified). Bigger uploads:
+        // 4MB part files through the same API, assembled with one `cat`.
+        const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+        const tmp = `.cba-upload-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        const parts: string[] = [];
+        for (let off = 0, i = 0; off < bytes.length; off += 4_000_000, i++) {
+          const part = `${tmp}.${i}`;
+          await client.writeFileBytes(box.id, part, bytes.subarray(off, off + 4_000_000));
+          parts.push(part);
+        }
+        const list = parts.map(q).join(" ");
+        const assembled = await client.command(box.id, {
+          command: `cd /home/user && cat ${list} > ${q(filePath)} && rm -f ${list} && stat -c %s ${q(filePath)}`,
+          timeoutMs: 60_000,
+        });
+        if (Number(assembled.stdout.trim()) !== bytes.length) {
+          return json(502, { ok: false, message: `assembled size mismatch: ${assembled.stdout.trim() || assembled.stderr.trim()}` }), true;
+        }
+      }
       return json(200, { ok: true }), true;
     }
 
@@ -404,7 +443,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname.startsWith("/api/fs/")) {
-      const body = await readBody(req);
+      // Uploads carry base64 file bytes (4/3 inflation): allow ~96MB of file.
+      const body = await readBody(req, 128_000_000);
       await handleFsRoute(url.pathname, body, res);
       return;
     }
@@ -853,6 +893,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   // Only the latest turn's events drive the side diagram — otherwise a still-draining
   // older turn's box/billing events fight the newest turn's route and the graph desyncs.
   if(isLatest)routeEvent(ev);
+  if(['billing.start','billing.stop','exec','turn.done','lifecycle'].includes(ev.type)){try{if(window.__optiboxFs&&window.__optiboxFs.poke)window.__optiboxFs.poke();}catch(_){}}
   const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
   // "working…" stays until the LATEST turn is fully finished: both surfaces answered
   // (or the box chose <end>) and the stream reached its terminal event. An older

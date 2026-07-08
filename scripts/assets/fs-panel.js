@@ -51,7 +51,16 @@ async function init() {
     return;
   }
   refresh(true);
-  refreshTimer = setInterval(() => refresh(false), 8000);
+  refreshTimer = setInterval(() => refresh(false), 4000);
+  // The chat page pokes on lifecycle events (billing/exec/turn.done) so the
+  // live/snapshot flip shows within a second instead of a poll interval.
+  const host = (window.__optiboxFs = window.__optiboxFs || {});
+  let pokePending = false;
+  host.poke = () => {
+    if (pokePending) return;
+    pokePending = true;
+    setTimeout(() => { pokePending = false; refreshNow().catch(() => {}); }, 400);
+  };
   panel.addEventListener("dragover", onDragOver);
   panel.addEventListener("dragleave", () => panel.classList.remove("fsDrop"));
   panel.addEventListener("drop", onDrop);

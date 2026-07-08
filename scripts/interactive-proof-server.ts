@@ -156,11 +156,13 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
     readinessPollMs: 750,
     handoffTimeoutMs: 120_000,
     resumeTimeoutMs: 60_000,
-    // Product decision: stop fast (~15s) once the assistant is idle — billing
-    // theater beats warm-box latency here. A follow-up after the stop pays the
-    // resume + disk-restore + serve-reboot (~12s measured); messages within the
-    // window stay on the warm box (~7s answers).
-    autoStopIdleMs: 15_000,
+    // 3 minutes (platform dev guidance, 2026-07-08): at 15s the box archived
+    // after every message, so EVERY turn ran inside the ~30-60s restore window
+    // (boot reads compete with the background bulk download — "the box is
+    // always in its first 20 seconds of life"). At 3 min, follow-ups hit a
+    // fully-hydrated warm box (~9s) and only session-openers pay the ~20s cold
+    // price. Warm box costs ~$0.04/hour.
+    autoStopIdleMs: 180_000,
     // Safety net: force-stop idle boxes on a timer even if a request stream was
     // abandoned or a turn hung, so a VM can never be left running for hours/days.
     idleReaperIntervalMs: 15_000,

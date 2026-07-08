@@ -177,12 +177,15 @@ async function onDrop(e) {
   panel.classList.remove("fsDrop");
   if (!e.dataTransfer || !e.dataTransfer.files.length) return;
   e.preventDefault();
-  // fsLive can be stale (state polls every 8s); re-check before the optimistic
-  // row so a just-stopped machine rejects cleanly instead of flashing a row.
+  // Capture files AND target synchronously: the browser neuters dataTransfer
+  // as soon as this handler yields, so anything read after an await is empty.
+  const files = Array.from(e.dataTransfer.files);
+  const dir = dropTargetDir(e);
+  // fsLive can be stale; re-check before the optimistic row so a just-stopped
+  // machine rejects cleanly instead of flashing a row.
   try { await refreshNow(); } catch {}
   if (!fsLive) { setStatus("machine is off — uploads need a running machine"); return; }
-  const dir = dropTargetDir(e);
-  for (const file of e.dataTransfer.files) {
+  for (const file of files) {
     const dest = (dir ? dir + "/" : "") + file.name;
     uploading.add(dest);
     entryByPath.set(dest, { path: dest, kind: "file", size: file.size });

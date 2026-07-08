@@ -292,7 +292,11 @@ async function fsResolveBox(credentials: DemoCredentials, userId: string): Promi
   const box = (boxes as any[]).find((b) => b.name === name);
   if (!box) return { live: false };
   const state = String(box.state ?? box.status ?? "");
-  return { box: { id: box.id, state }, live: state === "running" || state === "idle" };
+  // "live" here means "worth TRYING the live path": the state string lags the
+  // machine badly (it reports starting/resuming for many seconds while
+  // commands already execute), so anything not clearly parked counts and the
+  // caller falls back to the snapshot when the live attempt 409s.
+  return { box: { id: box.id, state }, live: !["archived", "archiving", "stopped", "stopping"].includes(state) };
 }
 
 /**
@@ -332,8 +336,12 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     if (pathname === "/api/fs/tree") {
       if (!box) return json(200, { ok: true, live: false, state: "none", entries: [] }), true;
       if (live) {
-        const entries = await fsLiveTree(client, box.id);
-        return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries }), true;
+        // Try live even while the state string still says starting/resuming;
+        // a 409 just means not actually up yet -> snapshot below.
+        try {
+          const entries = await fsLiveTree(client, box.id);
+          return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries }), true;
+        } catch { /* fall through to snapshot */ }
       }
       const snapshot = await client.latestSnapshot(box.id);
       if (!snapshot) return json(200, { ok: true, live: false, state: box.state, boxId: box.id, entries: [] }), true;
@@ -348,29 +356,34 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
 
     if (pathname === "/api/fs/read") {
       if (!box || !filePath) return json(404, { ok: false, message: "no box or path" }), true;
-      let bytes: Buffer;
+      let bytes: Buffer | undefined;
+      let servedLive = false;
       if (live) {
         // Live files API rejects absolute paths ("relative to the Box work
         // directory" = the home dir), so home-relative tree paths pass as-is.
         try {
-          bytes = await client.readFileBytes(box.id, filePath);
-        } catch (e) {
-          // Reads are capped at 5MB like writes (verified: 410 under the 502).
-          // Fallback: split into 4MB parts in the box, read each, reassemble.
-          const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-          const tmp = `.cba-dl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-          const prep = await client.command(box.id, {
-            command: `cd /home/user && mkdir -p ${q(tmp)} && split -b 4000000 -d -a 4 ${q(filePath)} ${q(tmp + "/p")} && ls ${q(tmp)} | wc -l`,
-            timeoutMs: 60_000,
-          });
-          const n = Number(prep.stdout.trim());
-          if (!n) throw e;
-          const chunks: Buffer[] = [];
-          for (let i = 0; i < n; i++) chunks.push(await client.readFileBytes(box.id, `${tmp}/p${String(i).padStart(4, "0")}`));
-          void client.command(box.id, { command: `rm -rf /home/user/${tmp}`, timeoutMs: 30_000 }).catch(() => undefined);
-          bytes = Buffer.concat(chunks);
-        }
-      } else {
+          try {
+            bytes = await client.readFileBytes(box.id, filePath);
+          } catch (e) {
+            // Reads are capped at 5MB like writes (verified: 410 under the 502).
+            // Fallback: split into 4MB parts in the box, read each, reassemble.
+            const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+            const tmp = `.cba-dl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+            const prep = await client.command(box.id, {
+              command: `cd /home/user && mkdir -p ${q(tmp)} && split -b 4000000 -d -a 4 ${q(filePath)} ${q(tmp + "/p")} && ls ${q(tmp)} | wc -l`,
+              timeoutMs: 60_000,
+            });
+            const n = Number(prep.stdout.trim());
+            if (!n) throw e;
+            const chunks: Buffer[] = [];
+            for (let i = 0; i < n; i++) chunks.push(await client.readFileBytes(box.id, `${tmp}/p${String(i).padStart(4, "0")}`));
+            void client.command(box.id, { command: `rm -rf /home/user/${tmp}`, timeoutMs: 30_000 }).catch(() => undefined);
+            bytes = Buffer.concat(chunks);
+          }
+          servedLive = true;
+        } catch { /* machine not actually up -> snapshot below */ }
+      }
+      if (!bytes) {
         const snapshot = await client.latestSnapshot(box.id);
         if (!snapshot) return json(404, { ok: false, message: "no snapshot" }), true;
         // Snapshot paths are home-relative (verified: ".bashrc" 200, "/.bashrc" 404).
@@ -379,7 +392,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       res.writeHead(200, {
         "content-type": "application/octet-stream",
         "content-length": bytes.length,
-        "x-fs-live": live ? "1" : "0",
+        "x-fs-live": servedLive ? "1" : "0",
       });
       return res.end(bytes), true;
     }

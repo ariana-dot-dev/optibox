@@ -288,6 +288,37 @@ function fsBoxName(credentials: DemoCredentials, userId: string): string {
   return "consumer-agent-user-" + userId + "-" + cacheKey.slice(0, 8);
 }
 
+/**
+ * Write raw bytes to one box file — reliably, at any size and any boot age.
+ *
+ * The files API is unreliable for our case in two ways: one write caps at 5MB,
+ * and a PUT to a path with a not-yet-existing parent dir can return 200 without
+ * ever hitting disk (observed moments after billing.start — the file simply
+ * isn't there). Root-level PUTs, however, DO persist. So we always ship ≤4MB
+ * parts to ROOT temp files, then assemble them into the target with one `cat`
+ * command (commands persist and can `mkdir -p` the destination dir). This is
+ * the same path for a 200KB image and a 90MB video — no silent subdir drops.
+ */
+async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: string, bytes: Buffer): Promise<void> {
+  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const dir = filePath.includes("/") ? filePath.replace(/\/[^/]*$/, "") : ".";
+  const tmp = `.cba-upload-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const parts: string[] = [];
+  for (let off = 0, i = 0; off < bytes.length || i === 0; off += 4_000_000, i++) {
+    const part = `${tmp}.${i}`;
+    await client.writeFileBytes(boxId, part, bytes.subarray(off, off + 4_000_000));
+    parts.push(part);
+  }
+  const list = parts.map(q).join(" ");
+  const assembled = await client.command(boxId, {
+    command: `cd /home/user && mkdir -p ${q(dir)} && cat ${list} > ${q(filePath)} && rm -f ${list} && stat -c %s ${q(filePath)}`,
+    timeoutMs: 60_000,
+  });
+  if (Number(assembled.stdout.trim()) !== bytes.length) {
+    throw new Error(`assembled size mismatch: ${assembled.stdout.trim() || assembled.stderr.trim()}`);
+  }
+}
+
 async function fsResolveBox(credentials: DemoCredentials, userId: string): Promise<{ box?: { id: string; state: string }; live: boolean }> {
   const client = fsBoxClient(credentials);
   const name = fsBoxName(credentials, userId);
@@ -425,29 +456,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       // running auto-stop countdown and the reaper skips held boxes.
       const releaseHold = orchestratorFor(credentials).holdUserBox(userId, "upload");
       try {
-      const bytes = Buffer.from(body.contentB64, "base64");
-      if (bytes.length <= 5_000_000) {
-        await client.writeFileBytes(box.id, filePath, bytes);
-      } else {
-        // The box files API caps one write at 5MB (verified). Bigger uploads:
-        // 4MB part files through the same API, assembled with one `cat`.
-        const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-        const tmp = `.cba-upload-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-        const parts: string[] = [];
-        for (let off = 0, i = 0; off < bytes.length; off += 4_000_000, i++) {
-          const part = `${tmp}.${i}`;
-          await client.writeFileBytes(box.id, part, bytes.subarray(off, off + 4_000_000));
-          parts.push(part);
-        }
-        const list = parts.map(q).join(" ");
-        const assembled = await client.command(box.id, {
-          command: `cd /home/user && cat ${list} > ${q(filePath)} && rm -f ${list} && stat -c %s ${q(filePath)}`,
-          timeoutMs: 60_000,
-        });
-        if (Number(assembled.stdout.trim()) !== bytes.length) {
-          return json(502, { ok: false, message: `assembled size mismatch: ${assembled.stdout.trim() || assembled.stderr.trim()}` }), true;
-        }
-      }
+      await writeBoxFile(client, box.id, filePath, Buffer.from(body.contentB64, "base64"));
       return json(200, { ok: true }), true;
       } finally {
         releaseHold();
@@ -563,8 +572,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/send") {
-      const body = await readBody(req);
+      const body = await readBody(req, 256_000_000);
       const send = sse(res);
+      // Chat attachments ride the send body as base64 and are written into the
+      // box under attachments/ the instant it bills — see the billing.start
+      // branch below (before the agent runs, so the file is always there).
+      const attachments: Array<{ name: string; contentB64: string }> = Array.isArray(body.attachments)
+        ? body.attachments.filter((a: any) => a && typeof a.name === "string" && typeof a.contentB64 === "string")
+        : [];
+      let attachmentsUploaded = false;
       const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const selection = {
         harness: String(body.harness),
@@ -608,6 +624,39 @@ const server = http.createServer(async (req, res) => {
           const boxIdForDesktop = (event as any).boxId;
           if ((event as ConsumerTurnEvent).type === "billing.start" && typeof boxIdForDesktop === "string") {
             void fsBoxClient(credentials).desktopStreamUrl(boxIdForDesktop, { theme: "light", publicAccess: true }).catch(() => undefined);
+            send(event as ConsumerTurnEvent);
+            // Upload attachments NOW, before yielding back to the generator (which
+            // then runs the agent). Awaiting here suspends the turn, so the file
+            // is guaranteed present under attachments/ before the agent looks.
+            if (attachments.length && !attachmentsUploaded) {
+              attachmentsUploaded = true;
+              const client = fsBoxClient(credentials);
+              const hold = orchestrator.holdUserBox(turnInput.userId, "upload", 120_000);
+              try {
+                // billing.start fires the instant the box bills, but its
+                // filesystem may not be mounted yet — a files-API PUT can return
+                // 200 without persisting. A command BLOCKS until the box truly
+                // executes, so use one as a readiness gate before any write.
+                for (let i = 0; i < 12; i++) {
+                  try {
+                    const probe = await client.command(boxIdForDesktop, { command: "echo ready", timeoutMs: 30_000 });
+                    if ((probe.stdout || "").includes("ready")) break;
+                  } catch { /* box still booting; retry */ }
+                }
+                for (const a of attachments) {
+                  const dest = "attachments/" + a.name.replace(/[/\\]/g, "_");
+                  try {
+                    await writeBoxFile(client, boxIdForDesktop, dest, Buffer.from(a.contentB64, "base64"));
+                    send({ type: "trace", stage: "attachment.uploaded", message: `saved ${dest}` } as ConsumerTurnEvent);
+                  } catch (err) {
+                    send({ type: "trace", stage: "attachment.failed", message: `failed to save ${dest}: ${err instanceof Error ? err.message : String(err)}` } as ConsumerTurnEvent);
+                  }
+                }
+              } finally {
+                hold();
+              }
+            }
+            continue;
           }
           send(event as ConsumerTurnEvent);
         }
@@ -998,12 +1047,14 @@ async function runTurn(msg,files){clearAutoStopTimer('paused');abortInterruptibl
   if(files&&files.length){
     atts=await Promise.all(files.map(async f=>({name:f.name.replace(/[\\/\\\\]/g,'_'),b64:await readAsB64(f),bytes:new Uint8Array(await f.arrayBuffer())})));
     renderAttachDeck(userEl,atts);
-    uploadAttachments(atts);
   }
-  // Tell the agent where the files landed so it can actually use them.
+  // Tell the agent where the files landed so it can actually use them. The
+  // server writes them into attachments/ the instant the box bills, BEFORE the
+  // agent runs, so by the time the agent reads this note the files exist.
   const sendMsg=atts.length?msg+'\\n\\n[Attached files, saved under attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
+  const attachPayload=atts.map(a=>({name:a.name,contentB64:a.b64}));
   showWorking();setState('shared bridge starting · private Box boot requested');resetRouteForTurn();
-  try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys()})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
+  try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys(),attachments:attachPayload})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 const stopBtn=$('stopBox');
 const diagnosticsBtn=$('downloadDiagnostics');
@@ -1052,17 +1103,6 @@ function renderAttachDeck(el,atts){
     deck.appendChild(card);
   });
   body.insertBefore(deck,body.firstChild);
-}
-// Upload attachments into the box under attachments/ once it is live. Retries a
-// bit so a booting box still receives them; view/preview never depends on this.
-async function uploadAttachments(atts){
-  for(const a of atts){
-    let ok=false;
-    for(let i=0;i<20&&!ok;i++){
-      try{await window.__optiboxFs.uploadAttachment(a.name,a.b64);ok=true;}
-      catch(_){await new Promise(r=>setTimeout(r,3000));}
-    }
-  }
 }
 function submitComposer(source){
   const text=msgEl.value.trim();

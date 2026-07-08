@@ -1,11 +1,13 @@
 import { realCliHarness, opencodeNoToolEnv, type RealCliHarnessSpec } from "../shared.js";
 
-// Hermes is reached through OpenCode's OpenRouter provider. OpenCode consumes
-// AGENTS.md project rules, so Hermes receives our phase rules through that
-// harness-native rule mechanism plus the hidden XML prompt body.
+// The OpenCode CLI driving OpenRouter models inside the user Box. The default
+// model is Claude Sonnet (the one whose OpenRouter endpoint exposes tools);
+// Nous Research's Hermes is offered only as a no-tools chat model. OpenCode
+// consumes AGENTS.md project rules, so the model receives our phase rules
+// through that harness-native mechanism plus the hidden XML prompt body.
 export const spec: RealCliHarnessSpec = {
-  name: "hermes",
-  description: "Hermes (Nous Research) model via OpenCode inside the user Box.",
+  name: "opencode-openrouter",
+  description: "OpenCode CLI via OpenRouter (default Claude Sonnet with tools; Hermes for no-tools chat), inside the user Box.",
   bin: "opencode",
   installCmd: "npm i -g opencode-ai@latest >/tmp/opencode-install.log 2>&1",
   instructionDelivery: "workspace-agents-md",

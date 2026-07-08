@@ -17,7 +17,7 @@ import { realCliHarness, type RealCliHarnessSpec } from "../examples/shared.js";
 import { spec as claudeSpec } from "../examples/claude-sdk/adapter.js";
 import { spec as codebaseDaemonSpec } from "../examples/codebase-daemon/adapter.js";
 import { spec as codexSpec } from "../examples/codex-sdk/adapter.js";
-import { spec as hermesSpec } from "../examples/hermes/adapter.js";
+import { spec as opencodeOpenrouterSpec } from "../examples/opencode-openrouter/adapter.js";
 import { spec as openclaudeSpec } from "../examples/openclaude/adapter.js";
 import { spec as opencodeSpec } from "../examples/opencode/adapter.js";
 import { spec as piSpec } from "../examples/pi/adapter.js";
@@ -36,7 +36,7 @@ const allSpecs: RealCliHarnessSpec[] = [
   claudeSpec,
   codebaseDaemonSpec,
   codexSpec,
-  hermesSpec,
+  opencodeOpenrouterSpec,
   openclaudeSpec,
   opencodeSpec,
   piSpec,
@@ -715,12 +715,10 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .toolChainDetails{display:none;margin:6px 0 2px 14px;color:#333}.toolChain.open .toolChainDetails{display:grid;gap:6px}.toolCallDetail{font-size:12px;line-height:1.35}.toolCallHead{color:#111}.toolCallMeta{color:#555;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}.toolCallOutput{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#444;max-height:180px;overflow:auto}@keyframes toolEllipsis{0%{content:''}25%{content:'.'}50%{content:'..'}75%,100%{content:'...'}}
 .composer{position:relative;display:block;padding:16px;border-top:1px solid #e0e0e0;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}.composer.attachDrop textarea{background:#f0f0f0;outline:2px dashed #fc4b55;outline-offset:-2px}textarea{width:100%;min-height:58px;max-height:140px;resize:none;border:0;background:#f6f6f6;color:#111;padding:13px 46px 13px 46px;font:inherit;font-weight:400;outline:none;display:block;border-radius:16px}textarea:focus{background:#f0f0f0}
 #attach{position:absolute;left:19px;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:#8a8a8a;border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}#attach:hover{background:#e6e6e6;color:#111}#attach svg{width:16px;height:16px;display:block}
-.pendingAttach{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}.pendingAttach:empty{display:none}
-.pendChip{display:flex;align-items:center;gap:6px;background:#f0f0f0;border-radius:9px;padding:5px 8px 5px 6px;font-size:11px;color:#333;max-width:170px}
-.pendChip img{width:22px;height:22px;object-fit:cover;border-radius:5px;display:block}
-.pendChip .pendExt{width:22px;height:22px;border-radius:5px;background:#dcdcdc;color:#666;font-size:8px;display:flex;align-items:center;justify-content:center;text-transform:uppercase;letter-spacing:.02em}
-.pendChip .pendName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pendChip .pendX{cursor:pointer;color:#9a9a9a;font-size:14px;line-height:1;padding:0 2px}.pendChip .pendX:hover{color:#111}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer;border-radius:9px}button:disabled{opacity:.5;cursor:not-allowed}/* Concentric with the textarea's 16px corner: the corner arc's center sits 16px
+/* Pending (unsent) attachments preview as the SAME fanned deck as sent ones. */
+.pendingAttach{margin:0 0 8px}.pendingAttach:empty{display:none}
+.pendingAttach .cardRemove{position:absolute;top:3px;right:3px;width:16px;height:16px;border-radius:50%;background:rgba(17,17,17,.7);color:#fff;font-size:11px;line-height:16px;text-align:center;cursor:pointer;opacity:0;transition:opacity .12s ease;z-index:3;padding:0}
+.pendingAttach .card:hover .cardRemove{opacity:1}.pendingAttach .cardRemove:hover{background:#fc4b55}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer;border-radius:9px}button:disabled{opacity:.5;cursor:not-allowed}/* Concentric with the textarea's 16px corner: the corner arc's center sits 16px
    in from the right/bottom edges, so a circle centered there with r=13 keeps a
    uniform 3px gap to both straight edges AND the arc. Offsets = composer pad 16
    + corner R 16 - button r 13 = 19px. */
@@ -1026,13 +1024,18 @@ function readAsB64(file){return new Promise((res,rej)=>{const r=new FileReader()
 function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)break;pendingFiles.push(f);}renderPending();}
 function renderPending(){
   const c=$('pendingAttach');if(!c)return;c.innerHTML='';
+  if(!pendingFiles.length)return;
+  c.className='pendingAttach attachDeck';
   pendingFiles.forEach((f,i)=>{
-    const chip=document.createElement('div');chip.className='pendChip';
-    if(IMG_RE.test(f.name)){const img=document.createElement('img');img.src=URL.createObjectURL(f);chip.appendChild(img);}
-    else{const e=document.createElement('div');e.className='pendExt';e.textContent=fileExt(f.name);chip.appendChild(e);}
-    const nm=document.createElement('div');nm.className='pendName';nm.textContent=f.name;chip.appendChild(nm);
-    const x=document.createElement('div');x.className='pendX';x.textContent='×';x.title='remove';x.addEventListener('click',()=>{pendingFiles.splice(i,1);renderPending();});chip.appendChild(x);
-    c.appendChild(chip);
+    const card=document.createElement('div');card.className='card';card.title=f.name;
+    if(IMG_RE.test(f.name)){const img=document.createElement('img');img.src=URL.createObjectURL(f);card.appendChild(img);}
+    else if(VID_RE.test(f.name)){const v=document.createElement('video');v.src=URL.createObjectURL(f);v.muted=true;card.appendChild(v);}
+    else{const e=document.createElement('div');e.className='cardIcon';e.textContent=fileExt(f.name);card.appendChild(e);}
+    const nm=document.createElement('div');nm.className='cardName';nm.textContent=f.name;card.appendChild(nm);
+    const x=document.createElement('button');x.type='button';x.className='cardRemove';x.textContent='×';x.title='remove';
+    x.addEventListener('click',ev=>{ev.stopPropagation();pendingFiles.splice(i,1);renderPending();});card.appendChild(x);
+    card.addEventListener('click',async()=>{try{window.__optiboxFs.openBytes(f.name,new Uint8Array(await f.arrayBuffer()));}catch(_){}});
+    c.appendChild(card);
   });
 }
 // Render the fanned deck inside a just-created user message bubble.

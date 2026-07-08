@@ -1156,7 +1156,7 @@ test("codebase daemon --no-tools never reads host machine facts", async () => {
 });
 test("runtime feasibility matrix covers required harnesses", async () => {
   const { RUNTIME_FEASIBILITY } = await import("../src/runtimeMatrix.js");
-  for (const harness of ["claude-agent-sdk", "codebase-daemon", "pi", "hermes", "opencode"]) {
+  for (const harness of ["claude-agent-sdk", "codebase-daemon", "pi", "opencode-openrouter", "opencode"]) {
     const row = RUNTIME_FEASIBILITY.find((r) => r.harnessName === harness);
     assert.ok(row, `${harness} is in the feasibility matrix`);
     assert.equal(row.supported, true);
@@ -1361,14 +1361,14 @@ test("every adapter structurally disables tools when toolsAllowed is false", asy
       },
     },
     {
-      mod: "../examples/hermes/adapter.js",
+      mod: "../examples/opencode-openrouter/adapter.js",
       provider: "openrouter",
       assertNoTools: (_argv, env) => {
-        assert.ok(env?.OPENCODE_CONFIG_CONTENT, "hermes no-tool env present");
+        assert.ok(env?.OPENCODE_CONFIG_CONTENT, "opencode-openrouter no-tool env present");
         assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { tools: { "*": false, webfetch: true }, permission: { "*": "allow" } });
       },
       assertTools: (_argv, env) => {
-        assert.ok(env?.OPENCODE_CONFIG_CONTENT, "hermes tools-on env present");
+        assert.ok(env?.OPENCODE_CONFIG_CONTENT, "opencode-openrouter tools-on env present");
         assert.deepEqual(JSON.parse(env!.OPENCODE_CONFIG_CONTENT), { permission: { "*": "allow" }, autoupdate: false, snapshot: false });
       },
     },
@@ -1632,10 +1632,10 @@ test("each adapter renders its native resume flags from sessionId/resumeSessionI
       assertResume: (a) => assert.ok(joinedHas(a, "-s", "RID"), "opencode resumes with -s"),
     },
     {
-      mod: "../examples/hermes/adapter.js",
+      mod: "../examples/opencode-openrouter/adapter.js",
       strategy: "capture",
       provider: "openrouter",
-      assertResume: (a) => assert.ok(joinedHas(a, "-s", "RID"), "hermes resumes with -s"),
+      assertResume: (a) => assert.ok(joinedHas(a, "-s", "RID"), "opencode-openrouter resumes with -s"),
     },
     {
       mod: "../examples/codebase-daemon/adapter.js",

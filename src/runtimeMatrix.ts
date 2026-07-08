@@ -76,13 +76,13 @@ export const RUNTIME_FEASIBILITY: RuntimeFeasibility[] = [
     noToolMechanism: "`--no-tools` loads the agent with zero tools (read/bash/edit/write/grep/find/ls). Box run omits it.",
   },
   {
-    runtime: "Hermès / Hermes",
-    harnessName: "hermes",
+    runtime: "OpenCode (OpenRouter)",
+    harnessName: "opencode-openrouter",
     supported: true,
     streaming: "stdout-chunks",
-    proofPath: "opencode run --format json --model openrouter/nousresearch/hermes-4-70b (OPENCODE_CONFIG_CONTENT permission map)",
-    blocker: "Direct Hermes token-event schema is not stable in this prototype; Hermes via OpenCode inherits OpenCode JSON event granularity.",
-    source: "Hermes runs through OpenCode's OpenRouter provider; OpenCode docs describe raw JSON events and the tools config map. NOTE: OpenRouter's Hermes endpoints report tools:false (no OpenAI-style tool-use API), so Hermes cannot drive Box tools through OpenCode — chat only.",
+    proofPath: "opencode run --format json --model openrouter/anthropic/claude-sonnet-5 (OPENCODE_CONFIG_CONTENT permission map)",
+    blocker: "Token-event granularity is whatever OpenCode's JSON events provide; per-token deltas are not guaranteed.",
+    source: "OpenCode drives OpenRouter models; default is Claude Sonnet (its OpenRouter endpoint exposes the tool-use API). NOTE: OpenRouter's Hermes endpoints report tools:false, so Hermes cannot drive Box tools through OpenCode — it is offered as chat only.",
     noToolMechanism: "OPENCODE_CONFIG_CONTENT={\"tools\":{\"*\":false}} structurally removes every tool (permission:deny would hang on a TTY-less approval prompt). Box run sets permission:{\"*\":\"allow\"} plus `opencode run --auto` so tool calls are never blocked on interactive approval.",
   },
   {

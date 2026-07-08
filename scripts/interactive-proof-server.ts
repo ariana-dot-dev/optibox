@@ -271,6 +271,9 @@ function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversat
 // features either way except writes, which need a live box.
 // ---------------------------------------------------------------------------
 
+/** Latest desktop-connect hold release per user (renewed on every poll). */
+const desktopHolds = new Map<string, () => void>();
+
 function fsBoxClient(credentials: DemoCredentials): BoxHttpClient {
   if (!credentials.boxApiKey) throw new Error("BOX_API_KEY is required");
   return new BoxHttpClient({ apiKey: credentials.boxApiKey });
@@ -395,6 +398,20 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
         "x-fs-live": servedLive ? "1" : "0",
       });
       return res.end(bytes), true;
+    }
+
+    if (pathname === "/api/fs/desktop") {
+      if (!box || !live) return json(409, { ok: false, message: "machine is off" }), true;
+      // Rolling keep-alive: VNC provisioning takes ~20s (longer than the idle
+      // window), and a stream the user is about to watch shouldn't die under
+      // them. Each poll renews a 45s hold; the TTL is the release.
+      desktopHolds.get(userId)?.();
+      desktopHolds.set(userId, orchestratorFor(credentials).holdUserBox(userId, "desktop-connect", 45_000));
+      // publicAccess: the token-bearing URL 302s into cookie auth, which dies
+      // inside an iframe when third-party cookies are blocked. The public URL
+      // needs no cookie; it is still an unguessable per-box host.
+      const desktop = await client.desktopStreamUrl(box.id, { vnc: true, publicAccess: true });
+      return json(200, { ok: true, provisioning: desktop.provisioning, ...(desktop.desktopUrl ? { desktopUrl: desktop.desktopUrl } : {}), ...(desktop.message ? { message: desktop.message } : {}) }), true;
     }
 
     if (pathname === "/api/fs/write") {
@@ -655,7 +672,19 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e0e0e0;padding:calc(14px + env(safe-area-inset-top)) 16px 14px;display:grid;gap:12px}
 .counters{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.counter{border:0;background:#f6f6f6;padding:11px 12px;min-width:0;border-radius:10px}.label{display:block;color:#555;letter-spacing:.01em;font-size:12px;font-weight:400}.value{display:block;margin-top:3px;font:400 21px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:0;background:transparent;color:#9a9a9a;padding:1px 2px;font-size:11px;font-weight:400;text-align:center;letter-spacing:.02em;display:flex;align-items:center;justify-content:center;gap:7px}.state:before{content:"";width:6px;height:6px;border-radius:50%;background:#cdcdcd;flex:0 0 auto;transition:background .3s ease}body[data-busy="1"] .state:before{background:#f4b93e}body[data-billing="1"] .state:before{background:#fc4b55;box-shadow:0 0 0 3px rgba(252,75,85,.16)}
 .composerBar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:9px 16px calc(11px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #f0f0f0}.composerBar button,.composerBar .traceToggle{min-height:32px;background:#fff;color:#6a6a6a;border:1px solid #e6e6e6;padding:0 11px;font-weight:400;font-size:11px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border-radius:8px;transition:border-color .15s ease,color .15s ease}.composerBar button:hover,.composerBar .traceToggle:hover{border-color:#c9c9c9;color:#111}.traceToggle{cursor:pointer}.traceToggle input{accent-color:#111}.iconButton{width:36px;justify-content:center;padding:0!important;font-size:16px}.iconButton svg{width:16px;height:16px;display:block}.composerBar .iconButton{width:32px;font-size:14px;margin-left:auto}.settingsBackdrop{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:18px}.settingsBackdrop.open{display:flex}.settingsDialog{width:min(560px,100%);max-height:calc(92dvh/var(--z));overflow:auto;background:#fff;border:1px solid #111;padding:18px;color:#111;border-radius:16px}.settingsHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.settingsHead h2{margin:0;font-size:20px;font-weight:400;letter-spacing:-.02em}.settingsHead p{margin:4px 0 0;color:#555;font-size:12px}.settingsDialog label{display:grid;gap:5px;margin-top:10px;font-size:12px;color:#555}.settingsDialog input,.settingsDialog select{width:100%;border:1px solid #d9d9d9;background:#fff;color:#111;min-height:38px;padding:8px 10px;font:inherit;font-size:13px;border-radius:9px}.settingsDialog input:focus,.settingsDialog select:focus{outline:none;border-color:#111}.settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.settingsNote{margin-top:12px;border:1px solid #e0e0e0;background:#f6f6f6;padding:10px 12px;font-size:12px;color:#333;border-radius:8px}.settingsActions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.settingsActions button.secondary{background:#fff;color:#111;border:1px solid #d9d9d9}.settingsStatus{font-size:12px;color:#555;margin-top:8px}.dangerText{color:#9f1239}.okText{color:#166534}
-.chat{flex:1;overflow:auto;padding:18px 16px 20px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#555;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;font-weight:400;border:1px solid transparent;border-radius:14px}.msg.user{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:5px}.msg.assistant{align-self:flex-start;background:#f6f6f6;color:#111;border-color:#e0e0e0;border-bottom-left-radius:5px}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed #d9d9d9;color:#555;font-size:12px;max-width:92%;padding:8px 10px;border-radius:10px}.msg .body code{background:rgba(0,0,0,.08);padding:1px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}.msg.user .body code{background:rgba(255,255,255,.18)}.msg .body pre{background:#101418;color:#e6edf3;padding:10px 12px;border-radius:5px;overflow-x:auto;margin:6px 0;white-space:pre}.msg .body pre code{background:none;padding:0;color:inherit}.msg .body .mdh{display:inline-block;font-size:1.05em}.msg .body .mdli{display:inline-block;padding-left:16px;position:relative}.msg .body .mdli:before{content:'•';position:absolute;left:4px;color:#999}.msg .body a{color:inherit;text-decoration:underline}.tag{display:block;margin-bottom:4px;color:#555;letter-spacing:.01em;font-size:10px;font-weight:400}.msg.user .tag{color:#d9d9d9}.msg.trace .tag{color:#777}
+.chat{flex:1;overflow:auto;padding:18px 16px 20px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#555;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;font-weight:400;border:1px solid transparent;border-radius:14px}.msg.user{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:5px}.msg.assistant{align-self:flex-start;background:#f6f6f6;color:#111;border-color:#e0e0e0;border-bottom-left-radius:5px}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed #d9d9d9;color:#555;font-size:12px;max-width:92%;padding:8px 10px;border-radius:10px}.msg .body code{background:rgba(0,0,0,.08);padding:1px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}.msg.user .body code{background:rgba(255,255,255,.18)}.msg .body pre{background:#101418;color:#e6edf3;padding:10px 12px;border-radius:5px;overflow-x:auto;margin:6px 0;white-space:pre}.msg .body pre code{background:none;padding:0;color:inherit}.msg .body .mdh{display:inline-block;font-size:1.05em}.msg .body .mdli{display:inline-block;padding-left:16px;position:relative}.msg .body .mdli:before{content:'•';position:absolute;left:4px;color:#999}.msg .body a{color:inherit;text-decoration:underline}
+.msg.desktop{align-self:flex-start;max-width:86%;width:540px;padding:8px;background:#f6f6f6;border-radius:14px;border:0}
+.msg.desktop .desktopTag{font-size:10px;color:#555;margin:0 4px 6px;display:flex;align-items:center;justify-content:space-between}
+.msg.desktop .desktopTag a{color:#9a9a9a;text-decoration:none}
+.msg.desktop .desktopTag a:hover{color:#111}
+.desktopWrap{position:relative;border-radius:8px;overflow:hidden;background:#111;min-height:60px}
+.desktopFrame{width:100%;aspect-ratio:16/10;border:0;display:block}
+.desktopOverlay{position:absolute;inset:0;cursor:pointer;display:flex;align-items:flex-end;justify-content:flex-end;padding:8px}
+.desktopOverlay span{background:rgba(17,17,17,.72);color:#fff;font-size:11px;padding:4px 10px;border-radius:12px;opacity:0;transition:opacity .15s ease}
+.desktopOverlay:hover span{opacity:1}
+.desktopNote{color:#bdbdbd;font-size:12px;padding:22px 12px;text-align:center}
+.msg.desktop.ended{padding:8px 12px}
+.msg.desktop.ended .desktopWrap{display:none}.tag{display:block;margin-bottom:4px;color:#555;letter-spacing:.01em;font-size:10px;font-weight:400}.msg.user .tag{color:#d9d9d9}.msg.trace .tag{color:#777}
 .toolChain{align-self:flex-start;max-width:92%;width:100%;font-size:13px;color:#555}.toolChainSummary{position:relative;min-height:24px;display:flex;align-items:center;gap:6px;padding:0;cursor:pointer;user-select:none;outline:none}.toolChainSummary:focus-visible{text-decoration:underline}.toolChainLabel{display:inline-block;transition:transform .16s ease}.toolChainLabel.bump{transform:translateY(-2px)}.toolChainEllipsis{display:inline-block;min-width:18px}.toolChain.running .toolChainEllipsis::after{content:'…';animation:toolEllipsis 1.1s steps(4,end) infinite}.toolChainChevron{margin-left:auto;opacity:0;transition:opacity .12s ease,transform .12s ease}.toolChain:hover .toolChainChevron,.toolChain.open .toolChainChevron,.toolChainSummary:focus-visible .toolChainChevron{opacity:1}.toolChain.open .toolChainChevron{transform:rotate(90deg)}.working{align-self:flex-start;color:#777;font-size:13px;padding:6px 2px;display:flex;align-items:center;gap:6px}.working::after{content:'…';display:inline-block;min-width:16px;animation:toolEllipsis 1.1s steps(4,end) infinite}
 .toolChainDetails{display:none;margin:6px 0 2px 14px;color:#333}.toolChain.open .toolChainDetails{display:grid;gap:6px}.toolCallDetail{font-size:12px;line-height:1.35}.toolCallHead{color:#111}.toolCallMeta{color:#555;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}.toolCallOutput{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#444;max-height:180px;overflow:auto}@keyframes toolEllipsis{0%{content:''}25%{content:'.'}50%{content:'..'}75%,100%{content:'...'}}
 .composer{position:relative;display:block;padding:16px;border-top:1px solid #e0e0e0;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}textarea{width:100%;min-height:58px;max-height:140px;resize:none;border:0;background:#f6f6f6;color:#111;padding:13px 42px 13px 15px;font:inherit;font-weight:400;outline:none;display:block;border-radius:16px}textarea:focus{background:#f0f0f0}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer;border-radius:9px}button:disabled{opacity:.5;cursor:not-allowed}/* Concentric with the textarea's 16px corner: the corner arc's center sits 16px
@@ -853,6 +882,58 @@ s=s.replace(new RegExp('^#{1,6}\\\\s+(.+)$','gm'),'<strong class="mdh">$1</stron
 s=s.replace(new RegExp('^[ ]*(?:[-*]|[0-9]+[.])[ ]+(.+)$','gm'),'<span class="mdli">$1</span>');
 s=s.replace(new RegExp('\\\\n?(<pre>)','g'),'$1').replace(new RegExp('(</pre>)\\\\n?','g'),'$1');
 return s;}
+// One live desktop widget per reply loop: the FIRST desktop-touching tool call
+// of a turn embeds the box's noVNC stream (view-only until clicked); later
+// desktop calls in the same turn reuse it; a new turn's widget ends the old
+// one. (Cross-origin iframes cannot be recorded client-side, so no replay.)
+var desktopWidget=null;
+var DESKTOP_MARKS=['xdotool','wmctrl','xdg-open','ydotool','wtype','scrot','DISPLAY=','chromium','google-chrome','firefox','lux '];
+function isDesktopCommand(cmd){cmd=String(cmd||'');for(var i=0;i<DESKTOP_MARKS.length;i++)if(cmd.indexOf(DESKTOP_MARKS[i])>=0)return true;return false;}
+function endDesktopWidget(){if(!desktopWidget)return;try{if(desktopWidget.frame)desktopWidget.frame.src='about:blank';}catch(_){}desktopWidget.el.classList.add('ended');var tag=desktopWidget.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · session ended';desktopWidget=null;}
+function ensureDesktopWidget(localId){
+  if(desktopWidget&&desktopWidget.localId===localId)return;
+  endDesktopWidget();
+  const c=$('chat');const stick=chatStick(c);$('empty')?.remove();
+  const el=document.createElement('div');el.className='msg desktop';
+  el.innerHTML='<div class="desktopTag"><span>desktop · connecting</span><a href="#" target="_blank" rel="noopener" style="display:none">open in tab</a></div><div class="desktopWrap"><div class="desktopNote">starting desktop stream…</div></div>';
+  c.appendChild(el);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;
+  desktopWidget={localId:localId,el:el,frame:null};
+  attachDesktopStream(desktopWidget);
+}
+async function attachDesktopStream(w){
+  for(var i=0;i<30;i++){
+    if(desktopWidget!==w)return;
+    try{
+      const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})});
+      const j=await res.json();
+      if(desktopWidget!==w)return;
+      if(j.ok&&j.desktopUrl&&!j.provisioning){
+        const wrap=w.el.querySelector('.desktopWrap');
+        const frame=document.createElement('iframe');
+        frame.className='desktopFrame';frame.setAttribute('allow','clipboard-read; clipboard-write; fullscreen');frame.src=j.desktopUrl;
+        const overlay=document.createElement('div');overlay.className='desktopOverlay';overlay.innerHTML='<span>click to take over</span>';
+        overlay.addEventListener('click',function(){overlay.remove();var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · interactive';});
+        wrap.innerHTML='';wrap.appendChild(frame);wrap.appendChild(overlay);
+        w.frame=frame;
+        var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · live';
+        var link=w.el.querySelector('.desktopTag a');if(link){link.href=j.desktopUrl;link.style.display='';}
+        // Heartbeat: renew the server-side desktop hold while this widget's
+        // turn is still running, so the machine stays up under the stream.
+        (async function(){
+          while(desktopWidget===w&&activeTurns.has(w.localId)){
+            await new Promise(function(r){setTimeout(r,20000);});
+            if(desktopWidget!==w||!activeTurns.has(w.localId))return;
+            try{await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})});}catch(_){}
+          }
+        })();
+        return;
+      }
+      if(j.ok===false){var n1=w.el.querySelector('.desktopNote');if(n1)n1.textContent='desktop unavailable: '+(j.message||'machine is off');return;}
+    }catch(_){}
+    await new Promise(function(r){setTimeout(r,2000);});
+  }
+  var n2=w.el.querySelector('.desktopNote');if(n2)n2.textContent='desktop stream did not start';
+}
 function addMsg(cls,tag,text,key){if(cls!=='trace')currentToolChain=null;const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');const raw=stripHidden((body.dataset.raw||'')+text);body.dataset.raw=raw;body.textContent=raw;if(cls==='assistant'||cls==='user')body.innerHTML=md(raw);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;return el;}
 const toolChains=[];
 let currentToolChain=null;
@@ -928,9 +1009,9 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}
   else if(ev.type==='runtime.proof'){addMsg('trace','proof · no Box prompt/API','boxPromptApiUsed='+ev.boxPromptApiUsed+' · boxBuiltInAgentUsed='+ev.boxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\\n',keyFor(ev,localId,'proof'));}
   else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine; stdout/SSE relays native chunks as emitted.',keyFor(ev,localId,'exec'));}
-  else if(ev.type==='harness.tool'){setState('Private machine running · using tools');addToolEvent(ev,localId);}
+  else if(ev.type==='harness.tool'){setState('Private machine running · using tools');if(isDesktopCommand(ev.command)){if(ev.phase==='tool_use'&&localId===latestLocalId)ensureDesktopWidget(localId);}else{addToolEvent(ev,localId);}}
   else if(ev.type==='user-box.delta'){addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
-  else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);}
+  else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
   else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
   else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}

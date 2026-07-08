@@ -152,6 +152,20 @@ export class BoxHttpClient implements BoxClient {
     await this.request(`/boxes/${encodeURIComponent(boxId)}/files`, { method: "PUT", body: JSON.stringify({ path, content: bytes.toString("base64"), encoding: "base64" }) });
   }
 
+  /**
+   * Create/fetch the desktop streaming URL for a live box. vnc mode streams
+   * noVNC over plain HTTPS (iframe-embeddable); provisioning=true means poll
+   * again shortly. The returned URL bears a secret — never log it.
+   */
+  async desktopStreamUrl(boxId: string, opts: { vnc?: boolean; publicAccess?: boolean } = {}): Promise<{ desktopUrl?: string; provisioning: boolean; message?: string }> {
+    const qs = opts.vnc === false ? "" : "?vnc=1";
+    const json = await this.request<{ desktopUrl?: string | null; provisioning?: boolean; message?: string }>(
+      `/boxes/${encodeURIComponent(boxId)}/desktop${qs}`,
+      { method: "POST", body: JSON.stringify(opts.publicAccess ? { publicAccess: true } : {}) },
+    );
+    return { ...(json.desktopUrl ? { desktopUrl: json.desktopUrl } : {}), provisioning: Boolean(json.provisioning), ...(json.message ? { message: json.message } : {}) };
+  }
+
   /** GET returning the raw Response (binary endpoints; throws on !ok). */
   private async rawGet(path: string): Promise<Response> {
     const controller = new AbortController();

@@ -2,12 +2,10 @@
 // is down. Click a file -> viewer dialog (pdf / image / table editors / code
 // editor). Drag-and-drop upload onto any folder (live box only).
 // Loaded as an ES module; the inline page script exposes window.__optiboxFs.
-import { FileTree } from "https://esm.sh/@pierre/trees@1.0.0-beta.5";
-
 const $ = (id) => document.getElementById(id);
 const panel = $("fsPanel");
-if (panel) init();
 
+let FileTree = null;
 let tree = null;
 let treePaths = [];
 let entryByPath = new Map();
@@ -44,7 +42,14 @@ function setStatus(text, cls) {
 
 // ---------------------------------------------------------------- tree
 
-function init() {
+async function init() {
+  setStatus("loading…");
+  try {
+    ({ FileTree } = await import("https://esm.sh/@pierre/trees@1.0.0-beta.5"));
+  } catch (e) {
+    setStatus("tree library failed to load: " + e.message);
+    return;
+  }
   refresh(true);
   refreshTimer = setInterval(() => refresh(false), 8000);
   panel.addEventListener("dragover", onDragOver);
@@ -609,3 +614,6 @@ async function showText(path, name, text, canSave) {
     catch (e) { markSaved(saveBtn, false, e.message); }
   });
 }
+
+// Kick off last: every top-level binding above is initialized by now.
+if (panel) init();

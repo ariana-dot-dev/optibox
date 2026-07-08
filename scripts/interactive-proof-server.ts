@@ -339,10 +339,15 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     if (pathname === "/api/fs/tree") {
       if (!box) return json(200, { ok: true, live: false, state: "none", entries: [] }), true;
       if (live) {
-        // Try live even while the state string still says starting/resuming;
-        // a 409 just means not actually up yet -> snapshot below.
+        // Try live even while the state string still says starting/resuming —
+        // but with a hard 3.5s deadline: commands against a still-booting box
+        // HANG until it is up (observed 30s tree loads), and the panel repolls
+        // every 4s anyway, so serving the snapshot now beats blocking.
         try {
-          const entries = await fsLiveTree(client, box.id);
+          const entries = await Promise.race([
+            fsLiveTree(client, box.id),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error("live-tree deadline")), 3500)),
+          ]);
           return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries }), true;
         } catch { /* fall through to snapshot */ }
       }
@@ -407,10 +412,9 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       // them. Each poll renews a 45s hold; the TTL is the release.
       desktopHolds.get(userId)?.();
       desktopHolds.set(userId, orchestratorFor(credentials).holdUserBox(userId, "desktop-connect", 45_000));
-      // publicAccess: the token-bearing URL 302s into cookie auth, which dies
-      // inside an iframe when third-party cookies are blocked. The public URL
-      // needs no cookie; it is still an unguessable per-box host.
-      const desktop = await client.desktopStreamUrl(box.id, { vnc: true, publicAccess: true });
+      // Moonlight (60fps WebRTC), not VNC. publicAccess: the tokened URL suits
+      // iframes (no cookie dance); the host stays unguessable per-box.
+      const desktop = await client.desktopStreamUrl(box.id, { theme: "light", publicAccess: true });
       return json(200, { ok: true, provisioning: desktop.provisioning, ...(desktop.desktopUrl ? { desktopUrl: desktop.desktopUrl } : {}), ...(desktop.message ? { message: desktop.message } : {}) }), true;
     }
 
@@ -603,7 +607,7 @@ const server = http.createServer(async (req, res) => {
           // command needs X up (~2s warm with the template-baked install).
           const boxIdForDesktop = (event as any).boxId;
           if ((event as ConsumerTurnEvent).type === "billing.start" && typeof boxIdForDesktop === "string") {
-            void fsBoxClient(credentials).desktopStreamUrl(boxIdForDesktop, { vnc: true, publicAccess: true }).catch(() => undefined);
+            void fsBoxClient(credentials).desktopStreamUrl(boxIdForDesktop, { theme: "light", publicAccess: true }).catch(() => undefined);
           }
           send(event as ConsumerTurnEvent);
         }
@@ -917,7 +921,7 @@ async function attachDesktopStream(w){
       if(j.ok&&j.desktopUrl&&!j.provisioning){
         const wrap=w.el.querySelector('.desktopWrap');
         const frame=document.createElement('iframe');
-        frame.className='desktopFrame';frame.setAttribute('allow','clipboard-read; clipboard-write; fullscreen');frame.src=j.desktopUrl;
+        frame.className='desktopFrame';frame.setAttribute('allow','clipboard-read; clipboard-write; fullscreen; autoplay; pointer-lock; gamepad');frame.src=j.desktopUrl;
         const overlay=document.createElement('div');overlay.className='desktopOverlay';overlay.innerHTML='<span>click to take over</span>';
         overlay.addEventListener('click',function(){overlay.remove();var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · interactive';});
         wrap.innerHTML='';wrap.appendChild(frame);wrap.appendChild(overlay);

@@ -157,8 +157,11 @@ export class BoxHttpClient implements BoxClient {
    * noVNC over plain HTTPS (iframe-embeddable); provisioning=true means poll
    * again shortly. The returned URL bears a secret — never log it.
    */
-  async desktopStreamUrl(boxId: string, opts: { vnc?: boolean; publicAccess?: boolean } = {}): Promise<{ desktopUrl?: string; provisioning: boolean; message?: string }> {
-    const qs = opts.vnc === false ? "" : "?vnc=1";
+  async desktopStreamUrl(boxId: string, opts: { vnc?: boolean; theme?: "light" | "dark"; publicAccess?: boolean } = {}): Promise<{ desktopUrl?: string; provisioning: boolean; message?: string }> {
+    const params = new URLSearchParams();
+    if (opts.vnc) params.set("vnc", "1");
+    else if (opts.theme) params.set("theme", opts.theme);
+    const qs = params.size ? `?${params}` : "";
     const json = await this.request<{ desktopUrl?: string | null; provisioning?: boolean; message?: string }>(
       `/boxes/${encodeURIComponent(boxId)}/desktop${qs}`,
       { method: "POST", body: JSON.stringify(opts.publicAccess ? { publicAccess: true } : {}) },

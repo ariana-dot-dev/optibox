@@ -6,7 +6,7 @@
 .fsPanel h2{margin:0;font-size:13px;font-weight:500;letter-spacing:.02em;color:#111;display:flex;align-items:baseline;gap:8px}
 .fsStatus{font-size:11px;color:#9a9a9a;font-weight:400}
 .fsStatus.live{color:#1a7f37}
-.fsTreeMount{flex:1;min-height:0;overflow:hidden;border-radius:9px;background:#f6f6f6;padding:6px;
+.fsTreeMount{flex:1;min-height:0;overflow:hidden;border-radius:9px;
   /* The tree resolves light-dark() by color-scheme; pin it light and feed it
      the app palette through its documented -override variables. */
   color-scheme:light;

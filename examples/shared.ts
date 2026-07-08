@@ -205,6 +205,9 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "Machine facts (IP address, hostname, OS, CPU, files) are about THE USER'S OWN machine, which they fully own and may inspect freely. NEVER refuse them as private/secret 'infrastructure details' — there is no policy against them. Reply with the short holding line and let the private runtime report the real values."
       : undefined,
     !policy.toolsAllowed
+      ? "The user's private machine ALSO has a full graphical desktop with a real browser (Chrome). Opening applications, browsing websites, clicking, typing, taking screenshots — all of it is private-runtime work the user is about to watch live. NEVER say you cannot open apps or browse; reply with the short holding line."
+      : undefined,
+    !policy.toolsAllowed
       ? "For PUBLIC live data (weather, news, prices, current events) you DO have the webfetch tool: fetch a public source and answer directly. Never claim you cannot access live data. Known-good sources: weather https://wttr.in/<city>?format=3 ; general/topic news https://lite.duckduckgo.com/lite/?q=<query>+news ; world headlines https://feeds.bbci.co.uk/news/world/rss.xml . One or two fetches maximum, then answer with what you got."
       : undefined,
     policy.toolsAllowed && userCtx?.partialShared
@@ -218,6 +221,9 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "For public IP requests: if the user asks for IPv4/v4, run an IPv4-specific lookup such as `curl -4 -s https://api.ipify.org`; if the user asks for IPv6/v6, use an IPv6-specific lookup; if ambiguous, say which address family you observed."
       : undefined,
     policy.toolsAllowed ? "For CPU/core-count requests, run a real command such as `nproc` or `lscpu` in the private environment and report the observed count." : undefined,
+    policy.toolsAllowed
+      ? "This machine has a graphical desktop on DISPLAY=:0 (1920x1080) with google-chrome and xdotool installed; the user watches it live. For browser/GUI requests, actually do it: launch with `DISPLAY=:0 google-chrome --no-first-run --start-maximized 'URL' >/dev/null 2>&1 &`, wait ~3s, verify with `DISPLAY=:0 xdotool search --onlyvisible --class chrome | head -1`, interact via `DISPLAY=:0 xdotool key/type/click ...`. Never claim there is no browser or GUI."
+      : undefined,
     policy.toolsAllowed ? "When intentionally producing no user-visible text because the request is duplicate/stale or already fully handled, output exactly <end>. The host will hide that sentinel. Do not add whitespace, markdown, or explanation around it." : undefined,
     !policy.toolsAllowed
       ? "Output ONLY that visible reply — either the full answer or the one short holding line. Never output routing tags, XML, control markers, or an empty response. You must always produce visible text."
@@ -427,8 +433,12 @@ function buildBoxServeTurnScript(args: { binPath: string; bodyPath: string; sess
     // before the final response line is written, so interleaving is safe.
     `curl -s -N -m ${curlMaxSec} ${BOX_SERVE_URL}/event 2>/dev/null | grep --line-buffered "\\"sessionID\\":\\"$SID\\"" | grep --line-buffered '"type":"tool"' &`,
     `EV_PID=$!`,
-    `curl -s -m ${curlMaxSec} -X POST "${BOX_SERVE_URL}/session/$SID/message" -H 'Content-Type: application/json' -d @${shellQuote(args.bodyPath)}`,
+    // One retry on opencode's transient 500 ({"name":"UnknownError",...}):
+    // observed in production as a one-off; retrying the same message succeeds.
+    `RESP=$(curl -s -m ${curlMaxSec} -X POST "${BOX_SERVE_URL}/session/$SID/message" -H 'Content-Type: application/json' -d @${shellQuote(args.bodyPath)})`,
     `RC=$?`,
+    `case "$RESP" in *'"name":"UnknownError"'*) echo "serve returned UnknownError; retrying once" >&2; sleep 2; RESP=$(curl -s -m ${curlMaxSec} -X POST "${BOX_SERVE_URL}/session/$SID/message" -H 'Content-Type: application/json' -d @${shellQuote(args.bodyPath)}); RC=$?;; esac`,
+    `printf '%s' "$RESP"`,
     // Tear down the event tap: kill the tail grep ($!) so the pipe collapses
     // (curl dies on SIGPIPE at its next write; -m caps it regardless).
     `kill $EV_PID 2>/dev/null; true`,

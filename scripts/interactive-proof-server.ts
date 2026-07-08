@@ -598,6 +598,13 @@ const server = http.createServer(async (req, res) => {
         send(receivedEvent);
         for await (const event of orchestrator.runTurn(turnInput)) {
           auditEvent(event as ConsumerTurnEvent, turnInput, requestId);
+          // Fire-and-forget desktop provisioning as soon as the box bills:
+          // GUI daemons die on archive, and the agent's first DISPLAY=:0
+          // command needs X up (~2s warm with the template-baked install).
+          const boxIdForDesktop = (event as any).boxId;
+          if ((event as ConsumerTurnEvent).type === "billing.start" && typeof boxIdForDesktop === "string") {
+            void fsBoxClient(credentials).desktopStreamUrl(boxIdForDesktop, { vnc: true, publicAccess: true }).catch(() => undefined);
+          }
           send(event as ConsumerTurnEvent);
         }
         send({ type: "stream.end" });

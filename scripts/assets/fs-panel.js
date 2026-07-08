@@ -57,6 +57,12 @@ async function init() {
   panel.addEventListener("drop", onDrop);
 }
 
+/** Refresh that waits out an in-flight poll instead of silently skipping. */
+async function refreshNow() {
+  while (refreshing) await new Promise((r) => setTimeout(r, 100));
+  await refresh(false);
+}
+
 async function refresh(first) {
   if (refreshing) return;
   refreshing = true;
@@ -129,8 +135,11 @@ function renderTree(paths) {
 
 function onDragOver(e) {
   if (!e.dataTransfer || ![...e.dataTransfer.types].includes("Files")) return;
+  // Machine off -> snapshots are read-only: refuse the drop outright (no
+  // preventDefault means the browser shows the blocked cursor).
+  if (!fsLive) { panel.classList.remove("fsDrop"); return; }
   e.preventDefault();
-  e.dataTransfer.dropEffect = fsLive ? "copy" : "none";
+  e.dataTransfer.dropEffect = "copy";
   panel.classList.add("fsDrop");
 }
 
@@ -159,7 +168,10 @@ async function onDrop(e) {
   panel.classList.remove("fsDrop");
   if (!e.dataTransfer || !e.dataTransfer.files.length) return;
   e.preventDefault();
-  if (!fsLive) { setStatus("machine is stopped — start it (send a message) to upload"); return; }
+  // fsLive can be stale (state polls every 8s); re-check before the optimistic
+  // row so a just-stopped machine rejects cleanly instead of flashing a row.
+  try { await refreshNow(); } catch {}
+  if (!fsLive) { setStatus("machine is off — uploads need a running machine"); return; }
   const dir = dropTargetDir(e);
   for (const file of e.dataTransfer.files) {
     const dest = (dir ? dir + "/" : "") + file.name;

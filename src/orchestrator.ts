@@ -239,6 +239,14 @@ export class ConsumerBoxAgentOrchestrator {
   private templateBuild: Promise<BoxInfo | undefined> | undefined;
   /** Per-conversation abort controllers of in-flight turns (a new message aborts priors). */
   private readonly turnAborts = new Map<string, AbortController[]>();
+  /**
+   * Named keep-alive holds per userId: while any hold is active the user's box
+   * is "still needed" — the idle countdown cancels/never starts and the idle
+   * reaper skips it. First holder: in-flight uploads; more uses later. Every
+   * hold carries a TTL so a leaked hold can never pin a VM (and the reaper's
+   * hard billing ceiling still overrides everything).
+   */
+  private readonly boxHolds = new Map<string, Map<string, { reason: string; expiresEpochMs: number }>>();
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -278,8 +286,10 @@ export class ConsumerBoxAgentOrchestrator {
       const overHardCeiling = now - since >= hardCeilingMs;
       if (!overHardCeiling) {
         // Otherwise never reap a genuinely busy conversation: an active stream, an
-        // owed private round, or an in-flight boot all mean real work is happening.
+        // owed private round, an in-flight boot, or a keep-alive hold (e.g. an
+        // upload in progress) all mean real work is happening.
         if (this.activeTurnCounts.has(key) || this.activePrivateRound(key) || this.userBoxStarts.has(key)) continue;
+        if (this.activeHoldReasons(owner.userId).length > 0) continue;
         if (now - (this.lastActivityAt.get(key) ?? now) < idleThreshold) continue;
       }
       await this.reapBox(boxId, key, overHardCeiling);
@@ -1615,7 +1625,51 @@ export class ConsumerBoxAgentOrchestrator {
     if (this.hasUnansweredPrompts(key)) blockers.push("unanswered-prompt");
     if (this.activePrivateRound(key)) blockers.push("active-private-round");
     if (this.userBoxStarts.has(key)) blockers.push("box-boot-in-flight");
+    for (const reason of this.activeHoldReasons(key.split(":")[0]!)) blockers.push(`hold:${reason}`);
     return blockers;
+  }
+
+  /**
+   * Register a keep-alive hold on a user's box (e.g. an in-flight upload).
+   * Returns a release function; the TTL (capped at 10 minutes) is the leak
+   * guard for callers that die without releasing. The idle countdown polls
+   * blockers every 250ms, so an appearing hold visibly cancels it and the box
+   * only becomes stoppable again once the last hold is released or expired.
+   */
+  holdUserBox(userId: string, reason: string, ttlMs = 10 * 60_000): () => void {
+    const id = randomUUID();
+    const holds = this.boxHolds.get(userId) ?? new Map<string, { reason: string; expiresEpochMs: number }>();
+    holds.set(id, { reason, expiresEpochMs: Date.now() + Math.min(Math.max(ttlMs, 1000), 10 * 60_000) });
+    this.boxHolds.set(userId, holds);
+    this.touchUserActivity(userId);
+    return () => {
+      const current = this.boxHolds.get(userId);
+      current?.delete(id);
+      if (current && current.size === 0) this.boxHolds.delete(userId);
+      // Restart the idle clock from the release, not from the last message.
+      this.touchUserActivity(userId);
+    };
+  }
+
+  private activeHoldReasons(userId: string): string[] {
+    const holds = this.boxHolds.get(userId);
+    if (!holds) return [];
+    const now = Date.now();
+    const reasons: string[] = [];
+    for (const [id, hold] of holds) {
+      if (hold.expiresEpochMs <= now) holds.delete(id);
+      else reasons.push(hold.reason);
+    }
+    if (holds.size === 0) this.boxHolds.delete(userId);
+    return reasons;
+  }
+
+  /** Bump the idle clock of every conversation of this user (box is per-user). */
+  private touchUserActivity(userId: string): void {
+    const prefix = `${userId}:`;
+    for (const key of this.lastActivityAt.keys()) {
+      if (key.startsWith(prefix)) this.lastActivityAt.set(key, Date.now());
+    }
   }
 
   private bumpTurnSequence(key: string): number {

@@ -1994,3 +1994,26 @@ test("missing template kicks off a background build and this boot falls back to 
   assert.ok(box.commands.some((c: string) => c === "echo install"), "background build ran the template installCmd");
   await waitFor(async () => (await box.get(tpl.id)).state === "archived", 2000);
 });
+
+test("keep-alive holds mark the box needed until released or expired", () => {
+  const orchestrator = new ConsumerBoxAgentOrchestrator({
+    box: new FakeBoxClient(),
+    harnesses: [probeHarness("alpha")],
+    readinessPollMs: 1,
+    autoStopIdleMs: 1,
+  });
+  const blockers = (key: string) => (orchestrator as any).idleStopBlockers(key, undefined);
+  assert.deepEqual(blockers("user-a:conv-1"), []);
+
+  const release = orchestrator.holdUserBox("user-a", "upload");
+  assert.deepEqual(blockers("user-a:conv-1"), ["hold:upload"], "hold blocks every conversation of the user");
+  assert.deepEqual(blockers("user-a:conv-2"), ["hold:upload"]);
+  assert.deepEqual(blockers("user-b:conv-1"), [], "other users unaffected");
+
+  release();
+  assert.deepEqual(blockers("user-a:conv-1"), [], "released hold clears the blocker");
+
+  orchestrator.holdUserBox("user-a", "upload");
+  for (const hold of (orchestrator as any).boxHolds.get("user-a").values()) hold.expiresEpochMs = Date.now() - 1;
+  assert.deepEqual(blockers("user-a:conv-1"), [], "expired hold is swept and never pins the box");
+});

@@ -400,6 +400,10 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     if (pathname === "/api/fs/write") {
       if (!box || !live) return json(409, { ok: false, message: "box is stopped — snapshot files are read-only" }), true;
       if (!filePath || typeof body.contentB64 !== "string") return json(400, { ok: false, message: "path and contentB64 required" }), true;
+      // Keep the box up for the duration of the upload: the hold cancels a
+      // running auto-stop countdown and the reaper skips held boxes.
+      const releaseHold = orchestratorFor(credentials).holdUserBox(userId, "upload");
+      try {
       const bytes = Buffer.from(body.contentB64, "base64");
       if (bytes.length <= 5_000_000) {
         await client.writeFileBytes(box.id, filePath, bytes);
@@ -424,6 +428,9 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
         }
       }
       return json(200, { ok: true }), true;
+      } finally {
+        releaseHold();
+      }
     }
 
     return json(404, { ok: false, message: "unknown fs endpoint" }), true;

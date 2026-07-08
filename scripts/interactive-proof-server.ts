@@ -684,6 +684,21 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .counters{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.counter{border:0;background:#f6f6f6;padding:11px 12px;min-width:0;border-radius:10px}.label{display:block;color:#555;letter-spacing:.01em;font-size:12px;font-weight:400}.value{display:block;margin-top:3px;font:400 21px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:0;background:transparent;color:#9a9a9a;padding:1px 2px;font-size:11px;font-weight:400;text-align:center;letter-spacing:.02em;display:flex;align-items:center;justify-content:center;gap:7px}.state:before{content:"";width:6px;height:6px;border-radius:50%;background:#cdcdcd;flex:0 0 auto;transition:background .3s ease}body[data-busy="1"] .state:before{background:#f4b93e}body[data-billing="1"] .state:before{background:#fc4b55;box-shadow:0 0 0 3px rgba(252,75,85,.16)}
 .composerBar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:9px 16px calc(11px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #f0f0f0}.composerBar button,.composerBar .traceToggle{min-height:32px;background:#fff;color:#6a6a6a;border:1px solid #e6e6e6;padding:0 11px;font-weight:400;font-size:11px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border-radius:8px;transition:border-color .15s ease,color .15s ease}.composerBar button:hover,.composerBar .traceToggle:hover{border-color:#c9c9c9;color:#111}.traceToggle{cursor:pointer}.traceToggle input{accent-color:#111}.iconButton{width:36px;justify-content:center;padding:0!important;font-size:16px}.iconButton svg{width:16px;height:16px;display:block}.composerBar .iconButton{width:32px;font-size:14px;margin-left:auto}.settingsBackdrop{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:18px}.settingsBackdrop.open{display:flex}.settingsDialog{width:min(560px,100%);max-height:calc(92dvh/var(--z));overflow:auto;background:#fff;border:1px solid #111;padding:18px;color:#111;border-radius:16px}.settingsHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.settingsHead h2{margin:0;font-size:20px;font-weight:400;letter-spacing:-.02em}.settingsHead p{margin:4px 0 0;color:#555;font-size:12px}.settingsDialog label{display:grid;gap:5px;margin-top:10px;font-size:12px;color:#555}.settingsDialog input,.settingsDialog select{width:100%;border:1px solid #d9d9d9;background:#fff;color:#111;min-height:38px;padding:8px 10px;font:inherit;font-size:13px;border-radius:9px}.settingsDialog input:focus,.settingsDialog select:focus{outline:none;border-color:#111}.settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.settingsNote{margin-top:12px;border:1px solid #e0e0e0;background:#f6f6f6;padding:10px 12px;font-size:12px;color:#333;border-radius:8px}.settingsActions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.settingsActions button.secondary{background:#fff;color:#111;border:1px solid #d9d9d9}.settingsStatus{font-size:12px;color:#555;margin-top:8px}.dangerText{color:#9f1239}.okText{color:#166534}
 .chat{flex:1;overflow:auto;padding:18px 16px 20px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#555;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;font-weight:400;border:1px solid transparent;border-radius:14px}.msg.user{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:5px}.msg.assistant{align-self:flex-start;background:#f6f6f6;color:#111;border-color:#e0e0e0;border-bottom-left-radius:5px}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed #d9d9d9;color:#555;font-size:12px;max-width:92%;padding:8px 10px;border-radius:10px}.msg .body code{background:rgba(0,0,0,.08);padding:1px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}.msg.user .body code{background:rgba(255,255,255,.18)}.msg .body pre{background:#101418;color:#e6edf3;padding:10px 12px;border-radius:5px;overflow-x:auto;margin:6px 0;white-space:pre}.msg .body pre code{background:none;padding:0;color:inherit}.msg .body .mdh{display:inline-block;font-size:1.05em}.msg .body .mdli{display:inline-block;padding-left:16px;position:relative}.msg .body .mdli:before{content:'•';position:absolute;left:4px;color:#999}.msg .body a{color:inherit;text-decoration:underline}
+/* Attachment deck: fanned cards that fan out flat on hover; each card lifts and
+   opens the file on click. */
+.attachDeck{display:flex;padding:8px 0 2px;min-height:0}
+.attachDeck .card{position:relative;width:76px;height:96px;border-radius:10px;background:#fff;border:1px solid #e2e2e2;overflow:hidden;flex:0 0 auto;cursor:pointer;transform-origin:bottom center;transition:transform .18s cubic-bezier(.4,0,.2,1),box-shadow .18s ease;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.attachDeck .card:not(:first-child){margin-left:-46px}
+.attachDeck .card:nth-child(odd){transform:rotate(-3deg)}
+.attachDeck .card:nth-child(even){transform:rotate(2.5deg)}
+.attachDeck:hover .card{margin-left:6px;transform:rotate(0)}
+.attachDeck:hover .card:first-child{margin-left:0}
+.attachDeck .card:hover{transform:translateY(-8px) rotate(0)!important;box-shadow:0 8px 22px rgba(0,0,0,.16);z-index:2;border-color:#d0d0d0}
+.attachDeck .card img,.attachDeck .card video{width:100%;height:100%;object-fit:cover;display:block}
+.attachDeck .card .cardIcon{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.03em;background:#f4f4f4}
+.attachDeck .card .cardName{position:absolute;left:0;right:0;bottom:0;padding:3px 5px;font-size:8.5px;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.62));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.attachDeck .card .cardUp{position:absolute;inset:0;background:rgba(255,255,255,.55);display:flex;align-items:center;justify-content:center;font-size:9px;color:#333}
+.msg.user .attachDeck .card .cardName{color:#fff}
 .msg.desktop{align-self:flex-start;max-width:86%;width:540px;padding:8px;background:#f6f6f6;border-radius:14px;border:0}
 .msg.desktop .desktopTag{font-size:10px;color:#555;margin:0 4px 6px;display:flex;align-items:center;justify-content:space-between}
 .msg.desktop .desktopTag a{color:#9a9a9a;text-decoration:none}
@@ -698,7 +713,14 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .msg.desktop.ended .desktopWrap{display:none}.tag{display:block;margin-bottom:4px;color:#555;letter-spacing:.01em;font-size:10px;font-weight:400}.msg.user .tag{color:#d9d9d9}.msg.trace .tag{color:#777}
 .toolChain{align-self:flex-start;max-width:92%;width:100%;font-size:13px;color:#555}.toolChainSummary{position:relative;min-height:24px;display:flex;align-items:center;gap:6px;padding:0;cursor:pointer;user-select:none;outline:none}.toolChainSummary:focus-visible{text-decoration:underline}.toolChainLabel{display:inline-block;transition:transform .16s ease}.toolChainLabel.bump{transform:translateY(-2px)}.toolChainEllipsis{display:inline-block;min-width:18px}.toolChain.running .toolChainEllipsis::after{content:'…';animation:toolEllipsis 1.1s steps(4,end) infinite}.toolChainChevron{margin-left:auto;opacity:0;transition:opacity .12s ease,transform .12s ease}.toolChain:hover .toolChainChevron,.toolChain.open .toolChainChevron,.toolChainSummary:focus-visible .toolChainChevron{opacity:1}.toolChain.open .toolChainChevron{transform:rotate(90deg)}.working{align-self:flex-start;color:#777;font-size:13px;padding:6px 2px;display:flex;align-items:center;gap:6px}.working::after{content:'…';display:inline-block;min-width:16px;animation:toolEllipsis 1.1s steps(4,end) infinite}
 .toolChainDetails{display:none;margin:6px 0 2px 14px;color:#333}.toolChain.open .toolChainDetails{display:grid;gap:6px}.toolCallDetail{font-size:12px;line-height:1.35}.toolCallHead{color:#111}.toolCallMeta{color:#555;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}.toolCallOutput{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#444;max-height:180px;overflow:auto}@keyframes toolEllipsis{0%{content:''}25%{content:'.'}50%{content:'..'}75%,100%{content:'...'}}
-.composer{position:relative;display:block;padding:16px;border-top:1px solid #e0e0e0;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}textarea{width:100%;min-height:58px;max-height:140px;resize:none;border:0;background:#f6f6f6;color:#111;padding:13px 42px 13px 15px;font:inherit;font-weight:400;outline:none;display:block;border-radius:16px}textarea:focus{background:#f0f0f0}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer;border-radius:9px}button:disabled{opacity:.5;cursor:not-allowed}/* Concentric with the textarea's 16px corner: the corner arc's center sits 16px
+.composer{position:relative;display:block;padding:16px;border-top:1px solid #e0e0e0;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}.composer.attachDrop textarea{background:#f0f0f0;outline:2px dashed #fc4b55;outline-offset:-2px}textarea{width:100%;min-height:58px;max-height:140px;resize:none;border:0;background:#f6f6f6;color:#111;padding:13px 46px 13px 46px;font:inherit;font-weight:400;outline:none;display:block;border-radius:16px}textarea:focus{background:#f0f0f0}
+#attach{position:absolute;left:19px;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:#8a8a8a;border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}#attach:hover{background:#e6e6e6;color:#111}#attach svg{width:16px;height:16px;display:block}
+.pendingAttach{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}.pendingAttach:empty{display:none}
+.pendChip{display:flex;align-items:center;gap:6px;background:#f0f0f0;border-radius:9px;padding:5px 8px 5px 6px;font-size:11px;color:#333;max-width:170px}
+.pendChip img{width:22px;height:22px;object-fit:cover;border-radius:5px;display:block}
+.pendChip .pendExt{width:22px;height:22px;border-radius:5px;background:#dcdcdc;color:#666;font-size:8px;display:flex;align-items:center;justify-content:center;text-transform:uppercase;letter-spacing:.02em}
+.pendChip .pendName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pendChip .pendX{cursor:pointer;color:#9a9a9a;font-size:14px;line-height:1;padding:0 2px}.pendChip .pendX:hover{color:#111}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer;border-radius:9px}button:disabled{opacity:.5;cursor:not-allowed}/* Concentric with the textarea's 16px corner: the corner arc's center sits 16px
    in from the right/bottom edges, so a circle centered there with r=13 keeps a
    uniform 3px gap to both straight edges AND the arc. Offsets = composer pad 16
    + corner R 16 - button r 13 = 19px. */
@@ -732,7 +754,10 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
   </header>
   <section class="chat" id="chat" aria-live="polite"><div class="empty" id="empty">Send a message to start the demo.</div></section>
   <form class="composer" id="composer">
+    <div class="pendingAttach" id="pendingAttach"></div>
     <textarea id="msg" placeholder="Message…" aria-label="Message"></textarea>
+    <button id="attach" type="button" aria-label="Attach files" title="Attach files"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M209.66,122.34a8,8,0,0,1,0,11.32l-82.05,82a56,56,0,0,1-79.2-79.21L147.67,35.73a40,40,0,1,1,56.61,56.55L105,193A24,24,0,1,1,71,159L154.3,74.38A8,8,0,1,1,165.7,85.6L82.39,170.31a8,8,0,1,0,11.27,11.36L192.93,81A24,24,0,1,0,159,47L59.76,147.68a40,40,0,1,0,56.53,56.62l82.06-82A8,8,0,0,1,209.66,122.34Z"/></svg></button>
+    <input id="fileInput" type="file" multiple hidden aria-hidden="true"/>
     <button id="send" type="submit" aria-label="Send" title="Send"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68ZM157.83,231.85l-.05.14,0-.07-40.06-82.3,48-48a8,8,0,0,0-11.31-11.31l-48,48L24.08,98.25l-.07,0,.14,0L216,40Z"/></svg></button>
   </form>
   <footer class="composerBar" aria-label="controls">
@@ -969,7 +994,18 @@ const activeTurns=new Map();
 let latestLocalId=null;
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg){clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});document.body.dataset.busy='1';addMsg('user','',msg,'user:'+localId);showWorking();setState('shared bridge starting · private Box boot requested');resetRouteForTurn();try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:msg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys()})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
+async function runTurn(msg,files){clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});document.body.dataset.busy='1';
+  const userEl=addMsg('user','',msg,'user:'+localId);
+  let atts=[];
+  if(files&&files.length){
+    atts=await Promise.all(files.map(async f=>({name:f.name.replace(/[\\/\\\\]/g,'_'),b64:await readAsB64(f),bytes:new Uint8Array(await f.arrayBuffer())})));
+    renderAttachDeck(userEl,atts);
+    uploadAttachments(atts);
+  }
+  // Tell the agent where the files landed so it can actually use them.
+  const sendMsg=atts.length?msg+'\\n\\n[Attached files, saved under attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
+  showWorking();setState('shared bridge starting · private Box boot requested');resetRouteForTurn();
+  try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys()})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 const stopBtn=$('stopBox');
 const diagnosticsBtn=$('downloadDiagnostics');
@@ -978,23 +1014,76 @@ if(showTracesEl){showTracesEl.checked=false;showTracesEl.addEventListener('chang
 $('settingsOpen')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsClear')?.addEventListener('click',clearSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});$('settingsHarness')?.addEventListener('change',e=>{selectedHarness=e.target.value;const h=H.find(x=>x.name===selectedHarness);const m=h&&h.models[0];if(m){selectedProvider=m.provider;selectedModel=m.model;}renderSettingsControls();});$('settingsModel')?.addEventListener('change',e=>{const [provider,model]=String(e.target.value).split('|');selectedProvider=provider;selectedModel=model;renderSettingsControls();});
 syncTraceVisibility();
 let lastSubmitAt=0;
+// ---- attachments ----------------------------------------------------------
+// Files the user attached to the NEXT message. Each carries its bytes so the
+// chat deck previews and opens them locally (no box needed to view), and they
+// upload into the box under attachments/ so the panel and the agent see them.
+let pendingFiles=[];
+const IMG_RE=/\\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
+const VID_RE=/\\.(mp4|webm|m4v|mov|ogv)$/i;
+function fileExt(n){const p=(n.split('.').pop()||'').toLowerCase();return p.length>4?'file':p;}
+function readAsB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=()=>rej(new Error('read failed'));r.readAsDataURL(file);});}
+function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)break;pendingFiles.push(f);}renderPending();}
+function renderPending(){
+  const c=$('pendingAttach');if(!c)return;c.innerHTML='';
+  pendingFiles.forEach((f,i)=>{
+    const chip=document.createElement('div');chip.className='pendChip';
+    if(IMG_RE.test(f.name)){const img=document.createElement('img');img.src=URL.createObjectURL(f);chip.appendChild(img);}
+    else{const e=document.createElement('div');e.className='pendExt';e.textContent=fileExt(f.name);chip.appendChild(e);}
+    const nm=document.createElement('div');nm.className='pendName';nm.textContent=f.name;chip.appendChild(nm);
+    const x=document.createElement('div');x.className='pendX';x.textContent='×';x.title='remove';x.addEventListener('click',()=>{pendingFiles.splice(i,1);renderPending();});chip.appendChild(x);
+    c.appendChild(chip);
+  });
+}
+// Render the fanned deck inside a just-created user message bubble.
+function renderAttachDeck(el,atts){
+  const body=el.querySelector('.body');if(!body)return;
+  const deck=document.createElement('div');deck.className='attachDeck';
+  atts.forEach(a=>{
+    const card=document.createElement('div');card.className='card';card.title=a.name;
+    if(IMG_RE.test(a.name)){const img=document.createElement('img');img.src=URL.createObjectURL(new Blob([a.bytes]));card.appendChild(img);}
+    else if(VID_RE.test(a.name)){const v=document.createElement('video');v.src=URL.createObjectURL(new Blob([a.bytes]));v.muted=true;card.appendChild(v);}
+    else{const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(a.name);card.appendChild(ic);}
+    const nm=document.createElement('div');nm.className='cardName';nm.textContent=a.name;card.appendChild(nm);
+    card.addEventListener('click',()=>{try{window.__optiboxFs.openBytes(a.name,a.bytes);}catch(_){}});
+    deck.appendChild(card);
+  });
+  body.insertBefore(deck,body.firstChild);
+}
+// Upload attachments into the box under attachments/ once it is live. Retries a
+// bit so a booting box still receives them; view/preview never depends on this.
+async function uploadAttachments(atts){
+  for(const a of atts){
+    let ok=false;
+    for(let i=0;i<20&&!ok;i++){
+      try{await window.__optiboxFs.uploadAttachment(a.name,a.b64);ok=true;}
+      catch(_){await new Promise(r=>setTimeout(r,3000));}
+    }
+  }
+}
 function submitComposer(source){
   const text=msgEl.value.trim();
-  console.debug('[trace] submit event fired', {source, hasText:Boolean(text), harness:selectedHarness, model:selectedModel});
-  if(!text){console.debug('[trace] empty submit ignored', {source});return false;}
+  const hasFiles=pendingFiles.length>0;
+  console.debug('[trace] submit event fired', {source, hasText:Boolean(text), files:pendingFiles.length});
+  if(!text&&!hasFiles){console.debug('[trace] empty submit ignored', {source});return false;}
   const st=currentSettingsStatus();
   if(!st.ok){addMsg('trace','settings required',st.msg+'\\n');openSettings();return false;}
   const now=Date.now();
   if(now-lastSubmitAt<150){console.debug('[trace] duplicate submit suppressed', {source});return false;}
   lastSubmitAt=now;
-  addMsg('trace','submit trace','submit event fired from '+source+' · request starting\\n');
-  msgEl.value='';
-  msgEl.focus();
-  runTurn(text);
+  const files=pendingFiles;pendingFiles=[];renderPending();
+  msgEl.value='';msgEl.focus();
+  runTurn(text||'(see attached)',files);
   return true;
 }
 composer.addEventListener('submit',e=>{e.preventDefault();submitComposer('form.submit');});
 sendBtn.addEventListener('click',e=>{e.preventDefault();submitComposer('button.click');});
+const attachBtn=$('attach'),fileInput=$('fileInput');
+attachBtn.addEventListener('click',()=>fileInput.click());
+fileInput.addEventListener('change',()=>{if(fileInput.files.length)addPendingFiles(fileInput.files);fileInput.value='';});
+composer.addEventListener('dragover',e=>{if(e.dataTransfer&&[...e.dataTransfer.types].includes('Files')){e.preventDefault();composer.classList.add('attachDrop');}});
+composer.addEventListener('dragleave',e=>{if(e.target===composer||!composer.contains(e.relatedTarget))composer.classList.remove('attachDrop');});
+composer.addEventListener('drop',e=>{composer.classList.remove('attachDrop');if(e.dataTransfer&&e.dataTransfer.files.length){e.preventDefault();addPendingFiles(e.dataTransfer.files);}});
 stopBtn.addEventListener('click',async e=>{e.preventDefault();stopBtn.disabled=true;addMsg('trace','manual stop','pause request sent for this conversation\\n');setState('Private machine stopping · manual pause requested');try{const res=await fetch('/api/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()})});await drain(res,newTurnId());}catch(err){addMsg('assistant','error','Stop failed: '+String(err&&err.message||err));}finally{stopBtn.disabled=false;}});
 diagnosticsBtn?.addEventListener('click',e=>{e.preventDefault();const a=document.createElement('a');a.href='/api/diagnostics?format=json';a.download='optibox-diagnostics.json';document.body.appendChild(a);a.click();a.remove();addMsg('trace','diagnostics','downloaded redacted JSON event log from /api/diagnostics\\n');});
 msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer('textarea.enter');}});

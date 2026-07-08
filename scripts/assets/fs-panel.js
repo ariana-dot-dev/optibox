@@ -271,6 +271,21 @@ const SQLITE_EXT = /\.(sqlite3?|db)$/i;
 const MIME_BY_EXT = { svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", m4v: "video/mp4", mov: "video/quicktime", ogv: "video/ogg", png: "image/png", gif: "image/gif", webp: "image/webp", jpg: "image/jpeg", jpeg: "image/jpeg" };
 const mimeFor = (name) => MIME_BY_EXT[(name.split(".").pop() || "").toLowerCase()] || "";
 
+// Dispatch already-loaded bytes to the right renderer. path is null for bytes
+// that don't live in the box (chat attachments opened from a local blob), which
+// forces canSave off.
+function dispatchViewer(name, bytes, canSave, path) {
+  if (/\.pdf$/i.test(name)) return showPdf(path, name, bytes);
+  if (IMG_EXT.test(name)) return showImage(path, name, bytes);
+  if (VIDEO_EXT.test(name)) return showVideo(path, name, bytes);
+  if (SHEET_EXT.test(name)) return showSheet(path, name, bytes, canSave);
+  if (SQLITE_EXT.test(name)) return showSqlite(path, name, bytes, canSave);
+  if (/\.csv$/i.test(name)) return showCsv(path, name, bytes, canSave);
+  const text = tryDecodeText(bytes);
+  if (text === null) return showBinary(path, name, bytes);
+  return showText(path, name, text, canSave);
+}
+
 async function openViewer(path, size) {
   const name = path.split("/").pop();
   if (size !== undefined && size > 40 * 1024 * 1024) {
@@ -288,16 +303,12 @@ async function openViewer(path, size) {
     body.appendChild(bigNotice("Could not read file: " + e.message, null));
     return;
   }
-  const canSave = live;
-  if (/\.pdf$/i.test(name)) return showPdf(path, name, bytes);
-  if (IMG_EXT.test(name)) return showImage(path, name, bytes);
-  if (VIDEO_EXT.test(name)) return showVideo(path, name, bytes);
-  if (SHEET_EXT.test(name)) return showSheet(path, name, bytes, canSave);
-  if (SQLITE_EXT.test(name)) return showSqlite(path, name, bytes, canSave);
-  if (/\.csv$/i.test(name)) return showCsv(path, name, bytes, canSave);
-  const text = tryDecodeText(bytes);
-  if (text === null) return showBinary(path, name, bytes);
-  return showText(path, name, text, canSave);
+  return dispatchViewer(name, bytes, live, path);
+}
+
+// Open bytes we already hold (chat attachment preview) with no box round trip.
+function openBytes(name, bytes) {
+  return dispatchViewer(name, bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes), false, null);
 }
 
 function human(n) {
@@ -657,6 +668,19 @@ async function showText(path, name, text, canSave) {
     catch (e) { markSaved(saveBtn, false, e.message); }
   });
 }
+
+// Public surface for the chat script (attachments): open local bytes in the
+// viewer, and upload attachment bytes into the box under attachments/.
+(function () {
+  const host = (window.__optiboxFs = window.__optiboxFs || {});
+  host.openBytes = openBytes;
+  host.uploadAttachment = async function (name, b64) {
+    const dest = "attachments/" + name.replace(/[/\\]/g, "_");
+    await api("/api/fs/write", { path: dest, contentB64: b64 });
+    refresh(false);
+    return dest;
+  };
+})();
 
 // Kick off last: every top-level binding above is initialized by now.
 if (panel) init();

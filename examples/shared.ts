@@ -433,11 +433,18 @@ function buildBoxServeTurnScript(args: { binPath: string; bodyPath: string; sess
     // before the final response line is written, so interleaving is safe.
     `curl -s -N -m ${curlMaxSec} ${BOX_SERVE_URL}/event 2>/dev/null | grep --line-buffered "\\"sessionID\\":\\"$SID\\"" | grep --line-buffered '"type":"tool"' &`,
     `EV_PID=$!`,
-    // One retry on opencode's transient 500 ({"name":"UnknownError",...}):
-    // observed in production as a one-off; retrying the same message succeeds.
-    `RESP=$(curl -s -m ${curlMaxSec} -X POST "${BOX_SERVE_URL}/session/$SID/message" -H 'Content-Type: application/json' -d @${shellQuote(args.bodyPath)})`,
-    `RC=$?`,
-    `case "$RESP" in *'"name":"UnknownError"'*) echo "serve returned UnknownError; retrying once" >&2; sleep 2; RESP=$(curl -s -m ${curlMaxSec} -X POST "${BOX_SERVE_URL}/session/$SID/message" -H 'Content-Type: application/json' -d @${shellQuote(args.bodyPath)}); RC=$?;; esac`,
+    // Recover opencode's 500 ({"name":"UnknownError",...}). It can be a one-off
+    // OR a poisoned session (a long GUI turn wedges the session so every retry
+    // on the SAME session 500s). So: retry once on the same session, then once
+    // MORE on a brand-new session — losing box-side history beats a hard error.
+    `POST(){ curl -s -m ${curlMaxSec} -X POST "${BOX_SERVE_URL}/session/$1/message" -H 'Content-Type: application/json' -d @${shellQuote(args.bodyPath)}; }`,
+    `RESP=$(POST "$SID"); RC=$?`,
+    `case "$RESP" in *'"name":"UnknownError"'*) echo "serve UnknownError; retry same session" >&2; sleep 2; RESP=$(POST "$SID"); RC=$?;; esac`,
+    `case "$RESP" in *'"name":"UnknownError"'*)`,
+    `  echo "serve UnknownError again; retry on a fresh session" >&2`,
+    `  NSID=$(curl -s -m 10 -X POST ${BOX_SERVE_URL}/session -H 'Content-Type: application/json' -d '{"title":"optibox"}' | grep -o '"id":"ses_[^"]*"' | head -1 | cut -d'"' -f4)`,
+    `  if [ -n "$NSID" ]; then SID="$NSID"; RESP=$(POST "$SID"); RC=$?; fi;;`,
+    `esac`,
     `printf '%s' "$RESP"`,
     // Tear down the event tap: kill the tail grep ($!) so the pipe collapses
     // (curl dies on SIGPIPE at its next write; -m caps it regardless).

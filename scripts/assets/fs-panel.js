@@ -264,9 +264,12 @@ function markSaved(saveBtn, ok, msg) {
   setTimeout(() => { saveBtn.textContent = "save"; saveBtn.classList.remove("err"); }, 1600);
 }
 
-const IMG_EXT = /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i;
+const IMG_EXT = /\.(png|jpe?g|gif|webp|bmp|ico|avif|svg)$/i;
+const VIDEO_EXT = /\.(mp4|webm|m4v|mov|ogv)$/i;
 const SHEET_EXT = /\.(xlsx|xls)$/i;
 const SQLITE_EXT = /\.(sqlite3?|db)$/i;
+const MIME_BY_EXT = { svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", m4v: "video/mp4", mov: "video/quicktime", ogv: "video/ogg", png: "image/png", gif: "image/gif", webp: "image/webp", jpg: "image/jpeg", jpeg: "image/jpeg" };
+const mimeFor = (name) => MIME_BY_EXT[(name.split(".").pop() || "").toLowerCase()] || "";
 
 async function openViewer(path, size) {
   const name = path.split("/").pop();
@@ -288,6 +291,7 @@ async function openViewer(path, size) {
   const canSave = live;
   if (/\.pdf$/i.test(name)) return showPdf(path, name, bytes);
   if (IMG_EXT.test(name)) return showImage(path, name, bytes);
+  if (VIDEO_EXT.test(name)) return showVideo(path, name, bytes);
   if (SHEET_EXT.test(name)) return showSheet(path, name, bytes, canSave);
   if (SQLITE_EXT.test(name)) return showSqlite(path, name, bytes, canSave);
   if (/\.csv$/i.test(name)) return showCsv(path, name, bytes, canSave);
@@ -353,8 +357,20 @@ function showImage(path, name, bytes) {
   const { body } = viewerParts(name, false);
   const img = document.createElement("img");
   img.className = "fsImage";
-  img.src = blobUrl(bytes, "");
+  img.src = blobUrl(bytes, mimeFor(name));
   body.appendChild(img);
+  body.appendChild(cornerDownload(name, bytes));
+}
+
+function showVideo(path, name, bytes) {
+  const { body } = viewerParts(name, false);
+  const video = document.createElement("video");
+  video.className = "fsVideo";
+  video.controls = true;
+  video.src = blobUrl(bytes, mimeFor(name));
+  // Codec the browser can't decode -> fall back to the binary notice.
+  video.addEventListener("error", () => { showBinary(path, name, bytes); }, { once: true });
+  body.appendChild(video);
   body.appendChild(cornerDownload(name, bytes));
 }
 

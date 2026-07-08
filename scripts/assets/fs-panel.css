@@ -1,0 +1,50 @@
+/* Filesystem panel + viewer dialog — follows the page's design language:
+   borderless #f6f6f6 fills, nested radii smaller than their containers,
+   inherited fonts, #fc4b55 accent, no drop shadows. */
+
+.fsPanel{display:flex;flex-direction:column;gap:10px;border-radius:16px;background:#fff;border:1px solid #e0e0e0;padding:16px;min-height:0;overflow:hidden}
+.fsPanel h2{margin:0;font-size:13px;font-weight:500;letter-spacing:.02em;color:#111;display:flex;align-items:baseline;gap:8px}
+.fsStatus{font-size:11px;color:#9a9a9a;font-weight:400}
+.fsStatus.live{color:#1a7f37}
+.fsTreeMount{flex:1;min-height:0;overflow:hidden;border-radius:9px;background:#f6f6f6;padding:6px;
+  --trees-fg-override:#111;--trees-selected-bg-override:#e8e8e8;--trees-border-color-override:transparent}
+.fsEmpty{color:#9a9a9a;font-size:12px;padding:14px 10px}
+.fsPanel.fsDrop .fsTreeMount{outline:2px dashed #fc4b55;outline-offset:-2px}
+
+.fsViewerBackdrop{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:24px}
+.fsViewer{position:relative;width:min(980px,96vw);height:min(720px,92dvh);background:#fff;border-radius:16px;display:flex;flex-direction:column;overflow:hidden}
+.fsViewerHead{display:flex;align-items:center;justify-content:space-between;padding:12px 16px 8px}
+.fsViewerTitle{font-size:13px;color:#111;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fsViewerClose{min-height:0;width:28px;height:28px;padding:0;border:0;border-radius:50%;background:transparent;color:#8a8a8a;font-size:17px;line-height:1;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.fsViewerClose:hover{background:#f0f0f0;color:#111}
+.fsViewerBody{flex:1;min-height:0;overflow:auto;padding:0 16px 16px;position:relative}
+.fsViewerSave{position:absolute;right:26px;bottom:24px;min-height:0;height:30px;padding:0 13px;border:0;border-radius:15px;background:rgba(17,17,17,.82);color:#fff;font-size:12px;cursor:pointer;z-index:2}
+.fsViewerSave:hover{background:#fc4b55}
+.fsViewerSave.err{background:#b54708}
+
+.fsLoading{color:#9a9a9a;font-size:13px;padding:18px 4px}
+.fsNotice{color:#555;font-size:13px;padding:22px 4px;text-align:center}
+.fsMiniBtn{min-height:0;height:28px;padding:0 12px;border:0;border-radius:14px;background:#f0f0f0;color:#111;font-size:12px;cursor:pointer;margin-top:10px}
+.fsMiniBtn:hover{background:#e4e4e4}
+.fsCorner{position:absolute;right:10px;bottom:8px;margin:0;background:rgba(240,240,240,.9)}
+.fsPdf{width:100%;height:100%;border:0;border-radius:9px}
+.fsImage{max-width:100%;max-height:100%;display:block;margin:0 auto;border-radius:9px}
+
+.fsTableWrap{overflow:auto;max-height:100%;border-radius:9px;background:#f6f6f6}
+.fsTable{border-collapse:collapse;font-size:12px;width:max-content;min-width:100%}
+.fsTable th{position:sticky;top:0;background:#ececec;color:#555;font-weight:500;text-align:left;padding:6px 10px;font-size:11px}
+.fsTable td{padding:5px 10px;border-top:1px solid #ebebeb;color:#111;white-space:pre;max-width:420px;overflow:hidden;text-overflow:ellipsis}
+.fsTable td[contenteditable="true"]:focus{outline:2px solid #fc4b55;outline-offset:-2px;background:#fff}
+.fsRowCount{color:#9a9a9a;font-size:11px;padding:6px 2px}
+.fsSheetPick{margin:0 0 8px;border:0;border-radius:9px;background:#f6f6f6;color:#111;min-height:30px;padding:4px 10px;font:inherit;font-size:12px}
+
+.fsPlainText{width:100%;height:100%;resize:none;border:0;border-radius:9px;background:#f6f6f6;color:#111;padding:12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}
+
+/* CodeMirror themed to the page */
+.fsViewerBody .CodeMirror{height:100%;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;border-radius:9px;background:#f6f6f6;color:#111}
+.fsViewerBody .CodeMirror-gutters{background:#efefef;border-right:1px solid #e6e6e6}
+.fsViewerBody .CodeMirror-linenumber{color:#a5a5a5}
+.fsViewerBody .CodeMirror-cursor{border-left:2px solid #fc4b55}
+.fsViewerBody .CodeMirror-selected{background:#e4e4e4}
+
+@media(max-width:900px){.fsPanel{display:none}}

@@ -124,6 +124,50 @@ export class BoxHttpClient implements BoxClient {
     return json.result ?? { exitCode: json.exitCode ?? 0, stdout: json.stdout ?? "", stderr: json.stderr ?? "" };
   }
 
+  /** Latest completed snapshot of a box, or undefined when none exists. */
+  async latestSnapshot(boxId: string): Promise<{ id: string; status: string } | undefined> {
+    const json = await this.request<{ snapshot?: { id: string; status: string } | null }>(`/boxes/${encodeURIComponent(boxId)}/snapshots/latest`);
+    return json.snapshot ?? undefined;
+  }
+
+  /** File tree of a snapshot (user-written files; base image excluded). */
+  async snapshotTree(snapshotId: string): Promise<{ treeAvailable: boolean; truncated: boolean; entries: Array<{ path: string; kind: string; size?: number }>; reason?: string }> {
+    return await this.request(`/snapshots/${encodeURIComponent(snapshotId)}/tree`);
+  }
+
+  /** Raw bytes of one file inside a snapshot (409s on dirs/symlinks/base-image files). */
+  async snapshotFileBytes(snapshotId: string, path: string): Promise<{ bytes: Buffer; kind: string }> {
+    const response = await this.rawGet(`/snapshots/${encodeURIComponent(snapshotId)}/files?${new URLSearchParams({ path })}`);
+    return { bytes: Buffer.from(await response.arrayBuffer()), kind: response.headers.get("X-Snapshot-Entry-Kind") ?? "file" };
+  }
+
+  /** Read a live-box file as raw bytes via base64 encoding. */
+  async readFileBytes(boxId: string, path: string): Promise<Buffer> {
+    const json = await this.request<{ content?: string; file?: { content: string } }>(`/boxes/${encodeURIComponent(boxId)}/files?${new URLSearchParams({ path, encoding: "base64" })}`);
+    return Buffer.from(json.content ?? json.file?.content ?? "", "base64");
+  }
+
+  /** Write raw bytes to a live-box file via base64 encoding. */
+  async writeFileBytes(boxId: string, path: string, bytes: Buffer): Promise<void> {
+    await this.request(`/boxes/${encodeURIComponent(boxId)}/files`, { method: "PUT", body: JSON.stringify({ path, content: bytes.toString("base64"), encoding: "base64" }) });
+  }
+
+  /** GET returning the raw Response (binary endpoints; throws on !ok). */
+  private async rawGet(path: string): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`Box API request timed out: ${path}`)), Math.max(this.requestTimeoutMs, 120_000));
+    try {
+      const response = await this.fetchImpl(`${this.baseUrl}${path}`, { headers: { Authorization: `Bearer ${this.apiKey}` }, signal: controller.signal });
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new BoxApiError(response.status, "box_api_error", text.slice(0, 300) || response.statusText);
+      }
+      return response;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async readFile(boxId: string, path: string): Promise<string> {
     const json = await this.request<{ content?: string; file?: { content: string } }>(`/boxes/${encodeURIComponent(boxId)}/files?${new URLSearchParams({ path, encoding: "utf8" })}`);
     return json.content ?? json.file?.content ?? "";

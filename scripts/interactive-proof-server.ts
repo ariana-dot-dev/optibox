@@ -1,5 +1,6 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { URL } from "node:url";
 import {
   BoxHttpClient,
@@ -266,6 +267,127 @@ function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversat
   console.log(JSON.stringify(entry));
 }
 
+// ---------------------------------------------------------------------------
+// Filesystem panel backend. The browser cannot hold the Box API key, so these
+// endpoints proxy: live boxes serve their real disk (files API + find), stopped
+// boxes serve their latest snapshot (tree + file download endpoints) — same
+// features either way except writes, which need a live box.
+// ---------------------------------------------------------------------------
+
+function fsBoxClient(credentials: DemoCredentials): BoxHttpClient {
+  if (!credentials.boxApiKey) throw new Error("BOX_API_KEY is required");
+  return new BoxHttpClient({ apiKey: credentials.boxApiKey });
+}
+
+function fsBoxName(credentials: DemoCredentials, userId: string): string {
+  const cacheKey = createHash("sha256")
+    .update(JSON.stringify({ box: credentials.boxApiKey, providerEnv: credentials.providerEnv }))
+    .digest("hex");
+  // NOTE: no template literal here — the client regression tests locate the
+  // html() template by finding this file's first returned backtick string.
+  return "consumer-agent-user-" + userId + "-" + cacheKey.slice(0, 8);
+}
+
+async function fsResolveBox(credentials: DemoCredentials, userId: string): Promise<{ box?: { id: string; state: string }; live: boolean }> {
+  const client = fsBoxClient(credentials);
+  const name = fsBoxName(credentials, userId);
+  const boxes = await client.list();
+  const box = (boxes as any[]).find((b) => b.name === name);
+  if (!box) return { live: false };
+  const state = String(box.state ?? box.status ?? "");
+  return { box: { id: box.id, state }, live: state === "running" || state === "idle" };
+}
+
+/**
+ * Live tree: one `find` over the home directory, home-relative paths — the
+ * SAME path space the snapshot tree uses, so the panel behaves identically
+ * whether the box is up or down. (/tmp is tmpfs and never in snapshots.)
+ */
+async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<Array<{ path: string; kind: string; size?: number }>> {
+  const out = await client.command(boxId, {
+    command: `find /home/user -mindepth 1 -printf '%y\\t%s\\t%P\\n' 2>/dev/null | head -c 3000000`,
+    timeoutMs: 30_000,
+  });
+  const entries: Array<{ path: string; kind: string; size?: number }> = [];
+  for (const line of out.stdout.split("\n")) {
+    const [y, size, ...rest] = line.split("\t");
+    const p = rest.join("\t");
+    if (!p || !y) continue;
+    const kind = y === "d" ? "dir" : y === "l" ? "symlink" : "file";
+    entries.push({ path: p, kind, ...(kind === "file" ? { size: Number(size) || 0 } : {}) });
+  }
+  return entries;
+}
+
+async function handleFsRoute(pathname: string, body: any, res: http.ServerResponse): Promise<boolean> {
+  if (!pathname.startsWith("/api/fs/")) return false;
+  const credentials = credentialsFromBody(body);
+  const userId = String(body.userId ?? "user-a");
+  const filePath = typeof body.path === "string" ? body.path.replace(/^\/+/, "") : "";
+  const json = (status: number, payload: unknown) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(payload));
+  };
+  try {
+    const { box, live } = await fsResolveBox(credentials, userId);
+    const client = fsBoxClient(credentials);
+
+    if (pathname === "/api/fs/tree") {
+      if (!box) return json(200, { ok: true, live: false, state: "none", entries: [] }), true;
+      if (live) {
+        const entries = await fsLiveTree(client, box.id);
+        return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries }), true;
+      }
+      const snapshot = await client.latestSnapshot(box.id);
+      if (!snapshot) return json(200, { ok: true, live: false, state: box.state, boxId: box.id, entries: [] }), true;
+      const tree = await client.snapshotTree(snapshot.id);
+      return json(200, {
+        ok: true, live: false, state: box.state, boxId: box.id, snapshotId: snapshot.id,
+        treeAvailable: tree.treeAvailable, truncated: tree.truncated,
+        entries: (tree.entries ?? []).map((e) => ({ ...e, path: e.path.replace(/^\//, "") })),
+        ...(tree.reason ? { reason: tree.reason } : {}),
+      }), true;
+    }
+
+    if (pathname === "/api/fs/read") {
+      if (!box || !filePath) return json(404, { ok: false, message: "no box or path" }), true;
+      let bytes: Buffer;
+      if (live) {
+        // Live files API rejects absolute paths ("relative to the Box work
+        // directory" = the home dir), so home-relative tree paths pass as-is.
+        bytes = await client.readFileBytes(box.id, filePath);
+      } else {
+        const snapshot = await client.latestSnapshot(box.id);
+        if (!snapshot) return json(404, { ok: false, message: "no snapshot" }), true;
+        // Snapshot paths are home-relative (verified: ".bashrc" 200, "/.bashrc" 404).
+        bytes = (await client.snapshotFileBytes(snapshot.id, filePath)).bytes;
+      }
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": bytes.length,
+        "x-fs-live": live ? "1" : "0",
+      });
+      return res.end(bytes), true;
+    }
+
+    if (pathname === "/api/fs/write") {
+      if (!box || !live) return json(409, { ok: false, message: "box is stopped — snapshot files are read-only" }), true;
+      if (!filePath || typeof body.contentB64 !== "string") return json(400, { ok: false, message: "path and contentB64 required" }), true;
+      await client.writeFileBytes(box.id, filePath, Buffer.from(body.contentB64, "base64"));
+      return json(200, { ok: true }), true;
+    }
+
+    return json(404, { ok: false, message: "unknown fs endpoint" }), true;
+  } catch (e) {
+    return json(502, { ok: false, message: e instanceof Error ? e.message : String(e) }), true;
+  }
+}
+
+const STATIC_ASSETS: Record<string, { file: string; type: string }> = {
+  "/static/fs-panel.js": { file: "scripts/assets/fs-panel.js", type: "text/javascript; charset=utf-8" },
+  "/static/fs-panel.css": { file: "scripts/assets/fs-panel.css", type: "text/css; charset=utf-8" },
+};
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(
@@ -276,6 +398,18 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       return void res.end(html());
+    }
+
+    const asset = req.method === "GET" ? STATIC_ASSETS[url.pathname] : undefined;
+    if (asset) {
+      res.writeHead(200, { "content-type": asset.type, "cache-control": "no-cache" });
+      return void res.end(readFileSync(asset.file, "utf8"));
+    }
+
+    if (req.method === "POST" && url.pathname.startsWith("/api/fs/")) {
+      const body = await readBody(req);
+      await handleFsRoute(url.pathname, body, res);
+      return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/harnesses") {
@@ -459,7 +593,8 @@ function html() {
    units are scaled by zoom too, so every dvh sizing divides by --z or the page
    would overflow the real viewport by 15%. */
 html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}body.hide-traces .msg.trace{display:none}
-.shell{height:calc(100dvh/var(--z));max-width:1180px;margin:0 auto;display:grid;grid-template-columns:minmax(380px,560px) 330px;gap:24px;align-items:stretch;padding:0 24px}.app{height:calc(100dvh/var(--z));min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e0e0e0;border-right:1px solid #e0e0e0}
+.shell{height:calc(100dvh/var(--z));max-width:1500px;margin:0 auto;display:grid;grid-template-columns:290px minmax(380px,560px) 330px;gap:24px;align-items:stretch;padding:0 24px}
+.fsPanel{align-self:center;height:min(78dvh,760px)}.app{height:calc(100dvh/var(--z));min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e0e0e0;border-right:1px solid #e0e0e0}
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e0e0e0;padding:calc(14px + env(safe-area-inset-top)) 16px 14px;display:grid;gap:12px}
 .counters{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.counter{border:0;background:#f6f6f6;padding:11px 12px;min-width:0;border-radius:10px}.label{display:block;color:#555;letter-spacing:.01em;font-size:12px;font-weight:400}.value{display:block;margin-top:3px;font:400 21px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:0;background:transparent;color:#9a9a9a;padding:1px 2px;font-size:11px;font-weight:400;text-align:center;letter-spacing:.02em;display:flex;align-items:center;justify-content:center;gap:7px}.state:before{content:"";width:6px;height:6px;border-radius:50%;background:#cdcdcd;flex:0 0 auto;transition:background .3s ease}body[data-busy="1"] .state:before{background:#f4b93e}body[data-billing="1"] .state:before{background:#fc4b55;box-shadow:0 0 0 3px rgba(252,75,85,.16)}
 .composerBar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:9px 16px calc(11px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #f0f0f0}.composerBar button,.composerBar .traceToggle{min-height:32px;background:#fff;color:#6a6a6a;border:1px solid #e6e6e6;padding:0 11px;font-weight:400;font-size:11px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border-radius:8px;transition:border-color .15s ease,color .15s ease}.composerBar button:hover,.composerBar .traceToggle:hover{border-color:#c9c9c9;color:#111}.traceToggle{cursor:pointer}.traceToggle input{accent-color:#111}.iconButton{width:36px;justify-content:center;padding:0!important;font-size:16px}.iconButton svg{width:16px;height:16px;display:block}.composerBar .iconButton{width:32px;font-size:14px;margin-left:auto}.settingsBackdrop{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:18px}.settingsBackdrop.open{display:flex}.settingsDialog{width:min(560px,100%);max-height:calc(92dvh/var(--z));overflow:auto;background:#fff;border:1px solid #111;padding:18px;color:#111;border-radius:16px}.settingsHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.settingsHead h2{margin:0;font-size:20px;font-weight:400;letter-spacing:-.02em}.settingsHead p{margin:4px 0 0;color:#555;font-size:12px}.settingsDialog label{display:grid;gap:5px;margin-top:10px;font-size:12px;color:#555}.settingsDialog input,.settingsDialog select{width:100%;border:1px solid #d9d9d9;background:#fff;color:#111;min-height:38px;padding:8px 10px;font:inherit;font-size:13px;border-radius:9px}.settingsDialog input:focus,.settingsDialog select:focus{outline:none;border-color:#111}.settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.settingsNote{margin-top:12px;border:1px solid #e0e0e0;background:#f6f6f6;padding:10px 12px;font-size:12px;color:#333;border-radius:8px}.settingsActions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.settingsActions button.secondary{background:#fff;color:#111;border:1px solid #d9d9d9}.settingsStatus{font-size:12px;color:#555;margin-top:8px}.dangerText{color:#9f1239}.okText{color:#166534}
@@ -483,7 +618,12 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .routeCaption{margin-top:14px;min-height:15px;font-size:11px;font-weight:400;color:#a0a0a0;line-height:1.4}.schematic[data-route="error"] .routeCaption{color:#9f1239}
 @media(max-width:900px){.shell{display:block;height:calc(100dvh/var(--z));padding:0}.schematic{display:none}.app{max-width:720px;margin:0 auto}}
 @media(max-width:520px){.app{max-width:none;border:0}.top{padding-left:10px;padding-right:10px}.chat{padding-left:10px;padding-right:10px}.composer{padding-left:10px;padding-right:10px}.counter{padding:10px}.value{font-size:18px}.state{font-size:12px;line-height:1.25}.msg{max-width:90%;font-size:14px}.label{font-size:11px}button{padding:0 14px}#send{right:13px}}
-</style></head><body class="hide-traces"><div class="shell">
+</style><link rel="stylesheet" href="/static/fs-panel.css"/>
+<script type="module" src="/static/fs-panel.js"></script></head><body class="hide-traces"><div class="shell">
+<aside class="fsPanel" id="fsPanel" aria-label="files">
+  <h2>Files <span class="fsStatus" id="fsStatus">…</span></h2>
+  <div class="fsTreeMount" id="fsTree"></div>
+</aside>
 <main class="app">
   <header class="top" aria-label="machine summary">
     <section class="counters" aria-label="totals">
@@ -737,6 +877,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
+if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};}};
 load();
 </script></body></html>`;
 }

@@ -51,6 +51,49 @@
   if (document.readyState === "complete") initPark();
   else window.addEventListener("load", initPark);
 
-  window.addEventListener("resize", () => { if (mq.matches) jumpTo(page); });
+  window.addEventListener("resize", () => { if (mq.matches && !document.body.classList.contains("kbOpen")) jumpTo(page); });
   if (mq.addEventListener) mq.addEventListener("change", (e) => { if (e.matches) jumpTo(HOME); });
+
+  // Keyboard-open handling. .shell is a mandatory-snap scroller; the browser's
+  // native "scroll the focused input above the keyboard" maneuver targets the
+  // nearest scrollable ancestor, which is THIS pager — so focusing any text
+  // input forced a full-page snap-jump instead of the small nudge it needed,
+  // sometimes landing on a different page and hiding the composer entirely.
+  // Fix: suspend snapping for the duration of the focus (native scroll behaves
+  // normally with no snap point to fight), then resync to the correct page once
+  // focus leaves and the keyboard's closing animation has settled. Delegated
+  // (focusin/focusout bubble, unlike focus/blur) so it also covers the Files
+  // panel's search input, not just the composer.
+  let kbCloseTimer = 0;
+  document.addEventListener("focusin", (e) => {
+    if (!mq.matches) return;
+    if (!(e.target instanceof HTMLElement) || !/^(input|textarea)$/i.test(e.target.tagName)) return;
+    clearTimeout(kbCloseTimer);
+    document.body.classList.add("kbOpen");
+    shell.classList.add("kbOpen");
+  });
+  document.addEventListener("focusout", (e) => {
+    if (!mq.matches) return;
+    if (!(e.target instanceof HTMLElement) || !/^(input|textarea)$/i.test(e.target.tagName)) return;
+    clearTimeout(kbCloseTimer);
+    // iOS shrinks the visual viewport back over ~250-300ms as the keyboard
+    // hides; jumping immediately re-homes against the still-shrunk viewport
+    // and can overshoot. Re-snap after the animation, not mid-flight.
+    kbCloseTimer = setTimeout(() => {
+      document.body.classList.remove("kbOpen");
+      shell.classList.remove("kbOpen");
+      jumpTo(page);
+    }, 320);
+  });
+
+  // Safety net: iOS Safari does not reliably fire a plain `window resize` when
+  // the on-screen keyboard opens/closes — it fires `visualViewport.resize`
+  // instead. Skip while a field is actively focused (mid-keyboard-transition,
+  // the browser's own scroll-into-view is what we want left alone); the
+  // focusout handler above already re-homes once focus clears.
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", () => {
+      if (mq.matches && !document.body.classList.contains("kbOpen")) jumpTo(page);
+    });
+  }
 })();

@@ -1129,12 +1129,31 @@ body{overflow:hidden;overscroll-behavior:none}
 .msg .body pre{max-width:100%}
 .composer{padding:12px 12px calc(12px + env(safe-area-inset-bottom))}
 textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px input font stops iOS zoom-on-focus */
+/* The desktop #attach/#mic/#send bottom:19px/right:19px offsets were solved for
+   the desktop composer's 16px padding and assume NO safe-area inset. Mobile's
+   composer padding-bottom adds env(safe-area-inset-bottom) on top of its own
+   12px, but those buttons kept the unchanged desktop offset — so on any phone
+   with a home-indicator gap (i.e. nearly all current iPhones in portrait) the
+   buttons sat entirely BELOW the textarea's real bottom edge, appearing to
+   hang out of the pill. Recomputed for the mobile 12px pad (same concentric
+   formula as desktop: pad + corner-radius(16) - button-radius(13) = 15px) and
+   the offset now GROWS by the same safe-area amount the padding grew by, so
+   the button's position relative to the textarea stays constant regardless of
+   the device's home-indicator height. */
+#attach{right:calc(47px + env(safe-area-inset-right));bottom:calc(15px + env(safe-area-inset-bottom))}
+#mic,#send{right:calc(15px + env(safe-area-inset-right));bottom:calc(15px + env(safe-area-inset-bottom))}
 .schematic h2{font-size:18px;margin-bottom:14px}
 .node .nodeTitle{font-size:13.5px}.node .nodeSub{font-size:11px}
 .composerBar{padding-bottom:calc(11px + env(safe-area-inset-bottom))}
 .mobileDots{position:fixed;right:calc(7px + env(safe-area-inset-right));top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:7px;z-index:15;pointer-events:none}
 .mobileDots span{width:6px;height:6px;border-radius:50%;background:#c9c9c9;transition:background .25s ease,transform .25s ease}
 .mobileDots span.on{background:#111;transform:scale(1.3)}
+/* Suspended while the composer textarea is focused (mobile.js toggles this):
+   iOS's native "scroll the focused input above the keyboard" maneuver targets
+   the nearest scrollable ancestor, which is this mandatory-snap pager — so
+   instead of a small nudge, focusing the textarea forced a full-page jump,
+   sometimes landing on Files/Backend and "hiding" the composer entirely. */
+.shell.kbOpen{scroll-snap-type:none}
 }
 /* The former ≤520px block folded into the ≤900px mobile pager rules above so a
    single source of truth sets phone type/spacing (it was overriding them here). */

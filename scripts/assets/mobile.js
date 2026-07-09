@@ -1,14 +1,16 @@
 // Mobile vertical pager glue. The paging itself is native CSS scroll-snap on
-// .shell (a full-screen y-mandatory snap column: Backend / Chat / Files); this
+// .shell (a full-screen y-mandatory snap column: Chat / Files / Backend); this
 // script only (1) parks the view on Chat as the start page and (2) lights the
 // position dots from the current scroll offset. No gesture handling — the
 // browser drives the drag/reveal/commit and its momentum, so it never collides
 // with the left-edge back-swipe the way the old horizontal transform did.
+// Chat is the TOP page so both other views are reached by swiping up, the one
+// direction the chat's own history scroll never eats (see the CSS comment).
 (() => {
   const shell = document.querySelector(".shell");
   if (!shell) return;
   const mq = window.matchMedia("(max-width:900px)");
-  const PAGES = 3, HOME = 1; // 0 Backend · 1 Chat · 2 Files
+  const PAGES = 3, HOME = 0; // 0 Chat (top, home) · 1 Files · 2 Backend
 
   const dots = document.createElement("div");
   dots.className = "mobileDots";

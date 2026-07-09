@@ -259,6 +259,14 @@ export interface HarnessAdapter {
   shared(ctx: SharedContext): AsyncIterable<string>;
   /** Full continuation: runs the REAL external harness inside the user Box. */
   userBox(ctx: UserBoxContext): AsyncIterable<HarnessOutputChunk>;
+  /**
+   * Optional: eagerly warm the box's resident runtime (e.g. boot `opencode
+   * serve`) the instant the machine wakes, so the user's FIRST message doesn't
+   * pay the boot cost. Fire-and-forget, idempotent — a turn's own health-check
+   * still boots serve if this never ran or the box cold-started since. No-op for
+   * harnesses that have nothing resident to warm.
+   */
+  prewarm?(runtime: HarnessRuntime): Promise<void>;
 }
 
 export interface SessionStore {

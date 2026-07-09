@@ -248,6 +248,8 @@ export class ConsumerBoxAgentOrchestrator {
    * hard billing ceiling still overrides everything).
    */
   private readonly boxHolds = new Map<string, Map<string, { reason: string; expiresEpochMs: number }>>();
+  /** Boxes with an eager serve-prewarm in flight — dedupes the every-4s typing pings. */
+  private readonly prewarmingBoxes = new Set<string>();
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -2220,6 +2222,53 @@ export class ConsumerBoxAgentOrchestrator {
     // and without an entry the reaper's `?? now` fallback never sees it idle.
     this.lastActivityAt.set(key, Date.now());
     this.touchUserActivity(userId);
+    // First wake of this billing lifecycle: eagerly boot serve so the user's
+    // first message doesn't pay for it. Repeat typing pings hit the early return
+    // above (billing already set) and never re-fire this.
+    this.prewarmBoxServe(boxId);
+  }
+
+  /**
+   * Eagerly boot the box's resident harness runtime (opencode serve) the moment
+   * a wake happens — typing/upload wakes the machine, so by the time the user
+   * finally sends their first message serve is already listening and the turn
+   * skips the ~3s (up to 90s on archive-resume) boot it would otherwise pay.
+   *
+   * Fire-and-forget and self-sequencing: the caller need not wait for the box to
+   * finish resuming — we poll for it to execute commands (up to ~90s), then run
+   * each serve-capable harness's own prewarm. Deduped per box so the 4s typing
+   * pings don't stack. A turn's health-check still boots serve if this loses a
+   * race or the box cold-started since, so this is a pure latency optimization,
+   * never a correctness dependency.
+   */
+  prewarmBoxServe(boxId: string): void {
+    if (this.prewarmingBoxes.has(boxId)) return;
+    const warmers = [...this.harnesses.values()].filter((h) => typeof h.prewarm === "function");
+    if (warmers.length === 0) return;
+    this.prewarmingBoxes.add(boxId);
+    void (async () => {
+      try {
+        const capabilities = createUserBoxCapabilities(this.options.box, boxId, {
+          ...(this.options.providerEnv ? { providerEnv: this.options.providerEnv } : {}),
+        });
+        // Wait until the box actually executes a command (it may still be
+        // resuming when the wake fired). Same readiness gate the upload path uses.
+        let live = false;
+        for (let i = 0; i < 45 && !live; i++) {
+          try {
+            const r = await capabilities.command(`echo ready`, { timeoutMs: 30_000 });
+            if ((r.stdout || "").includes("ready")) live = true;
+          } catch { /* still booting */ }
+          if (!live) await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+        if (!live) return;
+        for (const h of warmers) {
+          try { await h.prewarm!(capabilities); } catch { /* the turn's own boot covers a failed prewarm */ }
+        }
+      } finally {
+        this.prewarmingBoxes.delete(boxId);
+      }
+    })();
   }
 
   /**

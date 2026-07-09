@@ -208,6 +208,9 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "The user's private machine ALSO has a full graphical desktop with a real browser (Chrome). Opening applications, browsing websites, clicking, typing, taking screenshots — all of it is private-runtime work the user is about to watch live. NEVER say you cannot open apps or browse; reply with the short holding line."
       : undefined,
     !policy.toolsAllowed
+      ? "Files the user attaches or mentions — documents, PDFs, invoices, spreadsheets, images, audio, video, any path — LIVE on the private machine (e.g. /home/user, /home/user/attachments). Reading, opening, summarizing, or extracting from them is private-runtime work. NEVER say you 'don't have access to' or 'can't see' an attached/mentioned file, and NEVER assume it is absent — it is on the private machine you cannot see from here. For any such request your ENTIRE reply is just the short holding line."
+      : undefined,
+    !policy.toolsAllowed
       ? "For PUBLIC live data (weather, news, prices, current events) you DO have the webfetch tool: fetch a public source and answer directly. Never claim you cannot access live data. Known-good sources: weather https://wttr.in/<city>?format=3 ; general/topic news https://lite.duckduckgo.com/lite/?q=<query>+news ; world headlines https://feeds.bbci.co.uk/news/world/rss.xml . One or two fetches maximum, then answer with what you got."
       : undefined,
     policy.toolsAllowed && userCtx?.partialShared
@@ -395,10 +398,16 @@ const BOX_SERVE_URL = `http://127.0.0.1:${BOX_SERVE_PORT}`;
  * to stderr/serve log; stdout carries ONLY the final message JSON, which the
  * opencode-serve-json parser turns into text + native tool events.
  */
-function buildBoxServeTurnScript(args: { binPath: string; bodyPath: string; sessionId?: string; timeoutMs: number }): string {
-  const curlMaxSec = Math.max(30, Math.floor(args.timeoutMs / 1000) - 30);
-  const lines = [
-    `OC=${shellQuote(args.binPath)}`,
+/**
+ * The serve-boot preamble on its own: health-check the resident `opencode
+ * serve`, boot it if missing, wait until it answers. Shared verbatim by the
+ * per-turn script AND by eager prewarm (adapter.prewarm), so a machine woken by
+ * typing/upload has serve already listening before the first message — there is
+ * exactly ONE definition of how serve boots, so the two paths can never drift.
+ */
+function buildServeEnsureScript(binPath: string): string {
+  return [
+    `OC=${shellQuote(binPath)}`,
     `SL="$HOME/.cba-opencode-serve.log"`,
     `if ! curl -s -m 2 -o /dev/null ${BOX_SERVE_URL}/app 2>/dev/null; then`,
     // cd $HOME: sessions must all live in ONE deterministic project scope; a
@@ -413,6 +422,13 @@ function buildBoxServeTurnScript(args: { binPath: string; bodyPath: string; sess
     `  for i in $(seq 1 450); do if curl -s -m 1 -o /dev/null ${BOX_SERVE_URL}/app 2>/dev/null; then ready=1; break; fi; sleep 0.2; done`,
     `  [ -n "$ready" ] || { echo "opencode serve failed to boot within 90s: $(tail -c 300 "$SL" 2>/dev/null)" >&2; exit 7; }`,
     `fi`,
+  ].join("\n");
+}
+
+function buildBoxServeTurnScript(args: { binPath: string; bodyPath: string; sessionId?: string; timeoutMs: number }): string {
+  const curlMaxSec = Math.max(30, Math.floor(args.timeoutMs / 1000) - 30);
+  const lines = [
+    buildServeEnsureScript(args.binPath),
     args.sessionId
       ? [
           `SID=${shellQuote(args.sessionId)}`,
@@ -606,5 +622,36 @@ export function realCliHarness(spec: RealCliHarnessSpec, deps: RealCliHarnessDep
       const policy: HarnessPhasePolicy = { phase: "user-box", toolsAllowed: true, runtime: "user-box" };
       yield* runHarnessTurn(spec, ctx.capabilities, ctx, policy);
     },
+    // Eager serve boot on machine wake. Only serve-based (opencode-json) box
+    // harnesses have something resident to warm; everything else no-ops. Runs
+    // the EXACT serve-ensure preamble a turn would (via runHarness so it inherits
+    // the same provider-key env — a keyless serve would answer turns and then
+    // fail every model call), then drains output silently. Idempotent: the
+    // preamble's own health-check makes a second boot a ~2s curl and nothing more.
+    ...(spec.outputMode === "opencode-json"
+      ? {
+          async prewarm(runtime: HarnessRuntime): Promise<void> {
+            if (runtime.location !== "user-box") return;
+            // Bin absent only on a truly fresh box, which is about to run its
+            // first turn (that path installs + boots serve). Skip rather than
+            // duplicate the 180s install here.
+            const binPath = (await runtime.command(`command -v ${sanitizeShell(spec.bin)}`)).stdout.trim().split(/\s+/).pop();
+            if (!binPath) return;
+            const env = spec.buildEnv?.({ provider: spec.models[0]?.provider ?? "", model: spec.models[0]?.model ?? "", toolsAllowed: true });
+            const script = buildServeEnsureScript(binPath);
+            for await (const _ of runtime.runHarness({
+              argv: ["bash", "-c", script],
+              cwd: ".",
+              ...(env ? { env } : {}),
+              // Serve's own boot window is 90s (archive-resume disk restore); give
+              // the wrapper a little headroom so a genuinely slow boot still lands.
+              timeoutMs: 110_000,
+              pollMs: 200,
+            })) {
+              void _;
+            }
+          },
+        }
+      : {}),
   };
 }

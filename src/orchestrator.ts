@@ -1957,6 +1957,10 @@ export class ConsumerBoxAgentOrchestrator {
     });
     let userText = "";
     let sawToolUse = false;
+    // Lightweight record of what the agent DID, so a no-final-answer failure can
+    // salvage a human summary (execEvents is drained as it flushes, so count here).
+    let toolUseCount = 0;
+    let lastToolName = "";
     let heldEndCandidate = "";
     const itc = continued[Symbol.asyncIterator]();
     const harnessName = harness.name;
@@ -1965,7 +1969,7 @@ export class ConsumerBoxAgentOrchestrator {
       while (execEvents.length) {
         const ev = execEvents.shift()!;
         if (ev.type === "harness.tool") {
-          if (ev.phase === "tool_use") sawToolUse = true;
+          if (ev.phase === "tool_use") { sawToolUse = true; toolUseCount++; if (ev.toolName) lastToolName = ev.toolName; }
           // Surface tool activity in traces so the scheduler/UI can see the box
           // agent is actively working (NOT idle) even before any visible text.
           yield {
@@ -2135,13 +2139,33 @@ export class ConsumerBoxAgentOrchestrator {
       this.appendTranscript(key, assistantMessage);
       this.markPrivateRound(key, round, "answered");
     }
-    if (!userText) {
-      this.markPrivateRound(key, round, "suppressed");
-      // The box agent produced NOTHING — no answer, no <end>. That is a real
-      // failure, never a legitimate silence (rule 6: intentional silence is
-      // exactly "<end>", nothing else). Fail loudly with the harness' own exit
-      // code and raw output tail instead of leaving the user staring at nothing.
-      if (completion.reason !== "aborted") {
+    if (!userText && completion.reason !== "aborted") {
+      if (sawToolUse) {
+        // The agent DID run tools on the machine but the harness (opencode) died
+        // before writing a final answer — even the one-shot continuation retry
+        // above came back empty (observed: opencode serve 500s / UnknownError on
+        // the resume call). Don't strand the user on a hard error: surface WHAT
+        // the agent did as a real answer, mark the round answered so the box can
+        // idle-stop, and invite a continue. The work already ran on their box.
+        const did = `${toolUseCount} tool ${toolUseCount === 1 ? "call" : "calls"}${lastToolName ? ` (last: ${lastToolName})` : ""}`;
+        const salvage = `I worked on your machine — ${did} — but the run ended before I could write up the result${completion.diagnostic ? " (the harness threw an error mid-reply)" : ""}. The steps themselves ran; ask me to continue and I'll report back on what I found.`;
+        const assistantMessage: TranscriptMessage = {
+          role: "assistant",
+          content: salvage,
+          mode: "user-box",
+          harness: harness.name,
+          model: input.selection.model,
+          at: new Date().toISOString(),
+        };
+        transcript.push(assistantMessage);
+        this.appendTranscript(key, assistantMessage);
+        this.markPrivateRound(key, round, "answered");
+        yield { type: "user-box.delta", text: salvage, boxId: box.id, harness: harness.name, model: input.selection.model };
+      } else {
+        this.markPrivateRound(key, round, "suppressed");
+        // No text AND no tool ran — the agent produced NOTHING (not a legitimate
+        // silence; rule 6: intentional silence is exactly "<end>"). There is
+        // nothing to salvage, so fail loudly with the harness exit code + tail.
         yield {
           type: "turn.blocked",
           stage: "box.runtime.no-answer",

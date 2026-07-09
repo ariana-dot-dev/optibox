@@ -1350,10 +1350,17 @@ async function attachDesktopStream(w){
         var link=w.el.querySelector('.desktopTag a');if(link){link.href=j.desktopUrl;link.style.display='';}
         // Heartbeat: renew the server-side desktop hold while this widget's
         // turn is still running, so the machine stays up under the stream.
+        // Renew ONLY while the agent's turn is still producing its answer. Keying
+        // off boxDone (set on turn.done), not the SSE lifetime: the stream stays
+        // open after the answer to carry auto-stop ticks, and renewing across
+        // that window pins the box forever (the desktop hold keeps the turn
+        // "active", which keeps renewing the hold — the box never stops). Once
+        // renewal ceases the 45s TTL lapses and the countdown/reaper stop the box.
         (async function(){
-          while(desktopWidget===w&&activeTurns.has(w.localId)){
+          const alive=function(){const t=activeTurns.get(w.localId);return desktopWidget===w&&t&&!t.boxDone;};
+          while(alive()){
             await new Promise(function(r){setTimeout(r,20000);});
-            if(desktopWidget!==w||!activeTurns.has(w.localId))return;
+            if(!alive())return;
             try{await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})});}catch(_){}
           }
         })();
@@ -1419,7 +1426,7 @@ let lastAgentMsgEl=null;
 let agentFileBaseline=null;
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});document.body.dataset.busy='1';
+async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false,boxDone:false});document.body.dataset.busy='1';
   // Baseline the filesystem BEFORE the box does any work, so turn.done can diff
   // out the agent's own new/changed files. Fire-and-forget; if it fails the diff
   // is simply skipped and only name-mentions surface.
@@ -1763,7 +1770,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
   else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
-  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl,agentFileBaseline);lastAgentMsgEl=null;}}
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl,agentFileBaseline);lastAgentMsgEl=null;}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};

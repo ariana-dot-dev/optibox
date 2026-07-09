@@ -351,7 +351,19 @@ async function prepareTurnWorkspace(
   // truncated by the Git-Bash-on-Windows spawn arg limit (unexpected-EOF errors).
   let prep: CommandResult;
   if (runtime.location === "user-box") {
+    // The box disk is FUSE-backed: everything is present, but the FIRST access to
+    // a not-yet-cached library (e.g. bash's libtinfo.so.6) can miss and fail the
+    // whole `bash -c` with exit 127 "error while loading shared libraries" before
+    // any prep part runs. It is transient — the second access hits cache. Retry the
+    // whole prep through that warm-up window instead of hard-failing the turn.
+    const isTransientExecFail = (r: CommandResult) =>
+      !r.stdout.includes("__BIN_OK__") && !r.stdout.includes("__BIN_MISSING__") &&
+      (r.exitCode === 127 || /loading shared librar|libtinfo|cannot open shared object|command not found|\bbash\b.*: not found/i.test(r.stderr));
     prep = await runtime.command(parts.join(" && "));
+    for (let attempt = 0; attempt < 6 && isTransientExecFail(prep); attempt++) {
+      await new Promise((res) => setTimeout(res, 1500));
+      prep = await runtime.command(parts.join(" && "));
+    }
   } else {
     prep = { exitCode: 0, stdout: "", stderr: "" };
     for (const part of parts) {

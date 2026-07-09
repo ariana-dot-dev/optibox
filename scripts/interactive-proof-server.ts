@@ -483,7 +483,20 @@ async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<Array<{
     // %T@ = mtime as epoch seconds (float): lets the chat surface files the
     // agent created/modified during a turn by comparing against a turn-start
     // baseline, no per-command path parsing needed.
-    command: `find /home/user -mindepth 1 -printf '%y\\t%s\\t%T@\\t%P\\n' 2>/dev/null | head -c 3000000`,
+    //
+    // PRUNE the multi-thousand-entry machine-noise dirs (npm/pip/cargo caches,
+    // node_modules, nvm, git objects, etc). Without this, `.npm/_cacache` alone
+    // is ~20k entries: the printf output blows past the byte cap and `head`
+    // TRUNCATES real user files (e.g. Documents/*.pdf) out of the tail — which is
+    // why "live" showed FEWER files than the complete snapshot tree. Pruning keeps
+    // the output small and fast so every real file always makes it in. The cap is
+    // a safety backstop only, raised well above any realistic real-file listing.
+    command:
+      `find /home/user -mindepth 1 ` +
+      `\\( -name node_modules -o -name __pycache__ -o -name .git -o -name .npm ` +
+      `-o -name .cache -o -name .cargo -o -name .rustup -o -name .nvm ` +
+      `-o -name .vscode-server -o -name snap -o -name .bun -o -name .pnpm-store \\) -prune ` +
+      `-o -printf '%y\\t%s\\t%T@\\t%P\\n' 2>/dev/null | head -c 8000000`,
     timeoutMs: 30_000,
   });
   const entries: Array<{ path: string; kind: string; size?: number; mtime?: number }> = [];
@@ -524,7 +537,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
         try {
           const entries = await Promise.race([
             fsLiveTree(client, box.id),
-            new Promise<never>((_, reject) => setTimeout(() => reject(new Error("live-tree deadline")), 3500)),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error("live-tree deadline")), 6000)),
           ]);
           return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries, runtime }), true;
         } catch { /* fall through to snapshot */ }

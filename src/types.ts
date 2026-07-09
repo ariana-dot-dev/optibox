@@ -291,6 +291,16 @@ export interface OrchestratorOptions {
   handoffTimeoutMs?: number;
   /** Max time to wait for an archived private Box to resume before surfacing recovery and provisioning a fresh one. */
   resumeTimeoutMs?: number;
+  /**
+   * Ceiling on how long a turn waits for the private Box's create/fork/resume
+   * acknowledgement before giving up on emitting it inline and moving straight
+   * to the shared no-tools reply. The boot itself is NOT canceled or slowed by
+   * this — it keeps running in the background and its ack is emitted later,
+   * once the shared reply is in flight. This exists so the always-fast shared
+   * answer can never be blocked by a slow/stalled Box API call. Defaults to
+   * 1500ms.
+   */
+  bootAckTimeoutMs?: number;
   /** Provider LLM keys to inject into the Box when running harnesses. */
   providerEnv?: Record<string, string>;
   /** Delay after a Box answer before auto-stopping, unless a newer user turn arrives. Defaults to 5000ms. */

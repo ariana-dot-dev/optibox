@@ -2017,3 +2017,40 @@ test("keep-alive holds mark the box needed until released or expired", () => {
   for (const hold of (orchestrator as any).boxHolds.get("user-a").values()) hold.expiresEpochMs = Date.now() - 1;
   assert.deepEqual(blockers("user-a:conv-1"), [], "expired hold is swept and never pins the box");
 });
+
+class NeverCreatesBoxClient extends FakeBoxClient {
+  // Reproduces a prod incident (2026-07-09 15:42 UTC): a fresh user's first
+  // turn hung at box.status.resolved with zero further events for 5+ minutes
+  // (only an unrelated process restart ever ended it) because the shared
+  // no-tools reply was gated behind an uncapped await on the box create call.
+  override create(_input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
+    return new Promise(() => {}); // never resolves — models a stalled Box API call
+  }
+}
+
+test("a stalled Box create can never block the always-fast shared reply", async () => {
+  const box = new NeverCreatesBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({
+    box,
+    harnesses: [probeHarness("alpha")],
+    readinessPollMs: 1,
+    autoStopIdleMs: 1,
+    bootAckTimeoutMs: 20,
+  });
+
+  const events: any[] = [];
+  const started = Date.now();
+  const done = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "hey", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) {
+      events.push(e);
+      if (e.type === "shared.delta") break; // the shared answer is the thing under test
+    }
+  })();
+  await Promise.race([
+    done,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("shared reply did not arrive in time — box boot is blocking it again")), 500)),
+  ]);
+  const elapsedMs = Date.now() - started;
+  assert.ok(events.some((e) => e.type === "shared.delta"), "shared reply is emitted even though the box never comes up");
+  assert.ok(elapsedMs < 400, `shared reply took ${elapsedMs}ms — should be bounded by bootAckTimeoutMs, not the stalled box create`);
+});

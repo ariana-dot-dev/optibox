@@ -1040,7 +1040,21 @@ export class ConsumerBoxAgentOrchestrator {
         ...("boxId" in resolvedStatus ? { boxId: resolvedStatus.boxId } : {}),
       };
     } else {
-      const bootAck = await bootAckPromise.catch((error) => {
+      // Capped, NOT plain awaited: this gated the shared no-tools reply behind
+      // the box's create/fork/resume call with no ceiling of its own, so a
+      // stalled Box API request silently froze the "instant" shared line too —
+      // reproduced in prod (2026-07-09 15:42 UTC): a turn hung at
+      // box.status.resolved with zero further events until an unrelated
+      // process restart killed it 5 minutes later; the client never got so
+      // much as an error. bootAckPromise itself is untouched and still
+      // resolves/rejects normally in the background (already void-caught below
+      // its creation) — the second checkpoint after the shared reply (see
+      // `confirmedBootEmitted` below) emits the boot-start event once it does,
+      // so nothing is lost, only deferred.
+      const bootAck = await Promise.race([
+        bootAckPromise,
+        new Promise<undefined>((resolve) => setTimeout(resolve, this.options.bootAckTimeoutMs ?? 1_500)),
+      ]).catch((error) => {
         recoveryEvents.push({
           type: "trace",
           stage: "box.boot.failed",

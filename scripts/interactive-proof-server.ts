@@ -1574,12 +1574,13 @@ function renderAttachDeck(el,atts,side){
   });
   el.parentNode.insertBefore(deck,el);
 }
-// Agent "attachments": ONLY the files the box agent explicitly DECLARED it
-// created/modified this turn, via its trailing <optibox-files>…</optibox-files>
-// manifest. Shown as a left-aligned card deck BELOW its last bubble. This
-// replaced an mtime/baseline diff that surfaced every recently-touched file
-// (build churn, incidental writes) and made it impossible to tell what the
-// agent actually produced — now the agent names its own deliverables.
+// Agent "attachments": files the box agent produced this turn, shown as a
+// left-aligned deck BELOW its last bubble. Primary signal is its explicit
+// <optibox-files>…</optibox-files> manifest; as a fallback (models sometimes
+// forget the tag) we also resolve files it NAMES in prose to a single tree file.
+// Both are precise — neither is the old mtime diff that surfaced every touched
+// file. A named path only shows if it actually exists under /home/user.
+const AGENT_FILE_EXT=/\\.(png|jpe?g|gif|webp|bmp|avif|svg|pdf|mp4|webm|m4v|mov|ogv|mp3|wav|ogg|oga|m4a|opus|csv|xlsx?|json|txt|md|py|js|ts|tsx|html?|css|zip|sqlite3?|db|docx?|pptx?)$/i;
 async function fetchTreeFiles(){
   try{const t=await (await fetch('/api/fs/tree',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
     return (t.entries||[]).filter(e=>e.kind!=='directory'&&e.kind!=='d'&&e.kind!=='dir');
@@ -1590,11 +1591,17 @@ function isNoisePath(p){return p.split('/').some(seg=>seg.startsWith('.')||seg==
 async function renderAgentAttachments(el){
   if(!el||el.__deckDone||!el.parentNode)return;el.__deckDone=true;
   const body=el.querySelector('.body');if(!body)return;
-  const declared=parseFileDecl(body.dataset.raw||'');
-  if(!declared.length)return;
+  const raw=body.dataset.raw||'';
+  const declared=parseFileDecl(raw);
+  // Fallback: filename-ish tokens the agent mentioned in its visible prose.
+  const mentioned=[];const mseen={};let m;const mre=/[A-Za-z0-9_./-]+\\.[A-Za-z0-9]{1,8}/g;
+  const shown=stripFileDecl(raw);
+  while((m=mre.exec(shown))){let t=m[0].replace(/^[./]+/,'');if(AGENT_FILE_EXT.test(t)&&!mseen[t]){mseen[t]=1;mentioned.push(t);}}
+  const cands=declared.concat(mentioned);
+  if(!cands.length)return;
   const files=await fetchTreeFiles();if(!files)return;
   const ordered=[];const chosen={};
-  for(const c of declared){
+  for(const c of cands){
     const base=c.split('/').pop();
     const matches=[...new Set(files.filter(e=>{const p=e.path;return p===c||p.endsWith('/'+c)||p===base||p.endsWith('/'+base)||p.split('/').pop()===base;}).map(e=>e.path))];
     // Prefer an exact path match; otherwise accept a unique basename match.

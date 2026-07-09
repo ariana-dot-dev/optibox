@@ -297,8 +297,19 @@ async function prepareTurnWorkspace(
   extraFiles?: Record<string, string>,
 ): Promise<{ cwd: string; systemInstructionPath: string; binInstalled: boolean; binPath?: string }> {
   const conversationSlug = sanitizeShell(`${ctx.userId}-${ctx.conversationId}`).slice(0, 60);
-  const cwd = `/tmp/consumer-agent-${sanitizeShell(spec.name)}-${phase}-${conversationSlug}`;
-  const systemInstructionPath = `${cwd}/CONSUMER_AGENT_SYSTEM.md`;
+  // The user box IS the user's machine: the agent MUST work inside their real home
+  // so files it creates/edits are (a) visible in the file tree (which scans
+  // /home/user) and (b) survive stop/resume (ONLY /home/user is snapshotted; /tmp
+  // is wiped on stop). Running in /tmp is why "Done, I saved oil_producers.csv"
+  // produced a file nobody could ever see. Shared infra has no persistent files
+  // and no tree, so it keeps an isolated per-conversation scratch dir in /tmp.
+  const cwd = runtime.location === "user-box"
+    ? "/home/user"
+    : `/tmp/consumer-agent-${sanitizeShell(spec.name)}-${phase}-${conversationSlug}`;
+  // Harness scaffolding (system prompt, serve body) hides under dot-names in the
+  // box so it never clutters the user's visible home directory.
+  const scaffold = runtime.location === "user-box" ? ".optibox-" : "";
+  const systemInstructionPath = `${cwd}/${scaffold}CONSUMER_AGENT_SYSTEM.md`;
   const encoded = Buffer.from(instructions + "\n", "utf8").toString("base64");
   const parts = [
     `mkdir -p ${shellQuote(cwd)}`,

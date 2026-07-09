@@ -2046,6 +2046,54 @@ export class ConsumerBoxAgentOrchestrator {
       }
     };
     yield* drainIterator(itc);
+    // OBSERVABILITY: ground-truth what actually landed on disk in the user's home
+    // this turn. This is the source of truth behind "the agent said it saved X":
+    // it exposes files written to the wrong directory or writes that never
+    // persisted, and lets a turn be reproduced/diagnosed from /api/diagnostics
+    // instead of guesswork. Best-effort; never blocks or fails the turn.
+    if (this.options.box.command) {
+      try {
+        const probe = await this.options.box.command(box.id, {
+          command:
+            "find /home/user -maxdepth 6 -type f -mmin -15 -not -path '*/.*' " +
+            "-not -path '*/node_modules/*' -printf '%T@\\t%s\\t%P\\n' 2>/dev/null " +
+            "| sort -rn | head -50",
+          timeoutMs: 10_000,
+        });
+        const files = String(probe?.stdout ?? "")
+          .split("\n")
+          .map((l) => l.replace(/\r$/, ""))
+          .filter(Boolean)
+          .map((l) => {
+            const [mtime, size, ...rest] = l.split("\t");
+            return { path: rest.join("\t"), size: Number(size) || 0, mtime: Math.floor(Number(mtime) || 0) };
+          })
+          .filter((f) => f.path);
+        yield {
+          type: "trace",
+          stage: "box.files.ondisk",
+          message:
+            `after turn (${toolUseCount} tool call${toolUseCount === 1 ? "" : "s"}` +
+            `${lastToolName ? `, last: ${lastToolName}` : ""}): ` +
+            (files.length
+              ? `${files.length} file(s) modified under /home/user in last 15min → ${files.slice(0, 10).map((f) => f.path).join(", ")}`
+              : "NO non-hidden files modified under /home/user in last 15min"),
+          harness: harnessName,
+          model: selectionModel,
+          boxId: box.id,
+          data: { cwd: "/home/user", count: files.length, files, toolUseCount, lastToolName, sawToolUse },
+        };
+      } catch (err) {
+        yield {
+          type: "trace",
+          stage: "box.files.ondisk.error",
+          message: `on-disk file verification failed: ${String(err).slice(0, 200)}`,
+          harness: harnessName,
+          model: selectionModel,
+          boxId: box.id,
+        };
+      }
+    }
     if (!this.isPrivateRoundCurrent(key, round)) {
       this.markPrivateRound(key, round, "stale");
       yield {

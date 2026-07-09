@@ -816,6 +816,12 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .recBar.paused .recDot{animation:none;opacity:.4}
 @keyframes recPulse{0%,100%{opacity:1}50%{opacity:.25}}
 .recWave{flex:1;height:34px;min-width:0}
+.recDevice{width:20px;height:34px;min-height:34px;flex:0 0 auto;padding:0;border:0;background:transparent;color:#a2a2a2;display:flex;align-items:center;justify-content:center;cursor:pointer;border-radius:6px;transition:background .15s ease,color .15s ease}.recDevice:hover{color:#111;background:#e2e2e2}.recDevice svg{width:12px;height:12px;display:block}
+.recDeviceMenu{display:none;position:absolute;bottom:66px;right:10px;min-width:190px;max-width:82vw;background:#fff;border:1px solid #d9d9d9;border-radius:11px;padding:5px;z-index:6;max-height:230px;overflow:auto}
+.recDeviceMenu.open{display:block}
+.recDevItem{padding:7px 10px;font-size:12px;color:#333;border-radius:7px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.recDevItem:hover{background:#f0f0f0}
+.recDevItem.sel{color:#fc4b55}.recDevItem.sel::before{content:'✓ '}
 .recTime{flex:0 0 auto;font-size:12px;color:#555;font-variant-numeric:tabular-nums;min-width:34px;text-align:right}
 /* Pending (unsent) attachments preview as the SAME fanned deck as sent ones. */
 .pendingAttach{margin:0 0 8px}.pendingAttach:empty{display:none}
@@ -864,10 +870,12 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
       <button type="button" class="recBtn recTrash" id="recTrash" aria-label="Discard recording" title="Discard"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M216,48H176V40a24,24,0,0,0-24-24H104A24,24,0,0,0,80,40v8H40a8,8,0,0,0,0,16h8V208a16,16,0,0,0,16,16H192a16,16,0,0,0,16-16V64h8a8,8,0,0,0,0-16ZM112,168a8,8,0,0,1-16,0V104a8,8,0,0,1,16,0Zm48,0a8,8,0,0,1-16,0V104a8,8,0,0,1,16,0Zm0-120H96V40a8,8,0,0,1,8-8h48a8,8,0,0,1,8,8Z"/></svg></button>
       <span class="recDot" id="recDot"></span>
       <canvas class="recWave" id="recWave"></canvas>
+      <button type="button" class="recDevice" id="recDevice" aria-label="Choose microphone" title="Choose microphone"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z"/></svg></button>
       <span class="recTime" id="recTime">0:00</span>
       <button type="button" class="recBtn recPause" id="recPause" aria-label="Pause recording" title="Pause"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M216,48V208a16,16,0,0,1-16,16H160a16,16,0,0,1-16-16V48a16,16,0,0,1,16-16h40A16,16,0,0,1,216,48ZM96,32H56A16,16,0,0,0,40,48V208a16,16,0,0,0,16,16H96a16,16,0,0,0,16-16V48A16,16,0,0,0,96,32Z"/></svg></button>
       <button type="button" class="recBtn recSend" id="recSend" aria-label="Send voice message" title="Send"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68Z"/></svg></button>
     </div>
+    <div class="recDeviceMenu" id="recDeviceMenu" aria-label="Microphone devices"></div>
   </form>
   <footer class="composerBar" aria-label="controls">
     <button id="stopBox" type="button">Pause Box now</button>
@@ -1210,21 +1218,66 @@ const PAUSE_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" f
 const PLAY_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M240,128a15.74,15.74,0,0,1-7.6,13.51L88.32,229.65a16,16,0,0,1-16.2.3A15.86,15.86,0,0,1,64,216.13V39.87a15.86,15.86,0,0,1,8.12-13.82,16,16,0,0,1,16.2.3L232.4,114.49A15.74,15.74,0,0,1,240,128Z"/></svg>';
 function fmtTime(s){const m=Math.floor(s/60);const ss=Math.floor(s%60);return m+':'+(ss<10?'0':'')+ss;}
 function recTimeNow(){return recElapsed+(recPaused?0:(Date.now()-recStart)/1000);}
-async function startRecording(){
-  if(composer.classList.contains('recording'))return;
+function getSavedMicId(){try{return localStorage.getItem('optibox.micDeviceId')||'';}catch(_){return '';}}
+function saveMicId(id){try{localStorage.setItem('optibox.micDeviceId',id||'');}catch(_){}}
+// Open a mic stream on a specific device (falls back to default if that exact
+// device is gone) and wire up the recorder, waveform and timer.
+async function beginStream(deviceId){
   let stream;
-  try{stream=await navigator.mediaDevices.getUserMedia({audio:true});}
-  catch(e){addMsg('trace','microphone','microphone unavailable: '+String(e&&e.message||e)+'\\n');return;}
-  mediaStream=stream;recChunks=[];recElapsed=0;recPaused=false;
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:deviceId?{deviceId:{exact:deviceId}}:true});}
+  catch(e){
+    try{stream=await navigator.mediaDevices.getUserMedia({audio:true});}
+    catch(e2){addMsg('trace','microphone','microphone unavailable: '+String(e2&&e2.message||e2)+'\\n');composer.classList.remove('recording');return false;}
+  }
+  mediaStream=stream;recChunks=[];recPaused=false;
   const pick=['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg'].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||'';
   recMime=pick||'audio/webm';
   mediaRec=new MediaRecorder(stream,pick?{mimeType:pick}:undefined);
   mediaRec.ondataavailable=e=>{if(e.data&&e.data.size)recChunks.push(e.data);};
   mediaRec.start(100);recStart=Date.now();
-  const bar=$('recBar');bar.classList.remove('paused');$('recPause').innerHTML=PAUSE_SVG;$('recPause').title='Pause';$('recTime').textContent='0:00';
-  composer.classList.add('recording');
   try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();const src=audioCtx.createMediaStreamSource(stream);analyser=audioCtx.createAnalyser();analyser.fftSize=1024;src.connect(analyser);drawWave();}catch(_){}
+  try{clearInterval(recTimer);}catch(_){}
   recTimer=setInterval(()=>{$('recTime').textContent=fmtTime(recTimeNow());},200);
+  return true;
+}
+async function startRecording(){
+  if(composer.classList.contains('recording'))return;
+  recElapsed=0;recPaused=false;
+  $('recBar').classList.remove('paused');$('recPause').innerHTML=PAUSE_SVG;$('recPause').title='Pause';$('recTime').textContent='0:00';
+  composer.classList.add('recording');
+  const ok=await beginStream(getSavedMicId());
+  if(ok)populateDeviceMenu();
+}
+// Switch input device mid-recording. Two webm segments can't be stitched into
+// one valid file, so switching restarts a fresh recording on the new device
+// (you switch because the first one was silent anyway) — and remembers it.
+async function applyMicDevice(id){
+  saveMicId(id);
+  if(!composer.classList.contains('recording'))return;
+  if(mediaRec){mediaRec.ondataavailable=null;mediaRec.onstop=null;if(mediaRec.state!=='inactive')try{mediaRec.stop();}catch(_){}}
+  try{cancelAnimationFrame(recRAF);}catch(_){}
+  if(mediaStream)mediaStream.getTracks().forEach(t=>t.stop());
+  if(audioCtx&&audioCtx.close)try{audioCtx.close();}catch(_){}
+  audioCtx=null;analyser=null;mediaStream=null;mediaRec=null;recChunks=[];recElapsed=0;recPaused=false;
+  $('recBar').classList.remove('paused');$('recPause').innerHTML=PAUSE_SVG;$('recPause').title='Pause';$('recTime').textContent='0:00';
+  const ok=await beginStream(id);
+  if(ok)populateDeviceMenu();
+}
+function closeDeviceMenu(){const m=$('recDeviceMenu');if(m)m.classList.remove('open');}
+async function populateDeviceMenu(){
+  const menu=$('recDeviceMenu');if(!menu)return;
+  let devs=[];try{devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='audioinput');}catch(_){}
+  let activeId='';try{const tr=mediaStream&&mediaStream.getAudioTracks&&mediaStream.getAudioTracks()[0];activeId=(tr&&tr.getSettings&&tr.getSettings().deviceId)||'';}catch(_){}
+  const saved=getSavedMicId();
+  menu.innerHTML='';
+  if(!devs.length){const r=document.createElement('div');r.className='recDevItem';r.textContent='No microphones found';menu.appendChild(r);return;}
+  devs.forEach((d,i)=>{
+    const row=document.createElement('div');row.className='recDevItem';
+    if((activeId&&d.deviceId===activeId)||(!activeId&&saved&&d.deviceId===saved))row.classList.add('sel');
+    row.textContent=d.label||('Microphone '+(i+1));
+    row.addEventListener('click',ev=>{ev.stopPropagation();closeDeviceMenu();applyMicDevice(d.deviceId);});
+    menu.appendChild(row);
+  });
 }
 function drawWave(){
   const c=$('recWave');if(!c||!analyser)return;
@@ -1271,6 +1324,8 @@ $('mic').addEventListener('click',startRecording);
 $('recTrash').addEventListener('click',trashRecording);
 $('recPause').addEventListener('click',pauseResume);
 $('recSend').addEventListener('click',finishRecording);
+$('recDevice').addEventListener('click',e=>{e.stopPropagation();const m=$('recDeviceMenu');if(m.classList.contains('open'))closeDeviceMenu();else{populateDeviceMenu();m.classList.add('open');}});
+if(document.addEventListener)document.addEventListener('click',()=>closeDeviceMenu());
 updateComposerMode();
 async function drain(res,localId){if(!res){throw new Error('No response object from /api/send');}if(!res.ok){const body=await res.text().catch(()=>'');throw new Error('/api/send failed with HTTP '+res.status+' '+body);}if(!res.body){throw new Error('/api/send did not return a readable SSE body');}const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls+(ev.messageId?':msg:'+ev.messageId:(ev.messageIndex!=null?':msg:'+ev.messageIndex:''));}

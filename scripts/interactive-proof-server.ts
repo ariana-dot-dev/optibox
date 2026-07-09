@@ -291,32 +291,43 @@ function fsBoxName(credentials: DemoCredentials, userId: string): string {
 /**
  * Write raw bytes to one box file — reliably, at any size and any boot age.
  *
- * The files API is unreliable for our case in two ways: one write caps at 5MB,
- * and a PUT to a path with a not-yet-existing parent dir can return 200 without
- * ever hitting disk (observed moments after billing.start — the file simply
- * isn't there). Root-level PUTs, however, DO persist. So we always ship ≤4MB
- * parts to ROOT temp files, then assemble them into the target with one `cat`
- * command (commands persist and can `mkdir -p` the destination dir). This is
- * the same path for a 200KB image and a 90MB video — no silent subdir drops.
+ * The files API is unreliable for our case in three ways: one write caps at
+ * 5MB; a PUT to a path with a not-yet-existing parent dir can return 200 without
+ * ever hitting disk; and moments after a boot/resume the parts PUT silently
+ * no-ops while the (lazily-restored) filesystem is still settling. Root-level
+ * PUTs DO persist once the FS is ready, so we ship ≤4MB parts to ROOT temp
+ * files, assemble them into the target with one `cat` command (commands persist
+ * and can `mkdir -p` the dir), verify the byte count, and RETRY the whole thing
+ * through the settling window. Same path for a 200KB image and a 90MB video.
  */
 async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: string, bytes: Buffer): Promise<void> {
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
   const dir = filePath.includes("/") ? filePath.replace(/\/[^/]*$/, "") : ".";
-  const tmp = `.cba-upload-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  const parts: string[] = [];
-  for (let off = 0, i = 0; off < bytes.length || i === 0; off += 4_000_000, i++) {
-    const part = `${tmp}.${i}`;
-    await client.writeFileBytes(boxId, part, bytes.subarray(off, off + 4_000_000));
-    parts.push(part);
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      const tmp = `.cba-upload-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      const parts: string[] = [];
+      for (let off = 0, i = 0; off < bytes.length || i === 0; off += 4_000_000, i++) {
+        const part = `${tmp}.${i}`;
+        await client.writeFileBytes(boxId, part, bytes.subarray(off, off + 4_000_000));
+        parts.push(part);
+      }
+      const list = parts.map(q).join(" ");
+      const assembled = await client.command(boxId, {
+        command: `cd /home/user && mkdir -p ${q(dir)} && cat ${list} > ${q(filePath)} && rm -f ${list} && stat -c %s ${q(filePath)}`,
+        timeoutMs: 60_000,
+      });
+      if (Number(assembled.stdout.trim()) !== bytes.length) {
+        throw new Error(`assembled size mismatch: ${assembled.stdout.trim() || assembled.stderr.trim()}`);
+      }
+      return;
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
   }
-  const list = parts.map(q).join(" ");
-  const assembled = await client.command(boxId, {
-    command: `cd /home/user && mkdir -p ${q(dir)} && cat ${list} > ${q(filePath)} && rm -f ${list} && stat -c %s ${q(filePath)}`,
-    timeoutMs: 60_000,
-  });
-  if (Number(assembled.stdout.trim()) !== bytes.length) {
-    throw new Error(`assembled size mismatch: ${assembled.stdout.trim() || assembled.stderr.trim()}`);
-  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 async function fsResolveBox(credentials: DemoCredentials, userId: string): Promise<{ box?: { id: string; state: string }; live: boolean }> {
@@ -450,14 +461,24 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     }
 
     if (pathname === "/api/fs/write") {
-      if (!box || !live) return json(409, { ok: false, message: "box is stopped — snapshot files are read-only" }), true;
       if (!filePath || typeof body.contentB64 !== "string") return json(400, { ok: false, message: "path and contentB64 required" }), true;
+      if (!box) return json(409, { ok: false, message: "no machine yet — send a message first" }), true;
       // Keep the box up for the duration of the upload: the hold cancels a
       // running auto-stop countdown and the reaper skips held boxes.
-      const releaseHold = orchestratorFor(credentials).holdUserBox(userId, "upload");
+      const releaseHold = orchestratorFor(credentials).holdUserBox(userId, "upload", 300_000);
       try {
-      await writeBoxFile(client, box.id, filePath, Buffer.from(body.contentB64, "base64"));
-      return json(200, { ok: true }), true;
+        // Machine off? Boot it and wait until it actually executes a command,
+        // so a drop while parked just wakes the box and completes the upload.
+        if (!live) {
+          try { await client.resume(box.id); } catch { /* may already be resuming */ }
+          let up = false;
+          for (let i = 0; i < 40 && !up; i++) {
+            try { const p = await client.command(box.id, { command: "echo ready", timeoutMs: 30_000 }); if ((p.stdout || "").includes("ready")) up = true; } catch { /* still booting */ }
+          }
+          if (!up) return json(502, { ok: false, message: "machine did not wake up for the upload" }), true;
+        }
+        await writeBoxFile(client, box.id, filePath, Buffer.from(body.contentB64, "base64"));
+        return json(200, { ok: true }), true;
       } finally {
         releaseHold();
       }
@@ -653,25 +674,29 @@ const server = http.createServer(async (req, res) => {
         send(receivedEvent);
         for await (const event of orchestrator.runTurn(turnInput)) {
           auditEvent(event as ConsumerTurnEvent, turnInput, requestId);
-          // Fire-and-forget desktop provisioning as soon as the box bills:
-          // GUI daemons die on archive, and the agent's first DISPLAY=:0
-          // command needs X up (~2s warm with the template-baked install).
-          const boxIdForDesktop = (event as any).boxId;
-          if ((event as ConsumerTurnEvent).type === "billing.start" && typeof boxIdForDesktop === "string") {
+          const ev = event as ConsumerTurnEvent;
+          const boxIdForDesktop = (ev as any).boxId;
+          // Two box-ready signals fire before the agent runs: billing.start (a
+          // COLD box's first bill) and the runtime.owner.selected trace (fires
+          // on EVERY box turn, incl. WARM reuse where billing.start is skipped).
+          // Upload attachments on whichever lands first, awaiting here so the
+          // turn suspends and the file is present before the agent looks. Only
+          // billing.start also (re)provisions the desktop.
+          const boxReady = typeof boxIdForDesktop === "string" &&
+            (ev.type === "billing.start" || (ev.type === "trace" && (ev as any).stage === "runtime.owner.selected"));
+          if (ev.type === "billing.start" && typeof boxIdForDesktop === "string") {
             void fsBoxClient(credentials).desktopStreamUrl(boxIdForDesktop, { theme: "light", publicAccess: true }).catch(() => undefined);
-            send(event as ConsumerTurnEvent);
-            // Upload attachments NOW, before yielding back to the generator (which
-            // then runs the agent). Awaiting here suspends the turn, so the file
-            // is guaranteed present under attachments/ before the agent looks.
+          }
+          if (boxReady) {
+            send(ev);
             if (attachments.length && !attachmentsUploaded) {
               attachmentsUploaded = true;
               const client = fsBoxClient(credentials);
-              const hold = orchestrator.holdUserBox(turnInput.userId, "upload", 120_000);
+              const hold = orchestrator.holdUserBox(turnInput.userId, "upload", 300_000);
               try {
-                // billing.start fires the instant the box bills, but its
-                // filesystem may not be mounted yet — a files-API PUT can return
-                // 200 without persisting. A command BLOCKS until the box truly
-                // executes, so use one as a readiness gate before any write.
+                // The box may bill before its filesystem is mounted — a files-API
+                // PUT can 200 without persisting. A command BLOCKS until the box
+                // truly executes, so use one as a readiness gate before any write.
                 for (let i = 0; i < 12; i++) {
                   try {
                     const probe = await client.command(boxIdForDesktop, { command: "echo ready", timeoutMs: 30_000 });
@@ -693,7 +718,7 @@ const server = http.createServer(async (req, res) => {
             }
             continue;
           }
-          send(event as ConsumerTurnEvent);
+          send(ev);
         }
         send({ type: "stream.end" });
       } catch (e) {
@@ -766,11 +791,13 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .fsPanel{align-self:center;height:min(78dvh,760px)}.app{height:calc(100dvh/var(--z));min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e0e0e0;border-right:1px solid #e0e0e0}
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e0e0e0;padding:calc(14px + env(safe-area-inset-top)) 16px 14px;display:grid;gap:12px}
 .counters{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}.counter{border:0;background:#f6f6f6;padding:11px 12px;min-width:0;border-radius:10px}.label{display:block;color:#555;letter-spacing:.01em;font-size:12px;font-weight:400}.value{display:block;margin-top:3px;font:400 21px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.state{border:0;background:transparent;color:#9a9a9a;padding:1px 2px;font-size:11px;font-weight:400;text-align:center;letter-spacing:.02em;display:flex;align-items:center;justify-content:center;gap:7px}.state:before{content:"";width:6px;height:6px;border-radius:50%;background:#cdcdcd;flex:0 0 auto;transition:background .3s ease}body[data-busy="1"] .state:before{background:#f4b93e}body[data-billing="1"] .state:before{background:#fc4b55;box-shadow:0 0 0 3px rgba(252,75,85,.16)}
-.composerBar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:9px 16px calc(11px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #f0f0f0}.composerBar button,.composerBar .traceToggle{min-height:32px;background:#fff;color:#6a6a6a;border:1px solid #e6e6e6;padding:0 11px;font-weight:400;font-size:11px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border-radius:8px;transition:border-color .15s ease,color .15s ease}.composerBar button:hover,.composerBar .traceToggle:hover{border-color:#c9c9c9;color:#111}.traceToggle{cursor:pointer}.traceToggle input{accent-color:#111}.iconButton{width:36px;justify-content:center;padding:0!important;font-size:16px}.iconButton svg{width:16px;height:16px;display:block}.composerBar .iconButton{width:32px;font-size:14px;margin-left:auto}.settingsBackdrop{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:18px}.settingsBackdrop.open{display:flex}.settingsDialog{width:min(560px,100%);max-height:calc(92dvh/var(--z));overflow:auto;background:#fff;border:1px solid #111;padding:18px;color:#111;border-radius:16px}.settingsHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.settingsHead h2{margin:0;font-size:20px;font-weight:400;letter-spacing:-.02em}.settingsHead p{margin:4px 0 0;color:#555;font-size:12px}.settingsDialog label{display:grid;gap:5px;margin-top:10px;font-size:12px;color:#555}.settingsDialog input,.settingsDialog select{width:100%;border:1px solid #d9d9d9;background:#fff;color:#111;min-height:38px;padding:8px 10px;font:inherit;font-size:13px;border-radius:9px}.settingsDialog input:focus,.settingsDialog select:focus{outline:none;border-color:#111}.settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.settingsNote{margin-top:12px;border:1px solid #e0e0e0;background:#f6f6f6;padding:10px 12px;font-size:12px;color:#333;border-radius:8px}.settingsActions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.settingsActions button.secondary{background:#fff;color:#111;border:1px solid #d9d9d9}.settingsStatus{font-size:12px;color:#555;margin-top:8px}.dangerText{color:#9f1239}.okText{color:#166534}
+.composerBar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:9px 16px calc(11px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #f0f0f0}.composerBar button,.composerBar .traceToggle{min-height:32px;background:#fff;color:#6a6a6a;border:1px solid #e6e6e6;padding:0 11px;font-weight:400;font-size:11px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border-radius:8px;transition:border-color .15s ease,color .15s ease}.composerBar button:hover,.composerBar .traceToggle:hover{border-color:#c9c9c9;color:#111}.traceToggle{cursor:pointer}.traceToggle input{accent-color:#111}.iconButton{width:36px;display:inline-flex;align-items:center;justify-content:center;padding:0!important;font-size:16px}.iconButton svg{width:16px;height:16px;display:block}.composerBar .iconButton{width:32px;font-size:14px;margin-left:auto}.settingsBackdrop{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:18px}.settingsBackdrop.open{display:flex}.settingsDialog{width:min(560px,100%);max-height:calc(92dvh/var(--z));overflow:auto;background:#fff;border:1px solid #111;padding:18px;color:#111;border-radius:16px}.settingsHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.settingsHead h2{margin:0;font-size:20px;font-weight:400;letter-spacing:-.02em}.settingsHead p{margin:4px 0 0;color:#555;font-size:12px}.settingsDialog label{display:grid;gap:5px;margin-top:10px;font-size:12px;color:#555}.settingsDialog input,.settingsDialog select{width:100%;border:1px solid #d9d9d9;background:#fff;color:#111;min-height:38px;padding:8px 10px;font:inherit;font-size:13px;border-radius:9px}.settingsDialog input:focus,.settingsDialog select:focus{outline:none;border-color:#111}.settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.settingsNote{margin-top:12px;border:1px solid #e0e0e0;background:#f6f6f6;padding:10px 12px;font-size:12px;color:#333;border-radius:8px}.settingsActions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.settingsActions button.secondary{background:#fff;color:#111;border:1px solid #d9d9d9}.settingsStatus{font-size:12px;color:#555;margin-top:8px}.dangerText{color:#9f1239}.okText{color:#166534}
 .chat{flex:1;overflow:auto;padding:18px 16px 20px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}.empty{margin:auto;color:#555;text-align:center;font-size:14px;max-width:280px}.msg{max-width:86%;padding:11px 13px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;font-weight:400;border:1px solid transparent;border-radius:14px}.msg.user{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:5px}.msg.assistant{align-self:flex-start;background:#f6f6f6;color:#111;border-color:#e0e0e0;border-bottom-left-radius:5px}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed #d9d9d9;color:#555;font-size:12px;max-width:92%;padding:8px 10px;border-radius:10px}.msg .body code{background:rgba(0,0,0,.08);padding:1px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}.msg.user .body code{background:rgba(255,255,255,.18)}.msg .body pre{background:#101418;color:#e6edf3;padding:10px 12px;border-radius:5px;overflow-x:auto;margin:6px 0;white-space:pre}.msg .body pre code{background:none;padding:0;color:inherit}.msg .body .mdh{display:inline-block;font-size:1.05em}.msg .body .mdli{display:inline-block;padding-left:16px;position:relative}.msg .body .mdli:before{content:'•';position:absolute;left:4px;color:#999}.msg .body a{color:inherit;text-decoration:underline}
 /* Attachment deck: fanned cards that fan out flat on hover; each card lifts and
    opens the file on click. */
-.attachDeck{display:flex;padding:8px 0 2px;min-height:0}
+.attachDeck{display:flex;padding:2px 2px 4px;min-height:0;max-width:86%}
+.attachDeck.deckRight{align-self:flex-end;justify-content:flex-end}
+.attachDeck.deckLeft{align-self:flex-start;justify-content:flex-start}
 .attachDeck .card{position:relative;width:76px;height:96px;border-radius:10px;background:#fff;border:1px solid #e2e2e2;overflow:hidden;flex:0 0 auto;cursor:pointer;transform-origin:bottom center;transition:transform .18s cubic-bezier(.4,0,.2,1),box-shadow .18s ease;box-shadow:0 1px 2px rgba(0,0,0,.06)}
 .attachDeck .card:not(:first-child){margin-left:-46px}
 .attachDeck .card:nth-child(odd){transform:rotate(-3deg)}
@@ -826,7 +853,7 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 /* Pending (unsent) attachments preview as the SAME fanned deck as sent ones. */
 .pendingAttach{margin:0 0 8px}.pendingAttach:empty{display:none}
 .pendingAttach .cardRemove{position:absolute;top:3px;right:3px;width:17px;height:17px;min-height:0;box-sizing:border-box;border-radius:50%;background:rgba(17,17,17,.7);color:#fff;font-size:12px;line-height:1;cursor:pointer;opacity:0;transition:opacity .12s ease;z-index:3;padding:0;display:flex;align-items:center;justify-content:center}
-.pendingAttach .card:hover .cardRemove{opacity:1}.pendingAttach .cardRemove:hover{background:#fc4b55}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer;border-radius:9px}button:disabled{opacity:.5;cursor:not-allowed}/* Concentric with the textarea's 16px corner: the corner arc's center sits 16px
+.pendingAttach .card:hover .cardRemove{opacity:1}.pendingAttach .cardRemove:hover{background:#fc4b55}.pendingAttach .cardRemove svg{width:10px;height:10px;display:block}button{min-height:42px;border:0;background:#111;color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer;border-radius:9px}button:disabled{opacity:.5;cursor:not-allowed}/* Concentric with the textarea's 16px corner: the corner arc's center sits 16px
    in from the right/bottom edges, so a circle centered there with r=13 keeps a
    uniform 3px gap to both straight edges AND the arc. Offsets = composer pad 16
    + corner R 16 - button r 13 = 19px. */
@@ -848,6 +875,7 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 <aside class="fsPanel" id="fsPanel" aria-label="files">
   <h2>Files <span class="fsStatus" id="fsStatus">…</span></h2>
   <div class="fsTreeMount" id="fsTree"></div>
+  <label class="fsHidden"><input type="checkbox" id="fsShowHidden"/> show hidden files</label>
 </aside>
 <main class="app">
   <header class="top" aria-label="machine summary">
@@ -901,7 +929,7 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
   <section class="settingsDialog">
     <div class="settingsHead">
       <div><h2 id="settingsTitle">Demo settings</h2><p>Choose harness/model and bring your own keys for public/dev previews.</p></div>
-      <button id="settingsClose" class="iconButton" type="button" aria-label="Close settings">×</button>
+      <button id="settingsClose" class="iconButton" type="button" aria-label="Close settings"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></svg></button>
     </div>
     <div class="settingsGrid">
       <label>Harness<select id="settingsHarness"></select></label>
@@ -1109,19 +1137,21 @@ const activeTurns=new Map();
 // working indicator, so overlapping turns (rapid <30s sends, interrupt semantics)
 // can't desync the graph or leave a stale indicator.
 let latestLocalId=null;
+let lastAgentMsgEl=null;
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg,files){clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});document.body.dataset.busy='1';
+async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});document.body.dataset.busy='1';
   const userEl=addMsg('user','',msg,'user:'+localId);
   let atts=[];
   if(files&&files.length){
     atts=await Promise.all(files.map(async f=>({name:f.name.replace(/[\\/\\\\]/g,'_'),b64:await readAsB64(f),bytes:new Uint8Array(await f.arrayBuffer())})));
-    renderAttachDeck(userEl,atts);
+    renderAttachDeck(userEl,atts,'right');
   }
-  // Tell the agent where the files landed so it can actually use them. The
-  // server writes them into attachments/ the instant the box bills, BEFORE the
-  // agent runs, so by the time the agent reads this note the files exist.
-  const sendMsg=atts.length?msg+'\\n\\n[Attached files, saved under attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
+  // Tell the agent where the files landed so it can use them. Voice messages
+  // skip the note: the transcript already IS the message, and naming an audio
+  // file only makes the shared model apologise about not "processing audio".
+  // Files still upload silently so they show in chat and the panel.
+  const sendMsg=(atts.length&&!opts.silent)?msg+'\\n\\n[Attached files, saved under attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
   const attachPayload=atts.map(a=>({name:a.name,contentB64:a.b64}));
   showWorking();setState('shared bridge starting · private Box boot requested');resetRouteForTurn();
   try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys(),attachments:attachPayload})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
@@ -1142,6 +1172,7 @@ const IMG_RE=/\\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
 const VID_RE=/\\.(mp4|m4v|mov|ogv)$/i;
 const AUD_RE=/\\.(mp3|wav|ogg|oga|m4a|aac|flac|opus|weba)$/i;
 const MIC_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M80,128V64a48,48,0,0,1,96,0v64a48,48,0,0,1-96,0Zm128,0a8,8,0,0,0-16,0,64,64,0,0,1-128,0,8,8,0,0,0-16,0,80.11,80.11,0,0,0,72,79.6V240a8,8,0,0,0,16,0V207.6A80.11,80.11,0,0,0,208,128Z"/></svg>';
+const X_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></svg>';
 function isAudioName(n){return AUD_RE.test(n)||/^voice-/i.test(n)||(/\\.webm$/i.test(n)&&/^voice-/i.test(n));}
 function fileExt(n){const p=(n.split('.').pop()||'').toLowerCase();return p.length>4?'file':p;}
 function readAsB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=()=>rej(new Error('read failed'));r.readAsDataURL(file);});}
@@ -1158,16 +1189,18 @@ function renderPending(){
     else if(isAudioName(f.name)){const e=document.createElement('div');e.className='cardIcon cardAudio';e.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(e);}
     else{const e=document.createElement('div');e.className='cardIcon';e.textContent=fileExt(f.name);card.appendChild(e);}
     const nm=document.createElement('div');nm.className='cardName';nm.textContent=f.name;card.appendChild(nm);
-    const x=document.createElement('button');x.type='button';x.className='cardRemove';x.textContent='×';x.title='remove';
+    const x=document.createElement('button');x.type='button';x.className='cardRemove';x.innerHTML=X_SVG;x.title='remove';
     x.addEventListener('click',ev=>{ev.stopPropagation();pendingFiles.splice(i,1);renderPending();});card.appendChild(x);
     card.addEventListener('click',async()=>{try{window.__optiboxFs.openBytes(f.name,new Uint8Array(await f.arrayBuffer()));}catch(_){}});
     c.appendChild(card);
   });
 }
 // Render the fanned deck inside a just-created user message bubble.
-function renderAttachDeck(el,atts){
-  const body=el.querySelector('.body');if(!body)return;
-  const deck=document.createElement('div');deck.className='attachDeck';
+// The deck sits ABOVE its message bubble as its own chat row (right-aligned for
+// the user, left for the agent), not inside the bubble.
+function renderAttachDeck(el,atts,side){
+  if(!el||!el.parentNode)return;
+  const deck=document.createElement('div');deck.className='attachDeck '+(side==='left'?'deckLeft':'deckRight');
   atts.forEach(a=>{
     const card=document.createElement('div');card.className='card';card.title=a.name;
     if(IMG_RE.test(a.name)){const img=document.createElement('img');img.src=URL.createObjectURL(new Blob([a.bytes]));card.appendChild(img);}
@@ -1178,7 +1211,39 @@ function renderAttachDeck(el,atts){
     card.addEventListener('click',()=>{try{window.__optiboxFs.openBytes(a.name,a.bytes);}catch(_){}});
     deck.appendChild(card);
   });
-  body.insertBefore(deck,body.firstChild);
+  el.parentNode.insertBefore(deck,el);
+}
+// Agent "attachments": files the agent MENTIONS in its reply. We pull
+// filename-ish tokens from its text and, for each that resolves to exactly one
+// file in the box tree, show a card above the agent bubble that opens it.
+const AGENT_FILE_EXT=/\\.(png|jpe?g|gif|webp|bmp|avif|svg|pdf|mp4|webm|m4v|mov|ogv|mp3|wav|ogg|oga|m4a|opus|csv|xlsx?|json|txt|md|py|js|ts|tsx|html?|css|zip|sqlite3?|db|docx?|pptx?)$/i;
+async function renderAgentAttachments(el){
+  if(!el||el.__deckDone||!el.parentNode)return;el.__deckDone=true;
+  const body=el.querySelector('.body');if(!body)return;
+  const raw=body.dataset.raw||body.textContent||'';
+  const re=/[A-Za-z0-9_./-]+\\.[A-Za-z0-9]{1,8}/g;const cands=[];const seen={};let m;
+  while((m=re.exec(raw))){let t=m[0].replace(/^[./]+/,'');if(!AGENT_FILE_EXT.test(t)||seen[t])continue;seen[t]=1;cands.push(t);}
+  if(!cands.length)return;
+  let tree;try{tree=await (await fetch('/api/fs/tree',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();}catch(_){return;}
+  const files=(tree.entries||[]).filter(e=>e.kind!=='directory'&&e.kind!=='d'&&e.kind!=='dir');
+  const hits=[];const hitSeen={};
+  for(const c of cands){
+    const base=c.split('/').pop();
+    const paths=[...new Set(files.filter(e=>{const p=e.path;return p===c||p.endsWith('/'+c)||p===base||p.endsWith('/'+base)||p.split('/').pop()===base;}).map(e=>e.path))];
+    if(paths.length===1&&!hitSeen[paths[0]]){hitSeen[paths[0]]=1;hits.push(paths[0]);}
+  }
+  if(!hits.length)return;
+  const deck=document.createElement('div');deck.className='attachDeck deckLeft';
+  hits.forEach(path=>{
+    const name=path.split('/').pop();
+    const card=document.createElement('div');card.className='card';card.title=path;
+    if(isAudioName(name)){const ic=document.createElement('div');ic.className='cardIcon cardAudio';ic.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(ic);}
+    else{const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(name);card.appendChild(ic);}
+    const nm=document.createElement('div');nm.className='cardName';nm.textContent=name;card.appendChild(nm);
+    card.addEventListener('click',()=>{try{if(window.__optiboxFs&&window.__optiboxFs.openPath)window.__optiboxFs.openPath(path);}catch(_){}});
+    deck.appendChild(card);
+  });
+  el.parentNode.insertBefore(deck,el);
 }
 function submitComposer(source){
   const text=msgEl.value.trim();
@@ -1304,9 +1369,15 @@ function endRecUI(){composer.classList.remove('recording');$('recTime').textCont
 function trashRecording(){if(mediaRec){mediaRec.ondataavailable=null;mediaRec.onstop=null;if(mediaRec.state!=='inactive')try{mediaRec.stop();}catch(_){}}mediaRec=null;recChunks=[];stopRecTracks();endRecUI();}
 async function finishRecording(){
   if(!mediaRec)return;const rec=mediaRec;mediaRec=null;
-  const blob=await new Promise(resolve=>{rec.onstop=()=>resolve(new Blob(recChunks,{type:recMime}));if(rec.state!=='inactive'){try{rec.stop();}catch(_){resolve(new Blob(recChunks,{type:recMime}));}}else resolve(new Blob(recChunks,{type:recMime}));});
+  // Force a final chunk out before stopping (short clips can otherwise flush
+  // nothing and produce a 0-byte file), then assemble once onstop fires.
+  const blob=await new Promise(resolve=>{
+    rec.onstop=()=>resolve(new Blob(recChunks,{type:recMime}));
+    try{if(rec.state==='paused'&&rec.resume)rec.resume();if(rec.state!=='inactive'&&rec.requestData)rec.requestData();}catch(_){}
+    if(rec.state!=='inactive'){try{rec.stop();}catch(_){resolve(new Blob(recChunks,{type:recMime}));}}else resolve(new Blob(recChunks,{type:recMime}));
+  });
   stopRecTracks();endRecUI();
-  if(!blob||!blob.size)return;
+  if(!blob||!blob.size){addMsg('assistant','error','Voice recording was empty — no audio was captured. Try the mic-device picker in the recorder to select a working input.');return;}
   const ext=recMime.indexOf('mp4')>=0?'m4a':recMime.indexOf('ogg')>=0?'ogg':'webm';
   const file=new File([blob],'voice-'+Date.now()+'.'+ext,{type:recMime});
   addMsg('trace','voice','transcribing voice message…\\n');
@@ -1318,7 +1389,7 @@ async function finishRecording(){
     if(!j.ok)throw new Error(j.message||'transcription failed');
     text=(j.text||'').trim();
   }catch(e){addMsg('assistant','error','Could not transcribe voice message: '+String(e&&e.message||e));return;}
-  runTurn(text||'(voice message)',[file]);
+  runTurn(text||'(voice message)',[file],{silent:true});
 }
 $('mic').addEventListener('click',startRecording);
 $('recTrash').addEventListener('click',trashRecording);
@@ -1349,10 +1420,10 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='runtime.proof'){addMsg('trace','proof · no Box prompt/API','boxPromptApiUsed='+ev.boxPromptApiUsed+' · boxBuiltInAgentUsed='+ev.boxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\\n',keyFor(ev,localId,'proof'));}
   else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine; stdout/SSE relays native chunks as emitted.',keyFor(ev,localId,'exec'));}
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');if(isDesktopCommand(ev.command)){if(ev.phase==='tool_use'&&localId===latestLocalId)ensureDesktopWidget(localId);}else{addToolEvent(ev,localId);}}
-  else if(ev.type==='user-box.delta'){addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
+  else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
   else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
-  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');}
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);lastAgentMsgEl=null;}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};}};

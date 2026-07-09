@@ -13,7 +13,9 @@ let fsLive = false;
 let fsState = "none";
 let refreshTimer = null;
 let refreshing = false;
+let showHidden = false;
 const uploading = new Set();
+const isHiddenPath = (p) => p.split("/").some((seg) => seg.startsWith("."));
 
 function ctx() {
   const c = window.__optiboxFs && window.__optiboxFs.ctx ? window.__optiboxFs.ctx() : {};
@@ -64,6 +66,17 @@ async function init() {
   panel.addEventListener("dragover", onDragOver);
   panel.addEventListener("dragleave", () => panel.classList.remove("fsDrop"));
   panel.addEventListener("drop", onDrop);
+  const hc = $("fsShowHidden");
+  if (hc) {
+    try { showHidden = localStorage.getItem("optibox.fsShowHidden") === "1"; } catch {}
+    hc.checked = showHidden;
+    hc.addEventListener("change", () => {
+      showHidden = hc.checked;
+      try { localStorage.setItem("optibox.fsShowHidden", showHidden ? "1" : "0"); } catch {}
+      treePaths = []; // force a re-render with the new filter
+      refreshNow().catch(() => {});
+    });
+  }
 }
 
 /** Refresh that waits out an in-flight poll instead of silently skipping. */
@@ -85,7 +98,10 @@ async function refresh(first) {
     );
     const entries = data.entries || [];
     entryByPath = new Map(entries.map((e) => [e.path, e]));
-    const paths = entries.map((e) => (e.kind === "dir" ? e.path + "/" : e.path)).filter((p) => p && p !== "/");
+    const paths = entries
+      .map((e) => (e.kind === "dir" ? e.path + "/" : e.path))
+      .filter((p) => p && p !== "/")
+      .filter((p) => showHidden || !isHiddenPath(p));
     const changed = paths.length !== treePaths.length || paths.some((p, i) => p !== treePaths[i]);
     if (changed || first) {
       treePaths = paths;
@@ -144,9 +160,8 @@ function renderTree(paths) {
 
 function onDragOver(e) {
   if (!e.dataTransfer || ![...e.dataTransfer.types].includes("Files")) return;
-  // Machine off -> snapshots are read-only: refuse the drop outright (no
-  // preventDefault means the browser shows the blocked cursor).
-  if (!fsLive) { panel.classList.remove("fsDrop"); return; }
+  // Accept the drop even when the machine is off — dropping wakes it and
+  // finishes the upload once it's live (the server boots it for the write).
   e.preventDefault();
   e.dataTransfer.dropEffect = "copy";
   panel.classList.add("fsDrop");
@@ -181,10 +196,7 @@ async function onDrop(e) {
   // as soon as this handler yields, so anything read after an await is empty.
   const files = Array.from(e.dataTransfer.files);
   const dir = dropTargetDir(e);
-  // fsLive can be stale; re-check before the optimistic row so a just-stopped
-  // machine rejects cleanly instead of flashing a row.
-  try { await refreshNow(); } catch {}
-  if (!fsLive) { setStatus("machine is off — uploads need a running machine"); return; }
+  if (!fsLive) setStatus("waking machine to upload…");
   for (const file of files) {
     const dest = (dir ? dir + "/" : "") + file.name;
     uploading.add(dest);
@@ -225,7 +237,7 @@ function ensureDialog() {
   dialog.className = "fsViewerBackdrop";
   dialog.innerHTML =
     '<div class="fsViewer" role="dialog" aria-modal="true">' +
-    '<div class="fsViewerHead"><span class="fsViewerTitle"></span><button class="fsViewerClose" aria-label="Close">×</button></div>' +
+    '<div class="fsViewerHead"><span class="fsViewerTitle"></span><button class="fsViewerClose" aria-label="Close"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></svg></button></div>' +
     '<div class="fsViewerBody"></div>' +
     '<button class="fsViewerSave" title="Save (Ctrl+S)">save</button>' +
     "</div>";
@@ -691,6 +703,7 @@ async function showText(path, name, text, canSave) {
 (function () {
   const host = (window.__optiboxFs = window.__optiboxFs || {});
   host.openBytes = openBytes;
+  host.openPath = (path) => openViewer(path);
   host.uploadAttachment = async function (name, b64) {
     const dest = "attachments/" + name.replace(/[/\\]/g, "_");
     await api("/api/fs/write", { path: dest, contentB64: b64 });

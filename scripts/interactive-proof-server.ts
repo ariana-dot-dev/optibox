@@ -1049,20 +1049,23 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .path{position:relative;height:30px;display:flex;align-items:center;justify-content:center}.path .arrow{position:absolute;top:-1px;bottom:-1px;left:50%;width:2px;background:#e0e0e0;transform:translateX(-50%)}.path .arrow:after{content:"";position:absolute;left:50%;bottom:3px;width:6px;height:6px;border-right:2px solid #e0e0e0;border-bottom:2px solid #e0e0e0;transform:translateX(-50%) rotate(45deg)}.path .pathLabel{position:relative;z-index:1;background:#fff;padding:0 8px;color:#a6a6a6;font-size:10.5px;letter-spacing:.02em}
 .packet{position:absolute;left:0;top:0;z-index:3;line-height:1;transform:translate(-50%,-50%);opacity:0;transition:top .45s cubic-bezier(.5,0,.2,1),left .45s cubic-bezier(.5,0,.2,1),opacity .25s ease;pointer-events:none;color:#111;background:#fff;border:1px solid #e0e0e0;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center}.packet svg{width:14px;height:14px;display:block}.packet[data-kind="ok"]{color:#1a7f37;border-color:#1a7f37}.packet[data-kind="warn"]{color:#b54708;border-color:#b54708}
 .routeCaption{margin-top:14px;min-height:15px;font-size:11px;font-weight:400;color:#a0a0a0;line-height:1.4}.schematic[data-route="error"] .routeCaption{color:#9f1239}
-/* Mobile: the three panes become a full-screen horizontal pager — Backend |
-   Chat | Files — with Chat as home (page 1). mobile.js moves the strip 1:1
-   with the finger via --dragx and commits --page on release. Zoom returns to 1
-   so 100vw/100dvh are real screen units, and every pane clips its own
-   horizontal overflow so nothing can scroll the page sideways under the pager. */
+/* Mobile: the three panes become a full-screen VERTICAL pager — Backend (top),
+   Chat (home, middle), Files (bottom). It's a native CSS scroll-snap column, so
+   a swipe up/down reveals the neighbour as you drag and snaps on release, with
+   real momentum and no fight with the browser's left-edge back gesture (which a
+   horizontal pager collided with). The chat scrolls its own history first; at
+   the top/bottom the scroll chains out to the pager and snaps to Backend/Files.
+   mobile.js only sets Chat as the start page and lights the position dots. */
 .mobileDots{display:none}
 @media(max-width:900px){
 html{zoom:1;--z:1}
 body{overflow:hidden;overscroll-behavior:none}
-.shell{display:flex;max-width:none;width:100vw;height:100dvh;padding:0;gap:0;touch-action:pan-y;will-change:transform;transform:translate3d(calc(var(--page,1)*-100vw + var(--dragx,0px)),0,0)}
-.shell.pageSnap{transition:transform .3s cubic-bezier(.22,.61,.36,1)}
-.shell>.fsPanel,.shell>.app,.shell>.schematic{flex:0 0 100vw;width:100vw;min-width:0;max-width:none;height:100dvh;margin:0;align-self:stretch;border:0;border-radius:0;overflow-x:clip}
-.shell>.schematic{order:-1;display:flex;flex-direction:column;justify-content:center;padding:20px 16px}
-.shell>.fsPanel{order:1;padding:calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom))}
+.shell{display:flex;flex-direction:column;max-width:none;width:100vw;height:100dvh;padding:0;gap:0;overflow-y:scroll;overflow-x:hidden;scroll-snap-type:y mandatory;-webkit-overflow-scrolling:touch;overscroll-behavior:none;touch-action:pan-y;scrollbar-width:none}
+.shell::-webkit-scrollbar{display:none}
+.shell>.fsPanel,.shell>.app,.shell>.schematic{flex:0 0 100dvh;width:100vw;min-width:0;max-width:none;height:100dvh;margin:0;align-self:stretch;border:0;border-radius:0;overflow-x:clip;scroll-snap-align:start;scroll-snap-stop:always}
+.shell>.schematic{order:0;display:flex;flex-direction:column;justify-content:center;padding:20px 16px}
+.shell>.app{order:1}
+.shell>.fsPanel{order:2;padding:calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom))}
 /* Mobile type + spacing: the base sizes are tuned for the desktop 1.15 zoom;
    with zoom reset to 1 they read oversized on a phone, so step them down and
    tighten padding to phone proportions. */
@@ -1079,9 +1082,9 @@ textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px inpu
 .schematic h2{font-size:18px;margin-bottom:14px}
 .node .nodeTitle{font-size:13.5px}.node .nodeSub{font-size:11px}
 .composerBar{padding-bottom:calc(11px + env(safe-area-inset-bottom))}
-.mobileDots{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(6px + env(safe-area-inset-bottom));display:flex;gap:6px;z-index:15;pointer-events:none}
-.mobileDots span{width:6px;height:6px;border-radius:50%;background:#d4d4d4;transition:background .25s ease,transform .25s ease}
-.mobileDots span.on{background:#111;transform:scale(1.25)}
+.mobileDots{position:fixed;right:calc(7px + env(safe-area-inset-right));top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:7px;z-index:15;pointer-events:none}
+.mobileDots span{width:6px;height:6px;border-radius:50%;background:#c9c9c9;transition:background .25s ease,transform .25s ease}
+.mobileDots span.on{background:#111;transform:scale(1.3)}
 }
 /* The former ≤520px block folded into the ≤900px mobile pager rules above so a
    single source of truth sets phone type/spacing (it was overriding them here). */

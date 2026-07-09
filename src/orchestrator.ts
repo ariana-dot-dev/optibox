@@ -41,7 +41,7 @@ export type ConsumerTurnEventBody =
   | { type: "lifecycle"; state: string; boxId: string; note?: string }
   | {
       type: "autostop.timer";
-      phase: "started" | "tick" | "canceled" | "stopping";
+      phase: "started" | "tick" | "canceled" | "stopping" | "held";
       boxId?: string | undefined;
       remainingMs: number;
       deadlineEpochMs?: number;
@@ -1753,6 +1753,7 @@ export class ConsumerBoxAgentOrchestrator {
       // leaving a hidden stop tail.
       let lastWholeSecond = Math.ceil(delayMs / 1000);
       let heldNoted = false;
+      let lastHeldEmit = 0;
       while (true) {
         const blockers = this.idleStopBlockers(key, turnSequence);
         // Keep-alive holds (typing, attachment uploads, desktop stream) are the
@@ -1774,12 +1775,20 @@ export class ConsumerBoxAgentOrchestrator {
         }
         if (holdOnly) {
           deadlineEpochMs = Date.now() + delayMs;
-          if (!heldNoted) {
+          // Emit a `held` tick on entering the hold AND re-emit ~once a second
+          // while it lasts. A single emission is not enough: the client's local
+          // countdown keeps ticking on its own between server events, so a paused
+          // countdown would visibly run to zero unless the server keeps
+          // reasserting "held". The `held` phase (distinct from `tick`) tells the
+          // client to FREEZE the display rather than resume ticking.
+          const now = Date.now();
+          if (!heldNoted || now - lastHeldEmit >= 1000) {
             heldNoted = true;
+            lastHeldEmit = now;
             lastWholeSecond = Math.ceil(delayMs / 1000);
             yield {
               type: "autostop.timer",
-              phase: "tick",
+              phase: "held",
               boxId,
               remainingMs: delayMs,
               deadlineEpochMs,

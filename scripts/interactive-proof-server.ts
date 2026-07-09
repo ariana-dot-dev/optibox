@@ -1222,7 +1222,7 @@ function fmtAutoStopRemaining(ms){return Math.max(0,Math.ceil(ms/1000))+'s';}
 function clearAutoStopTimer(label){autoStopDeadline=0;autoStopBoxId=null;if(autoStopInterval){clearInterval(autoStopInterval);autoStopInterval=null;}$('autoStopTimer').textContent=label||'idle';}
 function renderAutoStopTimer(){if(!autoStopDeadline){$('autoStopTimer').textContent='idle';return;}const remaining=Math.max(0,autoStopDeadline-Date.now());$('autoStopTimer').textContent=fmtAutoStopRemaining(remaining);if(remaining<=0&&autoStopInterval){clearInterval(autoStopInterval);autoStopInterval=null;}}
 function startAutoStopTimer(ev){autoStopDeadline=ev.deadlineEpochMs||(Date.now()+Math.max(0,ev.remainingMs||0));autoStopBoxId=ev.boxId||autoStopBoxId;renderAutoStopTimer();if(autoStopInterval)clearInterval(autoStopInterval);autoStopInterval=setInterval(renderAutoStopTimer,200);}
-function describeAutoStop(ev){const remaining=fmtAutoStopRemaining(ev.remainingMs||0);if(ev.phase==='started'||ev.phase==='tick')return 'Assistant done · user idle · Box auto-stops in '+remaining;if(ev.phase==='stopping')return 'Auto-stop countdown reached 0s · stopping Box now';if(ev.phase==='canceled')return 'Auto-stop timer reset · new message is using the Box';return ev.note||'Auto-stop timer updated';}
+function describeAutoStop(ev){const remaining=fmtAutoStopRemaining(ev.remainingMs||0);if(ev.phase==='started'||ev.phase==='tick')return 'Assistant done · user idle · Box auto-stops in '+remaining;if(ev.phase==='held')return 'Auto-stop paused · Box still needed (uploading / composing)';if(ev.phase==='stopping')return 'Auto-stop countdown reached 0s · stopping Box now';if(ev.phase==='canceled')return 'Auto-stop timer reset · new message is using the Box';return ev.note||'Auto-stop timer updated';}
 function boxLabel(id){return id&&id!=='pending'?' · '+id:'';}
 function resetRouteForTurn(){clearAutoStopTimer('paused');routeState.phase='accepted';routeState.boxId=null;routeState.billing=false;routeState.finalRoute=null;routeState.done=false;setRoute('shared','message accepted · checking Box state, opening the shared bridge');paintDiagram();}
 function routeIsPrivate(){return Boolean(routeState.boxId)||['billing','starting','provisioning','provisioned','cloning','resuming','ready','idle','running','handoff','runtime-proof','tools','user-box'].includes(routeState.phase);}
@@ -1385,8 +1385,13 @@ function applyRuntimeStatus(rt){
   const turnActiveClient=activeTurns.size>0;
   if(rt.billingSinceEpochMs){
     if(!billing)startBilling(rt.billingSinceEpochMs);
-    if(rt.activeTurn||turnActiveClient)return; // the live turn stream owns the display
+    // Holds ("still needed": typing, uploads, desktop) freeze the countdown even
+    // during a turn tail — checked BEFORE deferring to the live stream, because
+    // the stream goes silent while held and the client's local timer would
+    // otherwise free-run to zero. Freezing during active generation is a no-op
+    // (no countdown is shown then), so this is always safe.
     if(rt.holds&&rt.holds.length){clearAutoStopTimer('held');setState('private machine held · '+rt.holds.join(', '));return;}
+    if(rt.activeTurn||turnActiveClient)return; // the live turn stream owns the display
     if(rt.idleStopEtaEpochMs&&(!autoStopDeadline||Math.abs(autoStopDeadline-rt.idleStopEtaEpochMs)>2000)){
       startAutoStopTimer({deadlineEpochMs:rt.idleStopEtaEpochMs,boxId:rt.boxId});
       setState('private machine idle · auto-stop counting down');
@@ -1719,7 +1724,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');if(isDesktopCommand(ev.command)){if(ev.phase==='tool_use'&&localId===latestLocalId)ensureDesktopWidget(localId);}else{addToolEvent(ev,localId);}}
   else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
-  else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
+  else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
   else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);lastAgentMsgEl=null;}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);

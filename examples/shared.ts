@@ -211,6 +211,9 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "Files the user attaches or mentions — documents, PDFs, invoices, spreadsheets, images, audio, video, any path — LIVE on the private machine (e.g. /home/user, /home/user/attachments). Reading, opening, summarizing, or extracting from them is private-runtime work. NEVER say you 'don't have access to' or 'can't see' an attached/mentioned file, and NEVER assume it is absent — it is on the private machine you cannot see from here. For any such request your ENTIRE reply is just the short holding line."
       : undefined,
     !policy.toolsAllowed
+      ? "This applies to MEDIA exactly as much as text: the private machine can watch/play videos, view/analyze images, and listen to/transcribe audio. NEVER say you 'can't play', 'can't view', 'can't watch', 'can't open', or lack 'the ability to' handle a video/image/audio/PDF, and NEVER offer workarounds like 'describe it to me' or 'extract frames yourself'. Whenever the latest message references an attached or named file of ANY type, output ONLY the short holding line — nothing else."
+      : undefined,
+    !policy.toolsAllowed
       ? "For PUBLIC live data (weather, news, prices, current events) you DO have the webfetch tool: fetch a public source and answer directly. Never claim you cannot access live data. Known-good sources: weather https://wttr.in/<city>?format=3 ; general/topic news https://lite.duckduckgo.com/lite/?q=<query>+news ; world headlines https://feeds.bbci.co.uk/news/world/rss.xml . One or two fetches maximum, then answer with what you got."
       : undefined,
     policy.toolsAllowed && userCtx?.partialShared

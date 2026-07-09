@@ -14,7 +14,8 @@ let fsState = "none";
 let refreshTimer = null;
 let refreshing = false;
 let showHidden = false;
-const uploading = new Set();
+const uploading = new Set(); // writes in flight (show "uploading…")
+const settled = new Set();   // written OK but not yet in the server tree (state lag)
 const isHiddenPath = (p) => p.split("/").some((seg) => seg.startsWith("."));
 
 function ctx() {
@@ -102,6 +103,16 @@ async function refresh(first) {
       .map((e) => (e.kind === "dir" ? e.path + "/" : e.path))
       .filter((p) => p && p !== "/")
       .filter((p) => showHidden || !isHiddenPath(p));
+    // Keep in-flight AND just-finished uploads visible. A slow upload (e.g. one
+    // that first WAKES a parked machine, ~6s) would be wiped by a 4s poll; and
+    // right after a write the box state string can still lag as "archived", so
+    // the tree endpoint serves the snapshot (no file) for a few seconds. Both
+    // sets ride over that until the real tree confirms the file, then it drops
+    // from `settled`.
+    const serverSet = new Set(paths);
+    for (const dest of settled) if (serverSet.has(dest)) settled.delete(dest);
+    for (const dest of uploading) if (!serverSet.has(dest) && (showHidden || !isHiddenPath(dest))) paths.push(dest);
+    for (const dest of settled) if (!serverSet.has(dest) && (showHidden || !isHiddenPath(dest))) paths.push(dest);
     const changed = paths.length !== treePaths.length || paths.some((p, i) => p !== treePaths[i]);
     if (changed || first) {
       treePaths = paths;
@@ -207,8 +218,10 @@ async function onDrop(e) {
       try {
         const b64 = await fileToB64(file);
         await api("/api/fs/write", { path: dest, contentB64: b64 });
+        settled.add(dest); // hold it visible until the tree confirms it
       } catch (err) {
         setStatus("upload failed: " + err.message);
+        settled.delete(dest);
         try { tree && tree.remove(dest); } catch {}
       } finally {
         uploading.delete(dest);

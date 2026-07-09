@@ -29,6 +29,14 @@
   --trees-file-icon-color-default:#9a9a9a;
   --trees-font-family-override:inherit;
   --trees-font-size-override:12.5px;
+  /* The tree adds its OWN 16px inline padding on top of the panel's 16px, so
+     rows sat ~32px in while the "Files" title sits at 16px. Zero it so the tree
+     lines up with the title and uses the full width. */
+  --trees-padding-inline-override:0;
+  /* Draw the search focus ring INSIDE the input; otherwise the mount's
+     overflow:hidden (needed for the rounded corners) clips it at the edges. */
+  --trees-focus-ring-offset-override:-2px;
+  --trees-focus-ring-width-override:1px;
   --trees-border-radius-override:7px}
 .fsEmpty{color:#9a9a9a;font-size:12px;padding:14px 10px}
 .fsHidden{display:flex;align-items:center;gap:7px;font-size:11px;color:#9a9a9a;cursor:pointer;user-select:none;flex:0 0 auto}

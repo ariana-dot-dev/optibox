@@ -216,8 +216,7 @@ async function onDrop(e) {
     try { tree && tree.add(dest); } catch { renderTree([...treePaths, dest]); }
     (async () => {
       try {
-        const b64 = await fileToB64(file);
-        await api("/api/fs/write", { path: dest, contentB64: b64 });
+        await uploadBinary(dest, file);
         settled.add(dest); // hold it visible until the tree confirms it
       } catch (err) {
         setStatus("upload failed: " + err.message);
@@ -238,6 +237,20 @@ function fileToB64(file) {
     r.onerror = () => reject(new Error("read failed"));
     r.readAsDataURL(file);
   });
+}
+
+// Raw-binary upload: streams the Blob straight to the server — no base64
+// inflation (which turned a 100MB video into a >128MB JSON body and got the
+// connection RESET instead of an error message).
+async function uploadBinary(dest, blob) {
+  const c = ctx();
+  const res = await fetch("/api/fs/upload?" + new URLSearchParams({ userId: c.userId, path: dest }), {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream", "x-fs-keys": JSON.stringify(c.apiKeys || {}) },
+    body: blob,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || json.ok === false) throw new Error(json.message || res.statusText);
 }
 
 // ---------------------------------------------------------------- viewer

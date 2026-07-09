@@ -202,14 +202,32 @@ function sse(res: http.ServerResponse) {
   return (event: unknown) => res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
+class BodyTooLargeError extends Error {
+  constructor(public limit: number, public got: number) {
+    super(`request body is ${Math.round(got / 1e6)}MB — limit is ${Math.round(limit / 1e6)}MB`);
+  }
+}
+
 function readBody(req: http.IncomingMessage, maxBytes = 1_000_000): Promise<any> {
   return new Promise((resolve, reject) => {
+    // Reject oversized bodies from the content-length header BEFORE reading:
+    // destroying the socket mid-body surfaces in the browser as a bare
+    // net::ERR_CONNECTION_RESET with no message and nothing in our logs. A
+    // typed rejection lets the route answer 413 with a real explanation.
+    const declared = Number(req.headers["content-length"] ?? 0);
+    if (declared > maxBytes) {
+      req.resume(); // drain so the client can read our response
+      return reject(new BodyTooLargeError(maxBytes, declared));
+    }
     let raw = "";
+    let overflow = false;
     req.on("data", (c) => {
+      if (overflow) return;
       raw += c;
-      if (raw.length > maxBytes) req.destroy(new Error("body too large"));
+      if (raw.length > maxBytes) { overflow = true; raw = ""; }
     });
     req.on("end", () => {
+      if (overflow) return reject(new BodyTooLargeError(maxBytes, maxBytes + 1));
       try {
         resolve(raw ? JSON.parse(raw) : {});
       } catch (e) {
@@ -218,6 +236,36 @@ function readBody(req: http.IncomingMessage, maxBytes = 1_000_000): Promise<any>
     });
     req.on("error", reject);
   });
+}
+
+/** Collect a raw binary request body into a Buffer (no base64/JSON overhead). */
+function readBinaryBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers["content-length"] ?? 0);
+    if (declared > maxBytes) {
+      req.resume();
+      return reject(new BodyTooLargeError(maxBytes, declared));
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let overflow = false;
+    req.on("data", (c: Buffer) => {
+      if (overflow) return;
+      total += c.length;
+      if (total > maxBytes) { overflow = true; chunks.length = 0; return; }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (overflow) return reject(new BodyTooLargeError(maxBytes, total));
+      resolve(Buffer.concat(chunks));
+    });
+    req.on("error", reject);
+  });
+}
+
+/** Runtime log line for every fs request — stdout lands in the server log. */
+function fsLog(fields: Record<string, unknown>): void {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), audit: "fs", ...fields }));
 }
 
 function redactAuditValue(value: unknown): unknown {
@@ -328,6 +376,46 @@ async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: stri
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+/**
+ * Write bytes into the user's box, waking it first if parked. The one write
+ * path shared by the JSON (base64) route and the raw-binary upload route.
+ * Logs every attempt — uploads failing silently is how we ended up debugging
+ * a browser ERR_CONNECTION_RESET with an empty server log.
+ */
+async function fsWriteIntoBox(credentials: DemoCredentials, userId: string, filePath: string, bytes: Buffer): Promise<{ status: number; payload: { ok: boolean; message?: string } }> {
+  const t0 = Date.now();
+  const done = (status: number, payload: { ok: boolean; message?: string }) => {
+    fsLog({ route: "write", userId, path: filePath, bytes: bytes.length, ms: Date.now() - t0, status, ...(payload.message ? { message: payload.message } : {}) });
+    return { status, payload };
+  };
+  try {
+    const { box, live } = await fsResolveBox(credentials, userId);
+    const client = fsBoxClient(credentials);
+    if (!box) return done(409, { ok: false, message: "no machine yet — send a message first" });
+    // Keep the box up for the duration of the upload: the hold cancels a
+    // running auto-stop countdown and the reaper skips held boxes.
+    const releaseHold = orchestratorFor(credentials).holdUserBox(userId, "upload", 300_000);
+    try {
+      // Machine off? Boot it and wait until it actually executes a command,
+      // so a drop while parked just wakes the box and completes the upload.
+      if (!live) {
+        try { await client.resume(box.id); } catch { /* may already be resuming */ }
+        let up = false;
+        for (let i = 0; i < 40 && !up; i++) {
+          try { const p = await client.command(box.id, { command: "echo ready", timeoutMs: 30_000 }); if ((p.stdout || "").includes("ready")) up = true; } catch { /* still booting */ }
+        }
+        if (!up) return done(502, { ok: false, message: "machine did not wake up for the upload" });
+      }
+      await writeBoxFile(client, box.id, filePath, bytes);
+      return done(200, { ok: true });
+    } finally {
+      releaseHold();
+    }
+  } catch (e) {
+    return done(502, { ok: false, message: e instanceof Error ? e.message : String(e) });
+  }
 }
 
 async function fsResolveBox(credentials: DemoCredentials, userId: string): Promise<{ box?: { id: string; state: string }; live: boolean }> {
@@ -486,26 +574,8 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
 
     if (pathname === "/api/fs/write") {
       if (!filePath || typeof body.contentB64 !== "string") return json(400, { ok: false, message: "path and contentB64 required" }), true;
-      if (!box) return json(409, { ok: false, message: "no machine yet — send a message first" }), true;
-      // Keep the box up for the duration of the upload: the hold cancels a
-      // running auto-stop countdown and the reaper skips held boxes.
-      const releaseHold = orchestratorFor(credentials).holdUserBox(userId, "upload", 300_000);
-      try {
-        // Machine off? Boot it and wait until it actually executes a command,
-        // so a drop while parked just wakes the box and completes the upload.
-        if (!live) {
-          try { await client.resume(box.id); } catch { /* may already be resuming */ }
-          let up = false;
-          for (let i = 0; i < 40 && !up; i++) {
-            try { const p = await client.command(box.id, { command: "echo ready", timeoutMs: 30_000 }); if ((p.stdout || "").includes("ready")) up = true; } catch { /* still booting */ }
-          }
-          if (!up) return json(502, { ok: false, message: "machine did not wake up for the upload" }), true;
-        }
-        await writeBoxFile(client, box.id, filePath, Buffer.from(body.contentB64, "base64"));
-        return json(200, { ok: true }), true;
-      } finally {
-        releaseHold();
-      }
+      const r = await fsWriteIntoBox(credentials, userId, filePath, Buffer.from(body.contentB64, "base64"));
+      return json(r.status, r.payload), true;
     }
 
     return json(404, { ok: false, message: "unknown fs endpoint" }), true;
@@ -537,8 +607,27 @@ const server = http.createServer(async (req, res) => {
       return void res.end(readFileSync(asset.file, "utf8"));
     }
 
+    // Raw-binary upload: the panel/composer sends the file bytes directly
+    // (query: userId, path; header x-fs-keys for BYOK). No base64 inflation,
+    // no giant JSON.parse — this is the path for anything big.
+    if (req.method === "POST" && url.pathname === "/api/fs/upload") {
+      const userId = String(url.searchParams.get("userId") || "user-a");
+      const filePath = String(url.searchParams.get("path") || "").replace(/^\/+/, "");
+      let keys: unknown = {};
+      try { keys = JSON.parse(String(req.headers["x-fs-keys"] || "{}")); } catch { /* optional */ }
+      const credentials = credentialsFromBody({ apiKeys: keys });
+      if (!filePath) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ ok: false, message: "path query param required" }));
+      }
+      const bytes = await readBinaryBody(req, 400_000_000);
+      const r = await fsWriteIntoBox(credentials, userId, filePath, bytes);
+      res.writeHead(r.status, { "content-type": "application/json" });
+      return void res.end(JSON.stringify(r.payload));
+    }
+
     if (req.method === "POST" && url.pathname.startsWith("/api/fs/")) {
-      // Uploads carry base64 file bytes (4/3 inflation): allow ~96MB of file.
+      // Small JSON writes/reads only; big uploads go through /api/fs/upload.
       const body = await readBody(req, 128_000_000);
       await handleFsRoute(url.pathname, body, res);
       return;
@@ -786,12 +875,17 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "not found" }));
   } catch (e) {
-    res.writeHead(500, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: e instanceof Error ? (e.stack ?? e.message) : String(e),
-      }),
-    );
+    const tooLarge = e instanceof BodyTooLargeError;
+    fsLog({ route: req.url ?? "?", status: tooLarge ? 413 : 500, error: e instanceof Error ? e.message : String(e) });
+    if (!res.headersSent) {
+      res.writeHead(tooLarge ? 413 : 500, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        ok: false,
+        message: tooLarge ? e.message : e instanceof Error ? (e.stack ?? e.message) : String(e),
+      }));
+    } else {
+      res.end();
+    }
   }
 });
 
@@ -1203,7 +1297,7 @@ const X_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill=
 function isAudioName(n){return AUD_RE.test(n)||/^voice-/i.test(n)||(/\\.webm$/i.test(n)&&/^voice-/i.test(n));}
 function fileExt(n){const p=(n.split('.').pop()||'').toLowerCase();return p.length>4?'file':p;}
 function readAsB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=()=>rej(new Error('read failed'));r.readAsDataURL(file);});}
-function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)break;pendingFiles.push(f);}renderPending();}
+function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)break;if(f.size>150*1024*1024){addMsg('trace','attachment','"'+f.name+'" is over the 150MB message-attachment limit — drop it on the Files panel instead (larger uploads allowed there)\\n');continue;}pendingFiles.push(f);}renderPending();}
 function renderPending(){
   const c=$('pendingAttach');if(!c)return;c.innerHTML='';
   updateComposerMode();

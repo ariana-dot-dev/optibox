@@ -504,8 +504,12 @@ export class ConsumerBoxAgentOrchestrator {
     const expectedName =
       this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`;
     const boxes = await this.options.box.list().catch(() => []);
+    // "archiving" counts as reusable too: excluding it made a mid-archive box
+    // invisible here, so a turn arriving in that window created a FRESH box
+    // with the SAME name — observed in production as two boxes sharing one
+    // name, with every name-based lookup then flipping a coin.
     const reusable = boxes
-      .filter((box) => box.name === expectedName && (isReady(box.state) || box.state === "archived"))
+      .filter((box) => box.name === expectedName && (isReady(box.state) || box.state === "archived" || box.state === "archiving"))
       .sort((a, b) => {
         // Prefer a warm ready Box. Otherwise prefer the newest archived snapshot
         // over creating a fresh Box; this preserves the same user conversation
@@ -528,8 +532,11 @@ export class ConsumerBoxAgentOrchestrator {
       lastSeenAt: Date.now(),
     });
     let box = reusable;
-    if (box.state === "archived") {
+    if (box.state === "archiving" || box.state === "archived") {
       try {
+        // Mid-archive: let the snapshot finish, then resume — same pattern as
+        // the per-session path. Never fall through to a fresh same-named box.
+        if (box.state === "archiving") await this.waitUntilArchived(box.id, "adopt-archiving");
         await this.options.box.resume(box.id);
         onBootAck?.({ action: "adopt-resume-requested", box: await this.options.box.get(box.id).catch(() => box) });
         box = await this.waitUntilReady(box.id, "adopt-archived", this.options.resumeTimeoutMs);
@@ -2118,6 +2125,19 @@ export class ConsumerBoxAgentOrchestrator {
     return "";
   }
 
+  /**
+   * The box currently billing for a user, if any. This is the authoritative
+   * answer to "which machine is this user's agent on RIGHT NOW" — name-based
+   * lookups can be ambiguous (duplicate names have been observed after an
+   * archiving race), but the billing owner map cannot.
+   */
+  activeUserBoxId(userId: string): string | undefined {
+    for (const [boxId, owner] of this.boxOwners) {
+      if (owner.userId === userId && this.billing.has(boxId)) return boxId;
+    }
+    return undefined;
+  }
+
   private startBilling(boxId: string, owner?: { userId: string; conversationId: string }): { since: number; fresh: boolean } {
     let since = this.billing.get(boxId);
     const fresh = since === undefined;
@@ -2232,6 +2252,19 @@ export class ConsumerBoxAgentOrchestrator {
       };
       return;
     }
+    // Billing stops the moment the stop request is accepted — the ~1min the
+    // platform then spends snapshotting/archiving is not the user's time. This
+    // also freezes the UI's machine counter at the countdown's zero instead of
+    // letting it tick through the archive (which read as "it never stops").
+    const elapsedSeconds = since ? Math.max(0, (Date.now() - since) / 1000) : 0;
+    this.billing.delete(boxId);
+    yield {
+      type: "billing.stop",
+      boxId,
+      elapsedSeconds,
+      costUsd: elapsedSeconds * BOX_PRICE_USD_PER_SECOND,
+      note: "billing PAUSED — you pay $0 while the box is stopped",
+    };
     yield {
       type: "lifecycle",
       boxId,
@@ -2249,15 +2282,6 @@ export class ConsumerBoxAgentOrchestrator {
       boxId,
       state: final?.state ?? "archived",
       note: "archived — disk snapshot kept, resumes with no cold start",
-    };
-    const elapsedSeconds = since ? Math.max(0, (Date.now() - since) / 1000) : 0;
-    this.billing.delete(boxId);
-    yield {
-      type: "billing.stop",
-      boxId,
-      elapsedSeconds,
-      costUsd: elapsedSeconds * BOX_PRICE_USD_PER_SECOND,
-      note: "billing PAUSED — you pay $0 while the box is stopped",
     };
   }
 

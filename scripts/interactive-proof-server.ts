@@ -332,9 +332,33 @@ async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: stri
 
 async function fsResolveBox(credentials: DemoCredentials, userId: string): Promise<{ box?: { id: string; state: string }; live: boolean }> {
   const client = fsBoxClient(credentials);
+  // Authoritative first: the box the orchestrator is billing for this user
+  // RIGHT NOW. Name matching alone picked the wrong box when two boxes shared
+  // a name (archiving-race duplicate), showing a stale snapshot of a machine
+  // the agent wasn't even on.
+  const activeId = orchestratorFor(credentials).activeUserBoxId(userId);
+  if (activeId) {
+    const active = await client.get(activeId).catch(() => undefined);
+    if (active) {
+      const state = String((active as any).state ?? (active as any).status ?? "");
+      return { box: { id: active.id, state }, live: !["archived", "archiving", "stopped", "stopping"].includes(state) };
+    }
+  }
   const name = fsBoxName(credentials, userId);
   const boxes = await client.list();
-  const box = (boxes as any[]).find((b) => b.name === name);
+  // Fallback (idle machine): among name matches prefer a non-parked box, then
+  // the most recently updated — mirrors the orchestrator's own adoption sort.
+  const parked = ["archived", "archiving", "stopped", "stopping"];
+  const box = (boxes as any[])
+    .filter((b) => b.name === name)
+    .sort((a, b) => {
+      const ap = parked.includes(String(a.state ?? "")) ? 1 : 0;
+      const bp = parked.includes(String(b.state ?? "")) ? 1 : 0;
+      if (ap !== bp) return ap - bp;
+      const au = Date.parse(String(a.updatedAt ?? "")) || 0;
+      const bu = Date.parse(String(b.updatedAt ?? "")) || 0;
+      return bu - au;
+    })[0];
   if (!box) return { live: false };
   const state = String(box.state ?? box.status ?? "");
   // "live" here means "worth TRYING the live path": the state string lags the

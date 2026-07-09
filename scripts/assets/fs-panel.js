@@ -97,6 +97,10 @@ async function refresh(first) {
       fsState === "none" ? "no machine yet" : fsLive ? "live" : "snapshot" + (data.treeAvailable === false ? " (tree unavailable)" : ""),
       fsLive ? "live" : "",
     );
+    // Hand the authoritative runtime snapshot to the page: it reconciles the
+    // billing/cost/auto-stop counters from it every poll, so out-of-band wakes
+    // (typing, uploads) drive the SAME UI as turn-started machines.
+    try { if (window.__optiboxFs && window.__optiboxFs.onRuntime) window.__optiboxFs.onRuntime(data.runtime || null); } catch { /* page hook optional */ }
     const entries = data.entries || [];
     entryByPath = new Map(entries.map((e) => [e.path, e]));
     const paths = entries

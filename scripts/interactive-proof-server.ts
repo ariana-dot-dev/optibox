@@ -404,8 +404,8 @@ async function fsWriteIntoBox(credentials: DemoCredentials, userId: string, file
     try {
       // Machine off? Boot it and wait until it actually executes a command,
       // so a drop while parked just wakes the box and completes the upload.
-      // Guard it so the orphan sweep doesn't read the unbilled wake as a leak.
-      orchestratorFor(credentials).guardBox(box.id, 120_000);
+      // The wake registers real billing, so every counter and reaper sees it.
+      orchestratorFor(credentials).registerExternalWake(box.id, userId, "fs");
       if (!live) {
         try { await client.resume(box.id); } catch { /* may already be resuming */ }
         let up = false;
@@ -497,7 +497,11 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     const client = fsBoxClient(credentials);
 
     if (pathname === "/api/fs/tree") {
-      if (!box) return json(200, { ok: true, live: false, state: "none", entries: [] }), true;
+      // One coherent runtime snapshot rides every tree poll: the page
+      // reconciles ALL counters from it, so machines woken outside a turn
+      // (typing, uploads) are never invisible to the UI.
+      const runtime = orchestratorFor(credentials).userRuntimeStatus(userId);
+      if (!box) return json(200, { ok: true, live: false, state: "none", entries: [], runtime }), true;
       if (live) {
         // Try live even while the state string still says starting/resuming —
         // but with a hard 3.5s deadline: commands against a still-booting box
@@ -508,14 +512,14 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
             fsLiveTree(client, box.id),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error("live-tree deadline")), 3500)),
           ]);
-          return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries }), true;
+          return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries, runtime }), true;
         } catch { /* fall through to snapshot */ }
       }
       const snapshot = await client.latestSnapshot(box.id);
-      if (!snapshot) return json(200, { ok: true, live: false, state: box.state, boxId: box.id, entries: [] }), true;
+      if (!snapshot) return json(200, { ok: true, live: false, state: box.state, boxId: box.id, entries: [], runtime }), true;
       const tree = await client.snapshotTree(snapshot.id);
       return json(200, {
-        ok: true, live: false, state: box.state, boxId: box.id, snapshotId: snapshot.id,
+        ok: true, live: false, state: box.state, boxId: box.id, snapshotId: snapshot.id, runtime,
         treeAvailable: tree.treeAvailable, truncated: tree.truncated,
         entries: (tree.entries ?? []).map((e) => ({ ...e, path: e.path.replace(/^\//, "") })),
         ...(tree.reason ? { reason: tree.reason } : {}),
@@ -591,7 +595,9 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       composingHolds.get(userId)?.();
       composingHolds.set(userId, orchestratorFor(credentials).holdUserBox(userId, "composing", 15_000));
       if (box) {
-        orchestratorFor(credentials).guardBox(box.id, 90_000);
+        // Wake + bill through the one shared machinery: the counter, reaper
+        // and status endpoint all see this machine like a turn-started one.
+        orchestratorFor(credentials).registerExternalWake(box.id, userId, "composing");
         if (!live) {
           fsLog({ route: "activity", userId, note: "composing wake", boxId: box.id, state: box.state });
           void client.resume(box.id).catch(() => undefined);
@@ -1301,6 +1307,26 @@ function addToolEvent(ev,localId){let chain=currentToolChain;if(ev.phase==='tool
 chain=ensureToolChain(localId);const call={id:'tool-'+(++toolSeq),toolName:ev.toolName||'tool',command:ev.command||'',description:ev.description||'',stdout:ev.stdout||'',stderr:ev.stderr||'',isError:Boolean(ev.isError),state:toolStateFromEvent(ev),resultSeen:ev.phase==='tool_result'};chain.calls.push(call);renderToolChain(chain);return chain.el;}
 function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date.now();if(!timer)timer=setInterval(renderTotals,100);}document.body.dataset.billing='1';setState('private machine running · tools active · billing live');renderTotals();}
 function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;}if(timer){clearInterval(timer);timer=null;}delete document.body.dataset.billing;clearAutoStopTimer('stopped');setState('private machine stopped · billing paused');renderTotals();}
+// Reconcile ALL machine counters from the polled runtime snapshot (rides every
+// fs tree poll). This is the ground truth: a machine woken by typing or an
+// upload has no SSE stream, so without this the counter/cost/auto-stop UI
+// simply never learns it is running. SSE turn events still land first and
+// faster; this corrects drift and covers the streams that don't exist.
+function applyRuntimeStatus(rt){
+  if(!rt)return;
+  const turnActiveClient=activeTurns.size>0;
+  if(rt.billingSinceEpochMs){
+    if(!billing)startBilling(rt.billingSinceEpochMs);
+    if(rt.activeTurn||turnActiveClient)return; // the live turn stream owns the display
+    if(rt.holds&&rt.holds.length){clearAutoStopTimer('held');setState('private machine held · '+rt.holds.join(', '));return;}
+    if(rt.idleStopEtaEpochMs&&(!autoStopDeadline||Math.abs(autoStopDeadline-rt.idleStopEtaEpochMs)>2000)){
+      startAutoStopTimer({deadlineEpochMs:rt.idleStopEtaEpochMs,boxId:rt.boxId});
+      setState('private machine idle · auto-stop counting down');
+    }
+  }else if(billing&&!turnActiveClient){
+    stopBilling();
+  }
+}
 const activeTurns=new Map();
 // The most recently sent turn. Only its events drive the side diagram and the
 // working indicator, so overlapping turns (rapid <30s sends, interrupt semantics)
@@ -1629,7 +1655,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);lastAgentMsgEl=null;}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
-if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};}};
+if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};
 load();
 </script></body></html>`;
 }

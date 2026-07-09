@@ -229,10 +229,6 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly harnessSessions = new Map<string, string>();
   /** boxId -> the conversation that owns it, so the reaper can stop it by user/conversation. */
   private readonly boxOwners = new Map<string, { userId: string; conversationId: string; key: string }>();
-  /** boxId -> guarded-until epoch ms: boxes woken OUTSIDE a turn (typing,
-   * upload) run unbilled, which the orphan sweep reads as a leak — a guard
-   * marks them intentionally awake until it expires. */
-  private readonly boxWakeGuards = new Map<string, number>();
   /** key -> last time this conversation had any turn activity (submit or stream end). */
   private readonly lastActivityAt = new Map<string, number>();
   /** Background idle-box reaper handle (see OrchestratorOptions.idleReaperIntervalMs). */
@@ -323,13 +319,9 @@ export class ConsumerBoxAgentOrchestrator {
       // one-time background build (its own TTL is the leak backstop).
       if (this.options.userBoxTemplate && box.name === this.options.userBoxTemplate.name) continue;
       if (box.state === "archived" || box.state === "archiving" || box.state === "stopped") continue;
+      // External wakes (typing/upload) register billing via registerExternalWake,
+      // so a deliberately-woken box is never mistaken for an orphan here.
       if (this.billing.has(box.id)) { this.orphanSightings.delete(box.id); continue; }
-      // Deliberately-woken box (user typing / uploading before a turn bills it).
-      const guardUntil = this.boxWakeGuards.get(box.id);
-      if (guardUntil !== undefined) {
-        if (now < guardUntil) { this.orphanSightings.delete(box.id); continue; }
-        this.boxWakeGuards.delete(box.id);
-      }
       seenIds.add(box.id);
       const firstSeen = this.orphanSightings.get(box.id);
       if (firstSeen === undefined) { this.orphanSightings.set(box.id, now); continue; }
@@ -2173,11 +2165,61 @@ export class ConsumerBoxAgentOrchestrator {
     return undefined;
   }
 
-  /** Mark a box as deliberately awake outside a billed turn (typing/upload
-   * wake): the orphan sweep skips it until the guard expires. Rolling — call
-   * again to extend. */
-  guardBox(boxId: string, ttlMs: number): void {
-    this.boxWakeGuards.set(boxId, Date.now() + Math.max(1_000, Math.min(ttlMs, 10 * 60_000)));
+  /**
+   * A box woken OUTSIDE a turn (user typing, staged attachment upload) is a
+   * running machine like any other: register it with the SAME billing/owner
+   * machinery turns use, so every downstream system — the cost counter, the
+   * idle reaper, the orphan sweep, userRuntimeStatus — sees ONE truth instead
+   * of a side-channel wake it has to special-case. Idempotent per box.
+   */
+  registerExternalWake(boxId: string, userId: string, reason: string): void {
+    // Already billed (a turn owns it, or a previous wake registered it): never
+    // overwrite the owner — that would detach the running turn's status.
+    if (this.billing.has(boxId)) {
+      this.touchUserActivity(userId);
+      return;
+    }
+    const conversationId = `external-${reason}`;
+    const key = `${userId}:${conversationId}`;
+    this.startBilling(boxId, { userId, conversationId });
+    // Seed + bump the idle clock: touchUserActivity only bumps existing keys,
+    // and without an entry the reaper's `?? now` fallback never sees it idle.
+    this.lastActivityAt.set(key, Date.now());
+    this.touchUserActivity(userId);
+  }
+
+  /**
+   * One coherent runtime snapshot for a user's machine, whatever woke it: the
+   * demo UI polls this and reconciles every counter (billing, cost, auto-stop,
+   * state) from it, so a wake with no SSE stream attached is never invisible.
+   */
+  userRuntimeStatus(userId: string): {
+    boxId?: string;
+    billingSinceEpochMs: number | null;
+    holds: string[];
+    activeTurn: boolean;
+    idleStopEtaEpochMs: number | null;
+    idleStopMs: number;
+  } {
+    const holds = this.activeHoldReasons(userId);
+    let boxId: string | undefined;
+    let since: number | null = null;
+    let activeTurn = false;
+    let lastActivity = 0;
+    for (const [bId, owner] of this.boxOwners) {
+      if (owner.userId !== userId) continue;
+      const s = this.billing.get(bId);
+      if (s === undefined) continue;
+      boxId = bId;
+      since = since === null ? s : Math.min(since, s);
+      if (this.activeTurnCounts.has(owner.key) || this.activePrivateRound(owner.key) || this.userBoxStarts.has(owner.key)) activeTurn = true;
+      lastActivity = Math.max(lastActivity, this.lastActivityAt.get(owner.key) ?? 0);
+    }
+    const idleStopMs = this.options.autoStopIdleMs ?? 5000;
+    const idleStopEtaEpochMs = since !== null && !activeTurn && holds.length === 0
+      ? Math.max(Date.now(), (lastActivity || Date.now()) + idleStopMs)
+      : null;
+    return { ...(boxId ? { boxId } : {}), billingSinceEpochMs: since, holds, activeTurn, idleStopEtaEpochMs, idleStopMs };
   }
 
   private startBilling(boxId: string, owner?: { userId: string; conversationId: string }): { since: number; fresh: boolean } {

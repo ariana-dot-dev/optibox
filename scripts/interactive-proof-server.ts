@@ -1372,7 +1372,12 @@ async function attachDesktopStream(w){
   }
   var n2=w.el.querySelector('.desktopNote');if(n2)n2.textContent='desktop stream did not start';
 }
-function addMsg(cls,tag,text,key){if(cls!=='trace')currentToolChain=null;const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');const raw=stripHidden((body.dataset.raw||'')+text);body.dataset.raw=raw;body.textContent=raw;if(cls==='assistant'||cls==='user')body.innerHTML=md(raw);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;return el;}
+function addMsg(cls,tag,text,key){if(cls!=='trace')currentToolChain=null;const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');const raw=stripHidden((body.dataset.raw||'')+text);body.dataset.raw=raw;const shown=stripFileDecl(raw);body.textContent=shown;if(cls==='assistant'||cls==='user')body.innerHTML=md(shown);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;return el;}
+// The box agent declares files it created/modified in a trailing tag
+// <optibox-files>a, b</optibox-files> (see the FILE MANIFEST instruction). Strip
+// it from the visible chat (even a partial one mid-stream) and parse the names.
+function stripFileDecl(s){s=String(s);const i=s.indexOf('<optibox');return (i>=0?s.slice(0,i):s).trimEnd();}
+function parseFileDecl(s){s=String(s);const a=s.indexOf('<optibox-files');if(a<0)return [];const b=s.indexOf('>',a);if(b<0)return [];const c=s.indexOf('</optibox-files',b);const inner=c>=0?s.slice(b+1,c):s.slice(b+1);const out=[];const seen={};inner.split(',').forEach(function(x){let t=x.trim();while(t.charAt(0)==='.'||t.charAt(0)==='/')t=t.slice(1);if(t&&!seen[t]){seen[t]=1;out.push(t);}});return out;}
 const toolChains=[];
 let currentToolChain=null;
 let toolSeq=0;
@@ -1420,26 +1425,15 @@ const activeTurns=new Map();
 // can't desync the graph or leave a stale indicator.
 let latestLocalId=null;
 let lastAgentMsgEl=null;
-// Snapshot of the box filesystem taken the moment a turn starts, so turn.done
-// can tell which files the AGENT created/modified during it (see
-// renderAgentAttachments). {map: path->mtime|undefined, userAtts, ready}.
-let agentFileBaseline=null;
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
 async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false,boxDone:false});document.body.dataset.busy='1';
-  // Baseline the filesystem BEFORE the box does any work, so turn.done can diff
-  // out the agent's own new/changed files. Fire-and-forget; if it fails the diff
-  // is simply skipped and only name-mentions surface.
-  const baseline={map:null,userAtts:new Set()};agentFileBaseline=baseline;
-  baseline.ready=fetchTreeFiles().then(fs=>{if(fs)baseline.map=new Map(fs.map(f=>[f.path,typeof f.mtime==='number'?f.mtime:undefined]));});
   const userEl=addMsg('user','',msg,'user:'+localId);
   let atts=[];
   if(files&&files.length){
     // Files staged while composing are already in the box — send just their
     // name (alreadyUploaded); only un-staged ones ship bytes with the message.
     atts=await Promise.all(files.map(async f=>({name:f.name.replace(/[\\/\\\\]/g,'_'),b64:f.__uploaded?'':await readAsB64(f),bytes:new Uint8Array(await f.arrayBuffer()),uploaded:Boolean(f.__uploaded)})));
-    // Don't re-surface the user's own uploads as agent outputs in the diff.
-    atts.forEach(a=>baseline.userAtts.add('attachments/'+a.name));
     renderAttachDeck(userEl,atts,'right');
   }
   // Tell the agent where the files landed so it can use them. Voice messages
@@ -1527,13 +1521,12 @@ function renderAttachDeck(el,atts,side){
   });
   el.parentNode.insertBefore(deck,el);
 }
-// Agent "attachments": files the agent produced or referenced this turn, shown
-// as a left-aligned card deck BELOW its last bubble (mirrors the user's own
-// attachment deck). Two signals, unioned: (1) files it MENTIONS by name in its
-// reply that resolve to exactly one tree file; (2) files it CREATED or MODIFIED
-// this turn — detected by diffing the live tree against a turn-start baseline
-// (new path, or a newer mtime than the baseline captured before the turn ran).
-const AGENT_FILE_EXT=/\\.(png|jpe?g|gif|webp|bmp|avif|svg|pdf|mp4|webm|m4v|mov|ogv|mp3|wav|ogg|oga|m4a|opus|csv|xlsx?|json|txt|md|py|js|ts|tsx|html?|css|zip|sqlite3?|db|docx?|pptx?)$/i;
+// Agent "attachments": ONLY the files the box agent explicitly DECLARED it
+// created/modified this turn, via its trailing <optibox-files>…</optibox-files>
+// manifest. Shown as a left-aligned card deck BELOW its last bubble. This
+// replaced an mtime/baseline diff that surfaced every recently-touched file
+// (build churn, incidental writes) and made it impossible to tell what the
+// agent actually produced — now the agent names its own deliverables.
 async function fetchTreeFiles(){
   try{const t=await (await fetch('/api/fs/tree',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
     return (t.entries||[]).filter(e=>e.kind!=='directory'&&e.kind!=='d'&&e.kind!=='dir');
@@ -1541,28 +1534,20 @@ async function fetchTreeFiles(){
 }
 // Noise: build/cache/dotfile churn is never a deliverable the user cares about.
 function isNoisePath(p){return p.split('/').some(seg=>seg.startsWith('.')||seg==='node_modules'||seg==='__pycache__');}
-async function renderAgentAttachments(el,baseline){
+async function renderAgentAttachments(el){
   if(!el||el.__deckDone||!el.parentNode)return;el.__deckDone=true;
   const body=el.querySelector('.body');if(!body)return;
-  const raw=body.dataset.raw||body.textContent||'';
+  const declared=parseFileDecl(body.dataset.raw||'');
+  if(!declared.length)return;
   const files=await fetchTreeFiles();if(!files)return;
   const ordered=[];const chosen={};
-  const take=path=>{if(path&&!chosen[path]&&!isNoisePath(path)){chosen[path]=1;ordered.push(path);}};
-  // (1) mentioned-by-name → unique tree match
-  const re=/[A-Za-z0-9_./-]+\\.[A-Za-z0-9]{1,8}/g;const cands=[];const seen={};let m;
-  while((m=re.exec(raw))){let t=m[0].replace(/^[./]+/,'');if(!AGENT_FILE_EXT.test(t)||seen[t])continue;seen[t]=1;cands.push(t);}
-  for(const c of cands){
+  for(const c of declared){
     const base=c.split('/').pop();
-    const paths=[...new Set(files.filter(e=>{const p=e.path;return p===c||p.endsWith('/'+c)||p===base||p.endsWith('/'+base)||p.split('/').pop()===base;}).map(e=>e.path))];
-    if(paths.length===1)take(paths[0]);
-  }
-  // (2) created/modified this turn vs the turn-start baseline
-  if(baseline){try{await baseline.ready;}catch(_){/* diff optional */}
-    const bmap=baseline.map;const uatt=baseline.userAtts||new Set();
-    if(bmap){for(const f of files){const p=f.path;if(uatt.has(p))continue;const had=bmap.has(p);const bm=bmap.get(p);const cm=typeof f.mtime==='number'?f.mtime:undefined;
-      const isNew=!had;const isMod=had&&bm!=null&&cm!=null&&cm>bm;
-      if(isNew||isMod)take(p);
-    }}
+    const matches=[...new Set(files.filter(e=>{const p=e.path;return p===c||p.endsWith('/'+c)||p===base||p.endsWith('/'+base)||p.split('/').pop()===base;}).map(e=>e.path))];
+    // Prefer an exact path match; otherwise accept a unique basename match.
+    let pick=matches.find(p=>p===c||p.endsWith('/'+c));
+    if(!pick&&matches.length===1)pick=matches[0];
+    if(pick&&!chosen[pick]&&!isNoisePath(pick)){chosen[pick]=1;ordered.push(pick);}
   }
   const hits=ordered.slice(0,8);
   if(!hits.length)return;
@@ -1770,7 +1755,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
   else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
-  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl,agentFileBaseline);lastAgentMsgEl=null;}}
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);lastAgentMsgEl=null;}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};

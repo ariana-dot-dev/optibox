@@ -231,6 +231,9 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "This machine has a graphical desktop on DISPLAY=:0 (1920x1080) with google-chrome and xdotool installed; the user watches it live. For browser/GUI requests, actually do it: launch with `DISPLAY=:0 google-chrome --no-first-run --start-maximized 'URL' >/dev/null 2>&1 &`, wait ~3s, verify with `DISPLAY=:0 xdotool search --onlyvisible --class chrome | head -1`, interact via `DISPLAY=:0 xdotool key/type/click ...`. Never claim there is no browser or GUI."
       : undefined,
     policy.toolsAllowed ? "When intentionally producing no user-visible text because the request is duplicate/stale or already fully handled, output exactly <end>. The host will hide that sentinel. Do not add whitespace, markdown, or explanation around it." : undefined,
+    policy.toolsAllowed
+      ? "FILE MANIFEST: at the very END of your reply, if and ONLY if you CREATED or MODIFIED one or more files this turn (not merely read or listed them), append one final line naming them for the UI: <optibox-files>path1, path2</optibox-files> — comma-separated, home-relative (e.g. report.pdf, out/data.csv) or absolute paths. If you created/modified no file, omit this line completely. The host strips this line so the user never sees it; do NOT mention it, describe it, or wrap it in code fences — just the raw tag on its own line."
+      : undefined,
     !policy.toolsAllowed
       ? "Output ONLY that visible reply — either the full answer or the one short holding line. Never output routing tags, XML, control markers, or an empty response. You must always produce visible text."
       : undefined,

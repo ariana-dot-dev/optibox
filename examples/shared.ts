@@ -606,7 +606,7 @@ export function realCliHarness(spec: RealCliHarnessSpec, deps: RealCliHarnessDep
       // makes every later shared turn return empty). A direct provider call is an
       // independent request — nothing shared to wedge, an interrupt just drops it,
       // and it streams token-by-token (~1.25s to first token). See sharedDirectStream.
-      if (spec.outputMode === "opencode-json") {
+      if (spec.outputMode === "opencode-json" || spec.outputMode === "pi-json") {
         const bundle = buildHarnessPromptBundle(ctx, policy);
         const argv = spec.buildArgv({ prompt: bundle.prompt, model: ctx.selection.model, provider: ctx.selection.provider, cwd: ".", systemInstructionPath: "", toolsAllowed: false });
         const mi = argv.indexOf("--model");

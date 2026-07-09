@@ -185,7 +185,8 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): Harnes
   }
 
   if (parser.mode === "opencode-json" || parser.mode === "pi-json") {
-    emitGenericToolEvent(j, parser);
+    if (parser.mode === "pi-json") emitPiToolEvent(j, parser);
+    else emitGenericToolEvent(j, parser);
     noteMessageBoundary(j, parser);
     const ev = j.assistantMessageEvent;
     if (j.type === "message_update" && ev?.type === "text_delta" && typeof ev.delta === "string") {
@@ -270,6 +271,42 @@ function emitServeToolPart(part: any, parser: HarnessOutputParser): void {
       ...base,
       stdout: typeof part.state?.output === "string" ? part.state.output : undefined,
       isError: status === "error",
+    });
+  }
+}
+
+/**
+ * Pi's `--mode json` reports tool activity as `tool_execution_start` (toolName +
+ * args) and `tool_execution_end` (result + isError) — distinct from opencode's
+ * `tool_use` snapshots — so surface them as native tool_use/tool_result events
+ * for the tool-chain UI. bash args carry `command`; file tools carry a path.
+ */
+function emitPiToolEvent(j: any, parser: HarnessOutputParser): void {
+  if (!parser.onToolEvent) return;
+  if (j.type === "tool_execution_start") {
+    const args = j.args ?? {};
+    parser.onToolEvent({
+      phase: "tool_use",
+      toolName: String(j.toolName ?? "tool"),
+      command: typeof args.command === "string" ? args.command
+        : typeof args.cmd === "string" ? args.cmd
+        : typeof args.file_path === "string" ? args.file_path
+        : typeof args.path === "string" ? args.path
+        : undefined,
+      description: typeof args.description === "string" ? args.description : undefined,
+    });
+  }
+  if (j.type === "tool_execution_end") {
+    const r = j.result;
+    const stdout = typeof r === "string" ? r
+      : (r && typeof r.stdout === "string") ? r.stdout
+      : (r && typeof r.output === "string") ? r.output
+      : r != null ? JSON.stringify(r).slice(0, 2000) : undefined;
+    parser.onToolEvent({
+      phase: "tool_result",
+      toolName: String(j.toolName ?? "tool"),
+      ...(stdout !== undefined ? { stdout } : {}),
+      isError: Boolean(j.isError),
     });
   }
 }

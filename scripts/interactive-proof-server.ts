@@ -469,18 +469,21 @@ async function fsResolveBox(credentials: DemoCredentials, userId: string): Promi
  * SAME path space the snapshot tree uses, so the panel behaves identically
  * whether the box is up or down. (/tmp is tmpfs and never in snapshots.)
  */
-async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<Array<{ path: string; kind: string; size?: number }>> {
+async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<Array<{ path: string; kind: string; size?: number; mtime?: number }>> {
   const out = await client.command(boxId, {
-    command: `find /home/user -mindepth 1 -printf '%y\\t%s\\t%P\\n' 2>/dev/null | head -c 3000000`,
+    // %T@ = mtime as epoch seconds (float): lets the chat surface files the
+    // agent created/modified during a turn by comparing against a turn-start
+    // baseline, no per-command path parsing needed.
+    command: `find /home/user -mindepth 1 -printf '%y\\t%s\\t%T@\\t%P\\n' 2>/dev/null | head -c 3000000`,
     timeoutMs: 30_000,
   });
-  const entries: Array<{ path: string; kind: string; size?: number }> = [];
+  const entries: Array<{ path: string; kind: string; size?: number; mtime?: number }> = [];
   for (const line of out.stdout.split("\n")) {
-    const [y, size, ...rest] = line.split("\t");
+    const [y, size, mtime, ...rest] = line.split("\t");
     const p = rest.join("\t");
     if (!p || !y) continue;
     const kind = y === "d" ? "dir" : y === "l" ? "symlink" : "file";
-    entries.push({ path: p, kind, ...(kind === "file" ? { size: Number(size) || 0 } : {}) });
+    entries.push({ path: p, kind, ...(kind === "file" ? { size: Number(size) || 0, mtime: Math.floor(Number(mtime) || 0) } : {}) });
   }
   return entries;
 }
@@ -1406,15 +1409,26 @@ const activeTurns=new Map();
 // can't desync the graph or leave a stale indicator.
 let latestLocalId=null;
 let lastAgentMsgEl=null;
+// Snapshot of the box filesystem taken the moment a turn starts, so turn.done
+// can tell which files the AGENT created/modified during it (see
+// renderAgentAttachments). {map: path->mtime|undefined, userAtts, ready}.
+let agentFileBaseline=null;
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
 async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false});document.body.dataset.busy='1';
+  // Baseline the filesystem BEFORE the box does any work, so turn.done can diff
+  // out the agent's own new/changed files. Fire-and-forget; if it fails the diff
+  // is simply skipped and only name-mentions surface.
+  const baseline={map:null,userAtts:new Set()};agentFileBaseline=baseline;
+  baseline.ready=fetchTreeFiles().then(fs=>{if(fs)baseline.map=new Map(fs.map(f=>[f.path,typeof f.mtime==='number'?f.mtime:undefined]));});
   const userEl=addMsg('user','',msg,'user:'+localId);
   let atts=[];
   if(files&&files.length){
     // Files staged while composing are already in the box — send just their
     // name (alreadyUploaded); only un-staged ones ship bytes with the message.
     atts=await Promise.all(files.map(async f=>({name:f.name.replace(/[\\/\\\\]/g,'_'),b64:f.__uploaded?'':await readAsB64(f),bytes:new Uint8Array(await f.arrayBuffer()),uploaded:Boolean(f.__uploaded)})));
+    // Don't re-surface the user's own uploads as agent outputs in the diff.
+    atts.forEach(a=>baseline.userAtts.add('attachments/'+a.name));
     renderAttachDeck(userEl,atts,'right');
   }
   // Tell the agent where the files landed so it can use them. Voice messages
@@ -1502,25 +1516,44 @@ function renderAttachDeck(el,atts,side){
   });
   el.parentNode.insertBefore(deck,el);
 }
-// Agent "attachments": files the agent MENTIONS in its reply. We pull
-// filename-ish tokens from its text and, for each that resolves to exactly one
-// file in the box tree, show a card above the agent bubble that opens it.
+// Agent "attachments": files the agent produced or referenced this turn, shown
+// as a left-aligned card deck BELOW its last bubble (mirrors the user's own
+// attachment deck). Two signals, unioned: (1) files it MENTIONS by name in its
+// reply that resolve to exactly one tree file; (2) files it CREATED or MODIFIED
+// this turn — detected by diffing the live tree against a turn-start baseline
+// (new path, or a newer mtime than the baseline captured before the turn ran).
 const AGENT_FILE_EXT=/\\.(png|jpe?g|gif|webp|bmp|avif|svg|pdf|mp4|webm|m4v|mov|ogv|mp3|wav|ogg|oga|m4a|opus|csv|xlsx?|json|txt|md|py|js|ts|tsx|html?|css|zip|sqlite3?|db|docx?|pptx?)$/i;
-async function renderAgentAttachments(el){
+async function fetchTreeFiles(){
+  try{const t=await (await fetch('/api/fs/tree',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
+    return (t.entries||[]).filter(e=>e.kind!=='directory'&&e.kind!=='d'&&e.kind!=='dir');
+  }catch(_){return null;}
+}
+// Noise: build/cache/dotfile churn is never a deliverable the user cares about.
+function isNoisePath(p){return p.split('/').some(seg=>seg.startsWith('.')||seg==='node_modules'||seg==='__pycache__');}
+async function renderAgentAttachments(el,baseline){
   if(!el||el.__deckDone||!el.parentNode)return;el.__deckDone=true;
   const body=el.querySelector('.body');if(!body)return;
   const raw=body.dataset.raw||body.textContent||'';
+  const files=await fetchTreeFiles();if(!files)return;
+  const ordered=[];const chosen={};
+  const take=path=>{if(path&&!chosen[path]&&!isNoisePath(path)){chosen[path]=1;ordered.push(path);}};
+  // (1) mentioned-by-name → unique tree match
   const re=/[A-Za-z0-9_./-]+\\.[A-Za-z0-9]{1,8}/g;const cands=[];const seen={};let m;
   while((m=re.exec(raw))){let t=m[0].replace(/^[./]+/,'');if(!AGENT_FILE_EXT.test(t)||seen[t])continue;seen[t]=1;cands.push(t);}
-  if(!cands.length)return;
-  let tree;try{tree=await (await fetch('/api/fs/tree',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();}catch(_){return;}
-  const files=(tree.entries||[]).filter(e=>e.kind!=='directory'&&e.kind!=='d'&&e.kind!=='dir');
-  const hits=[];const hitSeen={};
   for(const c of cands){
     const base=c.split('/').pop();
     const paths=[...new Set(files.filter(e=>{const p=e.path;return p===c||p.endsWith('/'+c)||p===base||p.endsWith('/'+base)||p.split('/').pop()===base;}).map(e=>e.path))];
-    if(paths.length===1&&!hitSeen[paths[0]]){hitSeen[paths[0]]=1;hits.push(paths[0]);}
+    if(paths.length===1)take(paths[0]);
   }
+  // (2) created/modified this turn vs the turn-start baseline
+  if(baseline){try{await baseline.ready;}catch(_){/* diff optional */}
+    const bmap=baseline.map;const uatt=baseline.userAtts||new Set();
+    if(bmap){for(const f of files){const p=f.path;if(uatt.has(p))continue;const had=bmap.has(p);const bm=bmap.get(p);const cm=typeof f.mtime==='number'?f.mtime:undefined;
+      const isNew=!had;const isMod=had&&bm!=null&&cm!=null&&cm>bm;
+      if(isNew||isMod)take(p);
+    }}
+  }
+  const hits=ordered.slice(0,8);
   if(!hits.length)return;
   const deck=document.createElement('div');deck.className='attachDeck deckLeft';
   hits.forEach(path=>{
@@ -1532,7 +1565,8 @@ async function renderAgentAttachments(el){
     card.addEventListener('click',()=>{try{if(window.__optiboxFs&&window.__optiboxFs.openPath)window.__optiboxFs.openPath(path);}catch(_){}});
     deck.appendChild(card);
   });
-  el.parentNode.insertBefore(deck,el);
+  // BELOW the agent's last bubble (user asked for it under the message/tool line).
+  el.parentNode.insertBefore(deck,el.nextSibling);
 }
 function submitComposer(source){
   const text=msgEl.value.trim();
@@ -1725,7 +1759,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
   else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
-  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);lastAgentMsgEl=null;}}
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl,agentFileBaseline);lastAgentMsgEl=null;}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};

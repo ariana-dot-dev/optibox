@@ -616,18 +616,21 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       if (!filePath.startsWith("attachments/")) return json(400, { ok: false, message: "only attachments/ files can be deleted here" }), true;
       if (!box) return json(409, { ok: false, message: "no machine — nothing to delete" }), true;
       const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-      try {
-        const out = await Promise.race([
-          client.command(box.id, { command: `cd /home/user && rm -f ${q(filePath)} && echo removed`, timeoutMs: 20_000 }),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("delete deadline")), 8_000)),
-        ]);
-        const removed = out.stdout.includes("removed");
-        fsLog({ route: "delete", userId, path: filePath, ok: removed });
-        return json(200, { ok: removed }), true;
-      } catch (e) {
-        fsLog({ route: "delete", userId, path: filePath, ok: false, error: e instanceof Error ? e.message : String(e) });
-        return json(409, { ok: false, message: "machine is off — file will be ignored" }), true;
+      // Retry through boot-transition stalls (commands can return empty stdout
+      // for a while right after a wake) — same medicine as writeBoxFile.
+      let removed = false;
+      let lastErr = "";
+      for (let attempt = 0; attempt < 4 && !removed; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, 2_000));
+        try {
+          const out = await client.command(box.id, { command: `cd /home/user && rm -f ${q(filePath)} && test ! -e ${q(filePath)} && echo removed`, timeoutMs: 20_000 });
+          removed = out.stdout.includes("removed");
+        } catch (e) {
+          lastErr = e instanceof Error ? e.message : String(e);
+        }
       }
+      fsLog({ route: "delete", userId, path: filePath, ok: removed, ...(removed ? {} : { error: lastErr || "no confirmation" }) });
+      return json(removed ? 200 : 409, removed ? { ok: true } : { ok: false, message: "could not delete — machine may be off; file will be ignored" }), true;
     }
 
     return json(404, { ok: false, message: "unknown fs endpoint" }), true;

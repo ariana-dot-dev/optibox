@@ -7,7 +7,8 @@ const panel = $("fsPanel");
 
 let FileTree = null;
 let tree = null;
-let treePaths = [];
+let serverPaths = [];    // last server-confirmed tree paths (unfiltered)
+let displayedPaths = []; // what is currently rendered (server + upload overlay)
 let entryByPath = new Map();
 let fsLive = false;
 let fsState = "none";
@@ -74,7 +75,7 @@ async function init() {
     hc.addEventListener("change", () => {
       showHidden = hc.checked;
       try { localStorage.setItem("optibox.fsShowHidden", showHidden ? "1" : "0"); } catch {}
-      treePaths = []; // force a re-render with the new filter
+      syncTree(true); // re-render immediately with the new filter
       refreshNow().catch(() => {});
     });
   }
@@ -93,9 +94,13 @@ async function refresh(first) {
     const data = await api("/api/fs/tree", {});
     fsLive = Boolean(data.live);
     fsState = data.state || "none";
+    const waking = !fsLive && data.runtime && data.runtime.billingSinceEpochMs;
     setStatus(
-      fsState === "none" ? "no machine yet" : fsLive ? "live" : "snapshot" + (data.treeAvailable === false ? " (tree unavailable)" : ""),
-      fsLive ? "live" : "",
+      fsState === "none" ? "no machine yet"
+        : fsLive ? "live"
+        : waking ? "machine starting…"
+        : "snapshot" + (data.treeAvailable === false ? " (tree unavailable)" : ""),
+      fsLive ? "live" : waking ? "live" : "",
     );
     // Hand the authoritative runtime snapshot to the page: it reconciles the
     // billing/cost/auto-stop counters from it every poll, so out-of-band wakes
@@ -103,29 +108,48 @@ async function refresh(first) {
     try { if (window.__optiboxFs && window.__optiboxFs.onRuntime) window.__optiboxFs.onRuntime(data.runtime || null); } catch { /* page hook optional */ }
     const entries = data.entries || [];
     entryByPath = new Map(entries.map((e) => [e.path, e]));
-    const paths = entries
+    serverPaths = entries
       .map((e) => (e.kind === "dir" ? e.path + "/" : e.path))
-      .filter((p) => p && p !== "/")
-      .filter((p) => showHidden || !isHiddenPath(p));
-    // Keep in-flight AND just-finished uploads visible. A slow upload (e.g. one
-    // that first WAKES a parked machine, ~6s) would be wiped by a 4s poll; and
-    // right after a write the box state string can still lag as "archived", so
-    // the tree endpoint serves the snapshot (no file) for a few seconds. Both
-    // sets ride over that until the real tree confirms the file, then it drops
-    // from `settled`.
-    const serverSet = new Set(paths);
+      .filter((p) => p && p !== "/");
+    // Uploads the real tree has confirmed no longer need the local overlay.
+    const serverSet = new Set(serverPaths);
     for (const dest of settled) if (serverSet.has(dest)) settled.delete(dest);
-    for (const dest of uploading) if (!serverSet.has(dest) && (showHidden || !isHiddenPath(dest))) paths.push(dest);
-    for (const dest of settled) if (!serverSet.has(dest) && (showHidden || !isHiddenPath(dest))) paths.push(dest);
-    const changed = paths.length !== treePaths.length || paths.some((p, i) => p !== treePaths[i]);
-    if (changed || first) {
-      treePaths = paths;
-      renderTree(paths);
-    }
+    syncTree(first);
   } catch (e) {
     if (first) setStatus("unavailable: " + e.message);
   } finally {
     refreshing = false;
+  }
+}
+
+/**
+ * The ONE list the tree renders: server truth + local overlay (in-flight and
+ * just-finished uploads, which a poll would otherwise wipe while the machine
+ * is still waking or its state string lags), hidden-filtered, deduped, sorted.
+ */
+function displayPaths() {
+  const set = new Set(serverPaths);
+  for (const dest of uploading) set.add(dest);
+  for (const dest of settled) set.add(dest);
+  return [...set].filter((p) => showHidden || !isHiddenPath(p)).sort();
+}
+
+/** Re-render only when the displayed list actually changed. NEVER throws —
+ * a render exception here used to escape into onDrop, killing the upload AND
+ * leaving a blank mount that "no change" checks then kept blank forever. */
+function syncTree(force) {
+  try {
+    const next = displayPaths();
+    const changed = force || next.length !== displayedPaths.length || next.some((p, i) => p !== displayedPaths[i]);
+    if (!changed) return;
+    renderTree(next);
+    displayedPaths = next; // only after a successful render — failures retry next poll
+  } catch (e) {
+    // Hard reset so the next sync rebuilds from scratch instead of staying blank.
+    try { tree && tree.cleanUp(); } catch { /* already broken */ }
+    tree = null;
+    displayedPaths = [];
+    setStatus("tree render failed — retrying: " + (e && e.message ? e.message : e));
   }
 }
 
@@ -213,11 +237,12 @@ async function onDrop(e) {
   const files = Array.from(e.dataTransfer.files);
   const dir = dropTargetDir(e);
   if (!fsLive) setStatus("waking machine to upload…");
+  // Start EVERY upload before touching the tree: rendering must never be able
+  // to prevent the actual work (a render throw here once ate the whole drop).
   for (const file of files) {
     const dest = (dir ? dir + "/" : "") + file.name;
     uploading.add(dest);
     entryByPath.set(dest, { path: dest, kind: "file", size: file.size });
-    try { tree && tree.add(dest); } catch { renderTree([...treePaths, dest]); }
     (async () => {
       try {
         await uploadBinary(dest, file);
@@ -225,13 +250,14 @@ async function onDrop(e) {
       } catch (err) {
         setStatus("upload failed: " + err.message);
         settled.delete(dest);
-        try { tree && tree.remove(dest); } catch {}
       } finally {
         uploading.delete(dest);
+        syncTree(false);
         refresh(false);
       }
     })();
   }
+  syncTree(false); // optimistic rows via the same one render path
 }
 
 function fileToB64(file) {

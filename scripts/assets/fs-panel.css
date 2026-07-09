@@ -41,7 +41,10 @@
 .fsEmpty{color:#9a9a9a;font-size:12px;padding:14px 10px}
 .fsHidden{display:flex;align-items:center;gap:7px;font-size:11px;color:#9a9a9a;cursor:pointer;user-select:none;flex:0 0 auto}
 .fsHidden input{accent-color:#fc4b55;width:13px;height:13px;cursor:pointer;margin:0}
-.fsPanel.fsDrop .fsTreeMount{outline:2px dashed #fc4b55;outline-offset:-2px}
+/* Drop indicator as an overlay pseudo-element: a plain outline was painted
+   UNDER the tree's sticky search bar, which hid its top edge. */
+.fsTreeMount{position:relative}
+.fsPanel.fsDrop .fsTreeMount::after{content:'';position:absolute;inset:0;border:2px dashed #fc4b55;border-radius:9px;background:rgba(252,75,85,.04);pointer-events:none;z-index:10}
 
 /* Inverse of the page zoom: CodeMirror's cursor/click math breaks under CSS
    zoom, so the dialog interior runs at effective zoom 1 (1.15 x 1/1.15). */

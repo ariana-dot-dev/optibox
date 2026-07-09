@@ -86,4 +86,5 @@
 .fsViewerBody .CodeMirror-cursor{border-left:2px solid #fc4b55}
 .fsViewerBody .CodeMirror-selected{background:#e4e4e4}
 
-@media(max-width:900px){.fsPanel{display:none}}
+/* ≤900px the panel is a full-screen page of the mobile swipe pager (see the
+   @media block in the page template) — it must NOT be display:none here. */

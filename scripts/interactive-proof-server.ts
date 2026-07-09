@@ -390,14 +390,16 @@ async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: stri
  */
 async function fsWriteIntoBox(credentials: DemoCredentials, userId: string, filePath: string, bytes: Buffer): Promise<{ status: number; payload: { ok: boolean; message?: string } }> {
   const t0 = Date.now();
+  let resolvedBoxId = "";
   const done = (status: number, payload: { ok: boolean; message?: string }) => {
-    fsLog({ route: "write", userId, path: filePath, bytes: bytes.length, ms: Date.now() - t0, status, ...(payload.message ? { message: payload.message } : {}) });
+    fsLog({ route: "write", userId, boxId: resolvedBoxId, path: filePath, bytes: bytes.length, ms: Date.now() - t0, status, ...(payload.message ? { message: payload.message } : {}) });
     return { status, payload };
   };
   try {
     const { box, live } = await fsResolveBox(credentials, userId);
     const client = fsBoxClient(credentials);
     if (!box) return done(409, { ok: false, message: "no machine yet — send a message first" });
+    resolvedBoxId = box.id;
     // Keep the box up for the duration of the upload: the hold cancels a
     // running auto-stop countdown and the reaper skips held boxes.
     const releaseHold = orchestratorFor(credentials).holdUserBox(userId, "upload", 300_000);
@@ -642,6 +644,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
 const STATIC_ASSETS: Record<string, { file: string; type: string }> = {
   "/static/fs-panel.js": { file: "scripts/assets/fs-panel.js", type: "text/javascript; charset=utf-8" },
   "/static/fs-panel.css": { file: "scripts/assets/fs-panel.css", type: "text/css; charset=utf-8" },
+  "/static/mobile.js": { file: "scripts/assets/mobile.js", type: "text/javascript; charset=utf-8" },
 };
 
 const server = http.createServer(async (req, res) => {
@@ -1046,10 +1049,25 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .path{position:relative;height:30px;display:flex;align-items:center;justify-content:center}.path .arrow{position:absolute;top:-1px;bottom:-1px;left:50%;width:2px;background:#e0e0e0;transform:translateX(-50%)}.path .arrow:after{content:"";position:absolute;left:50%;bottom:3px;width:6px;height:6px;border-right:2px solid #e0e0e0;border-bottom:2px solid #e0e0e0;transform:translateX(-50%) rotate(45deg)}.path .pathLabel{position:relative;z-index:1;background:#fff;padding:0 8px;color:#a6a6a6;font-size:10.5px;letter-spacing:.02em}
 .packet{position:absolute;left:0;top:0;z-index:3;line-height:1;transform:translate(-50%,-50%);opacity:0;transition:top .45s cubic-bezier(.5,0,.2,1),left .45s cubic-bezier(.5,0,.2,1),opacity .25s ease;pointer-events:none;color:#111;background:#fff;border:1px solid #e0e0e0;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center}.packet svg{width:14px;height:14px;display:block}.packet[data-kind="ok"]{color:#1a7f37;border-color:#1a7f37}.packet[data-kind="warn"]{color:#b54708;border-color:#b54708}
 .routeCaption{margin-top:14px;min-height:15px;font-size:11px;font-weight:400;color:#a0a0a0;line-height:1.4}.schematic[data-route="error"] .routeCaption{color:#9f1239}
-@media(max-width:900px){.shell{display:block;height:calc(100dvh/var(--z));padding:0}.schematic{display:none}.app{max-width:720px;margin:0 auto}}
+/* Mobile: the three panes become a full-screen horizontal pager — Backend |
+   Chat | Files — with Chat as home (page 1). mobile.js moves the strip 1:1
+   with the finger via --dragx and commits --page on release. Zoom returns to 1
+   so 100vw/100dvh are real screen units. */
+.mobileDots{display:none}
+@media(max-width:900px){html{zoom:1;--z:1}body{overflow:hidden;overscroll-behavior-x:none}
+.shell{display:flex;max-width:none;height:100dvh;padding:0;gap:0;touch-action:pan-y;will-change:transform;transform:translate3d(calc(var(--page,1)*-100vw + var(--dragx,0px)),0,0)}
+.shell.pageSnap{transition:transform .3s cubic-bezier(.22,.61,.36,1)}
+.shell>.fsPanel,.shell>.app,.shell>.schematic{flex:0 0 100vw;width:100vw;max-width:none;height:100dvh;margin:0;align-self:stretch;border:0;border-radius:0}
+.shell>.schematic{order:-1;display:flex;flex-direction:column;justify-content:center;padding:24px 20px}
+.shell>.fsPanel{order:1;padding:calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom))}
+.composer{padding-bottom:calc(16px + env(safe-area-inset-bottom))}
+.mobileDots{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(5px + env(safe-area-inset-bottom));display:flex;gap:6px;z-index:15;pointer-events:none}
+.mobileDots span{width:6px;height:6px;border-radius:50%;background:#d4d4d4;transition:background .25s ease,transform .25s ease}
+.mobileDots span.on{background:#111;transform:scale(1.25)}}
 @media(max-width:520px){.app{max-width:none;border:0}.top{padding-left:10px;padding-right:10px}.chat{padding-left:10px;padding-right:10px}.composer{padding-left:10px;padding-right:10px}.counter{padding:10px}.value{font-size:18px}.state{font-size:12px;line-height:1.25}.msg{max-width:90%;font-size:14px}.label{font-size:11px}button{padding:0 14px}#send{right:13px}#attach{right:45px}}
 </style><link rel="stylesheet" href="/static/fs-panel.css"/>
-<script type="module" src="/static/fs-panel.js"></script></head><body class="hide-traces"><div class="shell">
+<script type="module" src="/static/fs-panel.js"></script>
+<script defer src="/static/mobile.js"></script></head><body class="hide-traces"><div class="shell">
 <aside class="fsPanel" id="fsPanel" aria-label="files">
   <h2>Files <span class="fsStatus" id="fsStatus">…</span></h2>
   <div class="fsTreeMount" id="fsTree"></div>
@@ -1351,7 +1369,7 @@ async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused'
   // skip the note: the transcript already IS the message, and naming an audio
   // file only makes the shared model apologise about not "processing audio".
   // Files still upload silently so they show in chat and the panel.
-  const sendMsg=(atts.length&&!opts.silent)?msg+'\\n\\n[Attached files, saved under attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
+  const sendMsg=(atts.length&&!opts.silent)?msg+'\\n\\n[Attached files, saved in /home/user/attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
   const attachPayload=atts.map(a=>a.uploaded?{name:a.name,alreadyUploaded:true}:{name:a.name,contentB64:a.b64});
   showWorking();setState('shared bridge starting · private Box boot requested');resetRouteForTurn();
   try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys(),attachments:attachPayload})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}

@@ -151,7 +151,8 @@ type UserBoxBootAction =
   | "resume-requested"
   | "existing-boot"
   | "adopt-ready"
-  | "adopt-resume-requested";
+  | "adopt-resume-requested"
+  | "adopt-inflight";
 
 interface UserBoxBootAck {
   action: UserBoxBootAction;
@@ -506,12 +507,15 @@ export class ConsumerBoxAgentOrchestrator {
     const expectedName =
       this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`;
     const boxes = await this.options.box.list().catch(() => []);
-    // "archiving" counts as reusable too: excluding it made a mid-archive box
-    // invisible here, so a turn arriving in that window created a FRESH box
-    // with the SAME name — observed in production as two boxes sharing one
-    // name, with every name-based lookup then flipping a coin.
+    // EVERY non-error state is adoptable. Filtering to ready|archived twice
+    // produced same-named duplicates in production: first a mid-ARCHIVING box
+    // was invisible here, then a mid-STARTING one (woken seconds earlier by a
+    // typing/upload external wake) — each time a turn created a FRESH box with
+    // the SAME name and every name-based lookup then flipped a coin. The
+    // invariant is one user = one box; a box that is booting gets awaited, not
+    // duplicated.
     const reusable = boxes
-      .filter((box) => box.name === expectedName && (isReady(box.state) || box.state === "archived" || box.state === "archiving"))
+      .filter((box) => box.name === expectedName && box.state !== "error")
       .sort((a, b) => {
         // Prefer a warm ready Box. Otherwise prefer the newest archived snapshot
         // over creating a fresh Box; this preserves the same user conversation
@@ -534,7 +538,7 @@ export class ConsumerBoxAgentOrchestrator {
       lastSeenAt: Date.now(),
     });
     let box = reusable;
-    if (box.state === "archiving" || box.state === "archived") {
+    if (box.state === "archiving" || box.state === "archived" || box.state === "stopped") {
       try {
         // Mid-archive: let the snapshot finish, then resume — same pattern as
         // the per-session path. Never fall through to a fresh same-named box.
@@ -547,9 +551,20 @@ export class ConsumerBoxAgentOrchestrator {
         await this.clearSession(userId, conversationId);
         return undefined;
       }
-    } else {
+    } else if (isReady(box.state)) {
       onBootAck?.({ action: "adopt-ready", box });
       box = await this.waitUntilReady(reusable.id, "adopt-existing");
+    } else {
+      // starting/resuming/etc — an external wake (typing, upload) or another
+      // request is booting this box RIGHT NOW. Wait for it; do not duplicate.
+      try {
+        onBootAck?.({ action: "adopt-inflight", box });
+        box = await this.waitUntilReady(box.id, "adopt-inflight", this.options.resumeTimeoutMs);
+      } catch (e) {
+        if (e instanceof BoxTerminalStateError) throw e;
+        await this.clearSession(userId, conversationId);
+        return undefined;
+      }
     }
     return this.options.userBoxTtlSeconds === null
       ? box
@@ -565,6 +580,20 @@ export class ConsumerBoxAgentOrchestrator {
   ): Promise<BoxInfo> {
     const name = this.options.userBoxName?.(userId) ?? `consumer-agent-user-${userId}`;
     const ttlSeconds = this.options.userBoxTtlSeconds ?? 3600;
+    // INVARIANT: one user = one box name = one box. This is the only place a
+    // user box is created, so enforce it mechanically: any surviving box that
+    // still carries the name (adoption gave up on it) gets renamed out of the
+    // namespace first — a same-named duplicate corrupts every name-based
+    // lookup (observed twice: files staged onto one box while the agent ran
+    // on the other).
+    if (this.options.box.list) {
+      const existing = (await this.options.box.list().catch(() => [])).filter((b) => b.name === name);
+      for (const stale of existing) {
+        await this.options.box
+          .update(stale.id, { name: `${name}-superseded-${Date.now().toString(36)}` })
+          .catch(() => undefined);
+      }
+    }
     // A brand-new box has a brand-new harness session store. Carrying an old
     // box's native session id onto it makes `opencode run -s <unknown-id>` hang
     // forever (cross-store resume). Drop user-box session ids for this
@@ -2159,10 +2188,15 @@ export class ConsumerBoxAgentOrchestrator {
    * archiving race), but the billing owner map cannot.
    */
   activeUserBoxId(userId: string): string | undefined {
+    // Prefer a box a real conversation owns over an external-wake one: when a
+    // wake raced a turn into two billed boxes, files must follow the agent.
+    let fallback: string | undefined;
     for (const [boxId, owner] of this.boxOwners) {
-      if (owner.userId === userId && this.billing.has(boxId)) return boxId;
+      if (owner.userId !== userId || !this.billing.has(boxId)) continue;
+      if (!owner.conversationId.startsWith("external-")) return boxId;
+      fallback = fallback ?? boxId;
     }
-    return undefined;
+    return fallback;
   }
 
   /**
@@ -2525,6 +2559,8 @@ function bootLifecycleNote(ack: UserBoxBootAck): string {
       return `private Box create was accepted by Box API (${ack.box.state})`;
     case "fork-requested":
       return `private Box was forked from the pre-installed template snapshot (${ack.box.state})`;
+    case "adopt-inflight":
+      return `existing named private Box is already booting (${ack.box.state}) — waiting instead of duplicating`;
   }
 }
 
@@ -2537,6 +2573,7 @@ function bootTraceMessage(ack: UserBoxBootAck): string {
     case "adopt-resume-requested":
       return "private Box resume request was accepted by Box API";
     case "existing-boot":
+    case "adopt-inflight":
       return "private Box already exists and is booting";
     case "create-requested":
       return "private Box create request was accepted by Box API";

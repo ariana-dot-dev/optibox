@@ -499,6 +499,41 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Voice messages: transcribe recorded audio with OpenAI Whisper. The key is
+    // server-side (WHISPER_API_KEY), with a BYOK OpenAI key as fallback.
+    if (req.method === "POST" && url.pathname === "/api/transcribe") {
+      const body = await readBody(req, 64_000_000);
+      const json = (status: number, payload: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      const key = process.env.WHISPER_API_KEY
+        || credentialsFromBody(body).providerEnv.OPENAI_API_KEY
+        || process.env.OPENAI_API_KEY
+        || process.env.OPENAI_API_KEY_SCOPED;
+      if (!key) return void json(400, { ok: false, message: "No transcription key (set WHISPER_API_KEY or provide an OpenAI key in Settings)." });
+      if (typeof body.audioB64 !== "string") return void json(400, { ok: false, message: "audioB64 required" });
+      try {
+        const bytes = Buffer.from(body.audioB64, "base64");
+        const mime = typeof body.mime === "string" && body.mime ? body.mime : "audio/webm";
+        const ext = mime.includes("mp4") || mime.includes("mpeg") ? "mp4" : mime.includes("ogg") ? "ogg" : mime.includes("wav") ? "wav" : "webm";
+        const form = new FormData();
+        form.append("file", new Blob([bytes], { type: mime }), `audio.${ext}`);
+        form.append("model", "whisper-1");
+        const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${key}` },
+          body: form,
+        });
+        const text = await r.text();
+        if (!r.ok) return void json(502, { ok: false, message: `whisper ${r.status}: ${text.slice(0, 300)}` });
+        const parsed = JSON.parse(text);
+        return void json(200, { ok: true, text: String(parsed.text ?? "").trim() });
+      } catch (e) {
+        return void json(502, { ok: false, message: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/api/harnesses") {
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(
@@ -745,6 +780,7 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .attachDeck .card:hover{transform:translateY(-8px) rotate(0)!important;box-shadow:0 8px 22px rgba(0,0,0,.16);z-index:2;border-color:#d0d0d0}
 .attachDeck .card img,.attachDeck .card video{width:100%;height:100%;object-fit:cover;display:block}
 .attachDeck .card .cardIcon{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.03em;background:#f4f4f4}
+.attachDeck .card .cardAudio{flex-direction:column;gap:4px;background:#fdecec;color:#fc4b55}.attachDeck .card .cardAudio svg{width:26px;height:26px}.attachDeck .card .cardAudio span{font-size:8.5px;letter-spacing:.04em}
 .attachDeck .card .cardName{position:absolute;left:0;right:0;bottom:0;padding:3px 5px;font-size:8.5px;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.62));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .attachDeck .card .cardUp{position:absolute;inset:0;background:rgba(255,255,255,.55);display:flex;align-items:center;justify-content:center;font-size:9px;color:#333}
 .msg.user .attachDeck .card .cardName{color:#fff}
@@ -764,6 +800,23 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 .toolChainDetails{display:none;margin:6px 0 2px 14px;color:#333}.toolChain.open .toolChainDetails{display:grid;gap:6px}.toolCallDetail{font-size:12px;line-height:1.35}.toolCallHead{color:#111}.toolCallMeta{color:#555;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}.toolCallOutput{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#444;max-height:180px;overflow:auto}@keyframes toolEllipsis{0%{content:''}25%{content:'.'}50%{content:'..'}75%,100%{content:'...'}}
 .composer{position:relative;display:block;padding:16px;border-top:1px solid #e0e0e0;background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}.composer.attachDrop textarea{background:#f0f0f0;outline:2px dashed #fc4b55;outline-offset:-2px}textarea{width:100%;min-height:58px;max-height:140px;resize:none;border:0;background:#f6f6f6;color:#111;padding:13px 84px 13px 15px;font:inherit;font-weight:400;outline:none;display:block;border-radius:16px}textarea:focus{background:#f0f0f0}
 #attach{position:absolute;right:51px;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:#8a8a8a;border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}#attach:hover{background:#e6e6e6;color:#111}#attach svg{width:16px;height:16px;display:block}
+#mic{position:absolute;right:19px;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:#8a8a8a;border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}#mic:hover{background:#fc4b55;color:#fff}#mic svg{width:16px;height:16px;display:block}
+/* When there's text/attachments to send, swap mic->send; else show mic. */
+.composer.hasText #mic,.composer.recording #mic,.composer.recording #attach,.composer.recording #send,.composer.recording textarea{display:none}
+.composer:not(.hasText) #send{display:none}
+/* Telegram-style recording bar overlaying the input row. */
+.recBar{display:none;position:absolute;left:16px;right:16px;bottom:16px;height:58px;align-items:center;gap:10px;padding:0 8px 0 6px;background:#f0f0f0;border-radius:16px}
+.composer.recording .recBar{display:flex}
+.recBar .recBtn{width:34px;height:34px;min-height:34px;flex:0 0 auto;padding:0;border:0;border-radius:50%;background:transparent;color:#7a7a7a;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .15s ease,color .15s ease}.recBar .recBtn svg{width:18px;height:18px;display:block}
+.recBar .recTrash:hover{background:#e2e2e2;color:#fc4b55}
+.recBar .recPause:hover{background:#e2e2e2;color:#111}
+.recBar .recSend{background:#111;color:#fff}.recBar .recSend:hover{background:#fc4b55}
+.recBar.paused .recPause{color:#fc4b55}
+.recDot{width:9px;height:9px;border-radius:50%;background:#fc4b55;flex:0 0 auto;animation:recPulse 1.1s ease-in-out infinite}
+.recBar.paused .recDot{animation:none;opacity:.4}
+@keyframes recPulse{0%,100%{opacity:1}50%{opacity:.25}}
+.recWave{flex:1;height:34px;min-width:0}
+.recTime{flex:0 0 auto;font-size:12px;color:#555;font-variant-numeric:tabular-nums;min-width:34px;text-align:right}
 /* Pending (unsent) attachments preview as the SAME fanned deck as sent ones. */
 .pendingAttach{margin:0 0 8px}.pendingAttach:empty{display:none}
 .pendingAttach .cardRemove{position:absolute;top:3px;right:3px;width:17px;height:17px;min-height:0;box-sizing:border-box;border-radius:50%;background:rgba(17,17,17,.7);color:#fff;font-size:12px;line-height:1;cursor:pointer;opacity:0;transition:opacity .12s ease;z-index:3;padding:0;display:flex;align-items:center;justify-content:center}
@@ -805,7 +858,16 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
     <textarea id="msg" placeholder="Message…" aria-label="Message"></textarea>
     <button id="attach" type="button" aria-label="Attach files" title="Attach files"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M209.66,122.34a8,8,0,0,1,0,11.32l-82.05,82a56,56,0,0,1-79.2-79.21L147.67,35.73a40,40,0,1,1,56.61,56.55L105,193A24,24,0,1,1,71,159L154.3,74.38A8,8,0,1,1,165.7,85.6L82.39,170.31a8,8,0,1,0,11.27,11.36L192.93,81A24,24,0,1,0,159,47L59.76,147.68a40,40,0,1,0,56.53,56.62l82.06-82A8,8,0,0,1,209.66,122.34Z"/></svg></button>
     <input id="fileInput" type="file" multiple hidden aria-hidden="true"/>
+    <button id="mic" type="button" aria-label="Record voice message" title="Record voice message"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M80,128V64a48,48,0,0,1,96,0v64a48,48,0,0,1-96,0Zm128,0a8,8,0,0,0-16,0,64,64,0,0,1-128,0,8,8,0,0,0-16,0,80.11,80.11,0,0,0,72,79.6V240a8,8,0,0,0,16,0V207.6A80.11,80.11,0,0,0,208,128Z"/></svg></button>
     <button id="send" type="submit" aria-label="Send" title="Send"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68ZM157.83,231.85l-.05.14,0-.07-40.06-82.3,48-48a8,8,0,0,0-11.31-11.31l-48,48L24.08,98.25l-.07,0,.14,0L216,40Z"/></svg></button>
+    <div class="recBar" id="recBar" aria-hidden="true">
+      <button type="button" class="recBtn recTrash" id="recTrash" aria-label="Discard recording" title="Discard"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M216,48H176V40a24,24,0,0,0-24-24H104A24,24,0,0,0,80,40v8H40a8,8,0,0,0,0,16h8V208a16,16,0,0,0,16,16H192a16,16,0,0,0,16-16V64h8a8,8,0,0,0,0-16ZM112,168a8,8,0,0,1-16,0V104a8,8,0,0,1,16,0Zm48,0a8,8,0,0,1-16,0V104a8,8,0,0,1,16,0Zm0-120H96V40a8,8,0,0,1,8-8h48a8,8,0,0,1,8,8Z"/></svg></button>
+      <span class="recDot" id="recDot"></span>
+      <canvas class="recWave" id="recWave"></canvas>
+      <span class="recTime" id="recTime">0:00</span>
+      <button type="button" class="recBtn recPause" id="recPause" aria-label="Pause recording" title="Pause"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M216,48V208a16,16,0,0,1-16,16H160a16,16,0,0,1-16-16V48a16,16,0,0,1,16-16h40A16,16,0,0,1,216,48ZM96,32H56A16,16,0,0,0,40,48V208a16,16,0,0,0,16,16H96a16,16,0,0,0,16-16V48A16,16,0,0,0,96,32Z"/></svg></button>
+      <button type="button" class="recBtn recSend" id="recSend" aria-label="Send voice message" title="Send"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68Z"/></svg></button>
+    </div>
   </form>
   <footer class="composerBar" aria-label="controls">
     <button id="stopBox" type="button">Pause Box now</button>
@@ -1069,18 +1131,23 @@ let lastSubmitAt=0;
 // upload into the box under attachments/ so the panel and the agent see them.
 let pendingFiles=[];
 const IMG_RE=/\\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
-const VID_RE=/\\.(mp4|webm|m4v|mov|ogv)$/i;
+const VID_RE=/\\.(mp4|m4v|mov|ogv)$/i;
+const AUD_RE=/\\.(mp3|wav|ogg|oga|m4a|aac|flac|opus|weba)$/i;
+const MIC_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M80,128V64a48,48,0,0,1,96,0v64a48,48,0,0,1-96,0Zm128,0a8,8,0,0,0-16,0,64,64,0,0,1-128,0,8,8,0,0,0-16,0,80.11,80.11,0,0,0,72,79.6V240a8,8,0,0,0,16,0V207.6A80.11,80.11,0,0,0,208,128Z"/></svg>';
+function isAudioName(n){return AUD_RE.test(n)||/^voice-/i.test(n)||(/\\.webm$/i.test(n)&&/^voice-/i.test(n));}
 function fileExt(n){const p=(n.split('.').pop()||'').toLowerCase();return p.length>4?'file':p;}
 function readAsB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=()=>rej(new Error('read failed'));r.readAsDataURL(file);});}
 function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)break;pendingFiles.push(f);}renderPending();}
 function renderPending(){
   const c=$('pendingAttach');if(!c)return;c.innerHTML='';
+  updateComposerMode();
   if(!pendingFiles.length)return;
   c.className='pendingAttach attachDeck';
   pendingFiles.forEach((f,i)=>{
     const card=document.createElement('div');card.className='card';card.title=f.name;
     if(IMG_RE.test(f.name)){const img=document.createElement('img');img.src=URL.createObjectURL(f);card.appendChild(img);}
     else if(VID_RE.test(f.name)){const v=document.createElement('video');v.src=URL.createObjectURL(f);v.muted=true;card.appendChild(v);}
+    else if(isAudioName(f.name)){const e=document.createElement('div');e.className='cardIcon cardAudio';e.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(e);}
     else{const e=document.createElement('div');e.className='cardIcon';e.textContent=fileExt(f.name);card.appendChild(e);}
     const nm=document.createElement('div');nm.className='cardName';nm.textContent=f.name;card.appendChild(nm);
     const x=document.createElement('button');x.type='button';x.className='cardRemove';x.textContent='×';x.title='remove';
@@ -1097,6 +1164,7 @@ function renderAttachDeck(el,atts){
     const card=document.createElement('div');card.className='card';card.title=a.name;
     if(IMG_RE.test(a.name)){const img=document.createElement('img');img.src=URL.createObjectURL(new Blob([a.bytes]));card.appendChild(img);}
     else if(VID_RE.test(a.name)){const v=document.createElement('video');v.src=URL.createObjectURL(new Blob([a.bytes]));v.muted=true;card.appendChild(v);}
+    else if(isAudioName(a.name)){const ic=document.createElement('div');ic.className='cardIcon cardAudio';ic.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(ic);}
     else{const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(a.name);card.appendChild(ic);}
     const nm=document.createElement('div');nm.className='cardName';nm.textContent=a.name;card.appendChild(nm);
     card.addEventListener('click',()=>{try{window.__optiboxFs.openBytes(a.name,a.bytes);}catch(_){}});
@@ -1131,6 +1199,79 @@ stopBtn.addEventListener('click',async e=>{e.preventDefault();stopBtn.disabled=t
 diagnosticsBtn?.addEventListener('click',e=>{e.preventDefault();const a=document.createElement('a');a.href='/api/diagnostics?format=json';a.download='optibox-diagnostics.json';document.body.appendChild(a);a.click();a.remove();addMsg('trace','diagnostics','downloaded redacted JSON event log from /api/diagnostics\\n');});
 msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer('textarea.enter');}});
 msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer('textarea.beforeinput');}});
+msgEl.addEventListener('input',updateComposerMode);
+// ---- voice messages -------------------------------------------------------
+// Telegram-style: mic shows when the box is empty; press it to record with a
+// live waveform, pause/resume, trash, or send. Send transcribes via Whisper
+// (server key) and posts the transcript AND the audio file as an attachment.
+function updateComposerMode(){if(!composer||!composer.classList)return;composer.classList.toggle('hasText',((msgEl&&msgEl.value||'').trim().length>0)||pendingFiles.length>0);}
+let mediaRec=null,mediaStream=null,audioCtx=null,analyser=null,recChunks=[],recStart=0,recElapsed=0,recPaused=false,recRAF=0,recTimer=0,recMime='audio/webm';
+const PAUSE_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M216,48V208a16,16,0,0,1-16,16H160a16,16,0,0,1-16-16V48a16,16,0,0,1,16-16h40A16,16,0,0,1,216,48ZM96,32H56A16,16,0,0,0,40,48V208a16,16,0,0,0,16,16H96a16,16,0,0,0,16-16V48A16,16,0,0,0,96,32Z"/></svg>';
+const PLAY_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M240,128a15.74,15.74,0,0,1-7.6,13.51L88.32,229.65a16,16,0,0,1-16.2.3A15.86,15.86,0,0,1,64,216.13V39.87a15.86,15.86,0,0,1,8.12-13.82,16,16,0,0,1,16.2.3L232.4,114.49A15.74,15.74,0,0,1,240,128Z"/></svg>';
+function fmtTime(s){const m=Math.floor(s/60);const ss=Math.floor(s%60);return m+':'+(ss<10?'0':'')+ss;}
+function recTimeNow(){return recElapsed+(recPaused?0:(Date.now()-recStart)/1000);}
+async function startRecording(){
+  if(composer.classList.contains('recording'))return;
+  let stream;
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:true});}
+  catch(e){addMsg('trace','microphone','microphone unavailable: '+String(e&&e.message||e)+'\\n');return;}
+  mediaStream=stream;recChunks=[];recElapsed=0;recPaused=false;
+  const pick=['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg'].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||'';
+  recMime=pick||'audio/webm';
+  mediaRec=new MediaRecorder(stream,pick?{mimeType:pick}:undefined);
+  mediaRec.ondataavailable=e=>{if(e.data&&e.data.size)recChunks.push(e.data);};
+  mediaRec.start(100);recStart=Date.now();
+  const bar=$('recBar');bar.classList.remove('paused');$('recPause').innerHTML=PAUSE_SVG;$('recPause').title='Pause';$('recTime').textContent='0:00';
+  composer.classList.add('recording');
+  try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();const src=audioCtx.createMediaStreamSource(stream);analyser=audioCtx.createAnalyser();analyser.fftSize=1024;src.connect(analyser);drawWave();}catch(_){}
+  recTimer=setInterval(()=>{$('recTime').textContent=fmtTime(recTimeNow());},200);
+}
+function drawWave(){
+  const c=$('recWave');if(!c||!analyser)return;
+  const ctx=c.getContext('2d');const dpr=window.devicePixelRatio||1;const W=c.clientWidth||300,H=c.clientHeight||34;
+  if(c.width!==Math.round(W*dpr)){c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);}
+  const buf=new Uint8Array(analyser.frequencyBinCount);
+  const loop=()=>{
+    if(!composer.classList.contains('recording'))return;
+    recRAF=requestAnimationFrame(loop);
+    analyser.getByteTimeDomainData(buf);
+    ctx.clearRect(0,0,W,H);ctx.fillStyle=recPaused?'#bbb':'#fc4b55';
+    const bars=Math.max(20,Math.floor(W/4));const step=Math.max(1,Math.floor(buf.length/bars));const bw=W/bars;
+    for(let i=0;i<bars;i++){let peak=0;for(let j=0;j<step;j++){const v=Math.abs(buf[i*step+j]-128)/128;if(v>peak)peak=v;}const bh=Math.max(2,peak*H*0.92);ctx.fillRect(i*bw+bw*0.25,(H-bh)/2,Math.max(1,bw*0.5),bh);}
+  };
+  loop();
+}
+function pauseResume(){
+  if(!mediaRec)return;
+  if(recPaused){if(mediaRec.resume)mediaRec.resume();recPaused=false;recStart=Date.now();if(audioCtx&&audioCtx.resume)audioCtx.resume();$('recBar').classList.remove('paused');$('recPause').innerHTML=PAUSE_SVG;$('recPause').title='Pause';}
+  else{recElapsed=recTimeNow();if(mediaRec.pause)mediaRec.pause();recPaused=true;$('recBar').classList.add('paused');$('recPause').innerHTML=PLAY_SVG;$('recPause').title='Resume';}
+}
+function stopRecTracks(){try{cancelAnimationFrame(recRAF);}catch(_){}try{clearInterval(recTimer);}catch(_){}if(mediaStream)mediaStream.getTracks().forEach(t=>t.stop());if(audioCtx&&audioCtx.close)try{audioCtx.close();}catch(_){}audioCtx=null;analyser=null;mediaStream=null;}
+function endRecUI(){composer.classList.remove('recording');$('recTime').textContent='0:00';updateComposerMode();}
+function trashRecording(){if(mediaRec){mediaRec.ondataavailable=null;mediaRec.onstop=null;if(mediaRec.state!=='inactive')try{mediaRec.stop();}catch(_){}}mediaRec=null;recChunks=[];stopRecTracks();endRecUI();}
+async function finishRecording(){
+  if(!mediaRec)return;const rec=mediaRec;mediaRec=null;
+  const blob=await new Promise(resolve=>{rec.onstop=()=>resolve(new Blob(recChunks,{type:recMime}));if(rec.state!=='inactive'){try{rec.stop();}catch(_){resolve(new Blob(recChunks,{type:recMime}));}}else resolve(new Blob(recChunks,{type:recMime}));});
+  stopRecTracks();endRecUI();
+  if(!blob||!blob.size)return;
+  const ext=recMime.indexOf('mp4')>=0?'m4a':recMime.indexOf('ogg')>=0?'ogg':'webm';
+  const file=new File([blob],'voice-'+Date.now()+'.'+ext,{type:recMime});
+  addMsg('trace','voice','transcribing voice message…\\n');
+  let text='';
+  try{
+    const b64=await readAsB64(file);
+    const r=await fetch('/api/transcribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({audioB64:b64,mime:recMime,apiKeys:currentApiKeys()})});
+    const j=await r.json();
+    if(!j.ok)throw new Error(j.message||'transcription failed');
+    text=(j.text||'').trim();
+  }catch(e){addMsg('assistant','error','Could not transcribe voice message: '+String(e&&e.message||e));return;}
+  runTurn(text||'(voice message)',[file]);
+}
+$('mic').addEventListener('click',startRecording);
+$('recTrash').addEventListener('click',trashRecording);
+$('recPause').addEventListener('click',pauseResume);
+$('recSend').addEventListener('click',finishRecording);
+updateComposerMode();
 async function drain(res,localId){if(!res){throw new Error('No response object from /api/send');}if(!res.ok){const body=await res.text().catch(()=>'');throw new Error('/api/send failed with HTTP '+res.status+' '+body);}if(!res.body){throw new Error('/api/send did not return a readable SSE body');}const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls+(ev.messageId?':msg:'+ev.messageId:(ev.messageIndex!=null?':msg:'+ev.messageIndex:''));}
 function handle(ev,localId){console.debug('[trace] stream event', ev);const isLatest=(localId===latestLocalId);

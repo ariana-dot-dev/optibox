@@ -265,10 +265,11 @@ function markSaved(saveBtn, ok, msg) {
 }
 
 const IMG_EXT = /\.(png|jpe?g|gif|webp|bmp|ico|avif|svg)$/i;
-const VIDEO_EXT = /\.(mp4|webm|m4v|mov|ogv)$/i;
+const VIDEO_EXT = /\.(mp4|m4v|mov|ogv)$/i;
+const AUDIO_EXT = /\.(mp3|wav|ogg|oga|m4a|aac|flac|opus|weba)$/i;
 const SHEET_EXT = /\.(xlsx|xls)$/i;
 const SQLITE_EXT = /\.(sqlite3?|db)$/i;
-const MIME_BY_EXT = { svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", m4v: "video/mp4", mov: "video/quicktime", ogv: "video/ogg", png: "image/png", gif: "image/gif", webp: "image/webp", jpg: "image/jpeg", jpeg: "image/jpeg" };
+const MIME_BY_EXT = { svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", m4v: "video/mp4", mov: "video/quicktime", ogv: "video/ogg", png: "image/png", gif: "image/gif", webp: "image/webp", jpg: "image/jpeg", jpeg: "image/jpeg", mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg", m4a: "audio/mp4", aac: "audio/aac", flac: "audio/flac", opus: "audio/ogg", weba: "audio/webm" };
 const mimeFor = (name) => MIME_BY_EXT[(name.split(".").pop() || "").toLowerCase()] || "";
 
 // Dispatch already-loaded bytes to the right renderer. path is null for bytes
@@ -277,6 +278,7 @@ const mimeFor = (name) => MIME_BY_EXT[(name.split(".").pop() || "").toLowerCase(
 function dispatchViewer(name, bytes, canSave, path) {
   if (/\.pdf$/i.test(name)) return showPdf(path, name, bytes);
   if (IMG_EXT.test(name)) return showImage(path, name, bytes);
+  if (AUDIO_EXT.test(name) || /^voice-.*\.webm$/i.test(name)) return showAudio(path, name, bytes);
   if (VIDEO_EXT.test(name)) return showVideo(path, name, bytes);
   if (SHEET_EXT.test(name)) return showSheet(path, name, bytes, canSave);
   if (SQLITE_EXT.test(name)) return showSqlite(path, name, bytes, canSave);
@@ -382,6 +384,21 @@ function showVideo(path, name, bytes) {
   // Codec the browser can't decode -> fall back to the binary notice.
   video.addEventListener("error", () => { showBinary(path, name, bytes); }, { once: true });
   body.appendChild(video);
+  body.appendChild(cornerDownload(name, bytes));
+}
+
+function showAudio(path, name, bytes) {
+  const { body } = viewerParts(name, false);
+  const wrap = document.createElement("div");
+  wrap.className = "fsAudioWrap";
+  const audio = document.createElement("audio");
+  audio.className = "fsAudio";
+  audio.controls = true;
+  // Voice notes are audio/webm(opus); tag the blob so the browser decodes it.
+  audio.src = blobUrl(bytes, mimeFor(name) || (/^voice-/i.test(name) ? "audio/webm" : ""));
+  audio.addEventListener("error", () => { showBinary(path, name, bytes); }, { once: true });
+  wrap.appendChild(audio);
+  body.appendChild(wrap);
   body.appendChild(cornerDownload(name, bytes));
 }
 

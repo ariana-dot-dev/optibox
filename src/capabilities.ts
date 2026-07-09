@@ -184,9 +184,26 @@ function parseHarnessJsonLine(line: string, parser: HarnessOutputParser): Harnes
     return emitNewSuffix(text, parser);
   }
 
-  if (parser.mode === "opencode-json" || parser.mode === "pi-json") {
-    if (parser.mode === "pi-json") emitPiToolEvent(j, parser);
-    else emitGenericToolEvent(j, parser);
+  if (parser.mode === "pi-json") {
+    emitPiToolEvent(j, parser);
+    noteMessageBoundary(j, parser);
+    const ev = j.assistantMessageEvent;
+    // Assistant text streams ONLY as message_update/text_delta. Pi ALSO emits
+    // message_start/message_end for the USER message (role:"user") echoing the
+    // full prompt — extracting text from those would leak the entire hidden
+    // system-instruction XML back as the assistant's visible reply. So the
+    // final-text safety net is strictly gated to role:"assistant".
+    if (j.type === "message_update" && ev?.type === "text_delta" && typeof ev.delta === "string" && j.message?.role !== "user") {
+      return emitChunk(ev.delta, parser);
+    }
+    if (j.type === "message_end" && j.message?.role === "assistant") {
+      return emitNewSuffix(String(extractAssistantMessageText(j.message) || ""), parser);
+    }
+    return undefined;
+  }
+
+  if (parser.mode === "opencode-json") {
+    emitGenericToolEvent(j, parser);
     noteMessageBoundary(j, parser);
     const ev = j.assistantMessageEvent;
     if (j.type === "message_update" && ev?.type === "text_delta" && typeof ev.delta === "string") {

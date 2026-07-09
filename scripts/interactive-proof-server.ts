@@ -331,6 +331,9 @@ const desktopHolds = new Map<string, () => void>();
 // box-still-needed flag (countdown pauses at full); the client pings every few
 // seconds while composing, so a short TTL drops the flag soon after they stop.
 const composingHolds = new Map<string, () => void>();
+// Users with a cold box-boot (fork on first keystroke) in flight — dedupes the
+// 4s composing pings so typing spawns at most one fork, not one per ping.
+const coldBooting = new Set<string>();
 
 function fsBoxClient(credentials: DemoCredentials): BoxHttpClient {
   if (!credentials.boxApiKey) throw new Error("BOX_API_KEY is required");
@@ -603,18 +606,39 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     // renew a rolling hold (pauses any running countdown at full) and wake the
     // box if it's parked so it's warm by the time the message is sent.
     if (pathname === "/api/fs/activity") {
+      const orch = orchestratorFor(credentials);
       composingHolds.get(userId)?.();
-      composingHolds.set(userId, orchestratorFor(credentials).holdUserBox(userId, "composing", 15_000));
+      composingHolds.set(userId, orch.holdUserBox(userId, "composing", 15_000));
       if (box) {
         // Wake + bill through the one shared machinery: the counter, reaper
         // and status endpoint all see this machine like a turn-started one.
-        orchestratorFor(credentials).registerExternalWake(box.id, userId, "composing");
+        orch.registerExternalWake(box.id, userId, "composing");
         if (!live) {
           fsLog({ route: "activity", userId, note: "composing wake", boxId: box.id, state: box.state });
           void client.resume(box.id).catch(() => undefined);
         }
+      } else if (!coldBooting.has(userId)) {
+        // No box exists yet (fresh account / post-reset): typing must still
+        // "start the machine". Fork/boot one now — ONCE per user (deduped), fired
+        // and forgotten — and start billing the instant the box id is known
+        // (onBootAck) so the counter appears immediately. The composing hold keeps
+        // it alive; the reaper reclaims it if the user stops typing without sending.
+        // The session is keyed to the SAME conversation the send will use, so
+        // /api/send reuses this exact box instead of forking a second one.
+        coldBooting.add(userId);
+        const convId = String(body.conversationId ?? "conv-1");
+        fsLog({ route: "activity", userId, note: "cold boot on type", conversationId: convId });
+        void orch.ensureUserBox(userId, convId, (ack: any) => {
+          const b = ack?.box;
+          if (b?.id) orch.registerExternalWake(b.id, userId, "composing");
+        }).then((booted) => {
+          // Fresh fork/create may not emit a boot-ack; bill on the resolved box
+          // too (registerExternalWake is idempotent — no-ops if already billing).
+          if (booted?.id) orch.registerExternalWake(booted.id, userId, "composing");
+        }).catch((e) => fsLog({ route: "activity", userId, note: "cold boot failed", message: String(e).slice(0, 140) }))
+          .finally(() => coldBooting.delete(userId));
       }
-      return json(200, { ok: true, state: box?.state ?? "none", live }), true;
+      return json(200, { ok: true, state: box?.state ?? "none", live, ...(coldBooting.has(userId) ? { booting: true } : {}) }), true;
     }
 
     // Remove a staged attachment the user deleted from the composer before
@@ -1632,7 +1656,7 @@ function notifyComposing(){
   const now=Date.now();
   if(now-lastComposePing<4000)return;
   lastComposePing=now;
-  fetch('/api/fs/activity',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})}).catch(()=>{});
+  fetch('/api/fs/activity',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()})}).catch(()=>{});
 }
 // ---- voice messages -------------------------------------------------------
 // Telegram-style: mic shows when the box is empty; press it to record with a

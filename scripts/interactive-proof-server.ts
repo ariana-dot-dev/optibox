@@ -33,13 +33,16 @@ const allowServerKeys =
     process.env.OPTIBOX_ALLOW_SERVER_KEYS !== "0");
 
 const allSpecs: RealCliHarnessSpec[] = [
+  // Pi first → it is the default harness/model selection (the client picks the
+  // first harness whose provider key is available). OpenRouter-backed, feature-
+  // complete, being trialled against opencode for snappiness/stability.
+  piSpec,
   claudeSpec,
   codebaseDaemonSpec,
   codexSpec,
   opencodeOpenrouterSpec,
   openclaudeSpec,
   opencodeSpec,
-  piSpec,
 ];
 
 interface DemoCredentials {
@@ -173,7 +176,10 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
     // creating an empty box and npm-installing opencode inside it (~15-40s).
     userBoxTemplate: {
       name: "consumer-agent-template",
-      installCmd: "npm i -g opencode-ai@latest >/tmp/opencode-install.log 2>&1",
+      // Pi is the default harness now, so it MUST be baked into the template or
+      // every fresh box pays a 15-40s npm install on its first turn. opencode
+      // stays installed too so switching harnesses is still instant.
+      installCmd: "npm i -g --ignore-scripts @earendil-works/pi-coding-agent >/tmp/pi-install.log 2>&1; npm i -g opencode-ai@latest >/tmp/opencode-install.log 2>&1",
     },
   });
   orchestrators.set(cacheKey, orchestrator);
@@ -1171,7 +1177,30 @@ textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px inpu
   </section>
 </div>
 <script>
-let H=[]; let PRICING=null; let HARNESS_META={serverKeysAllowed:false,credentialMode:'byok-required',env:{}}; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser=(new URLSearchParams(location.search).get('userId')||'user-a'), selectedConversation=(new URLSearchParams(location.search).get('conversationId')||('conv-'+Math.random().toString(36).slice(2,10)));
+// Per-device identity. Boxes are named per userId server-side, so a shared link
+// with a fixed id would put every visitor on ONE box (shared files, one billing
+// meter, colliding turns). Derive a stable id from a browser fingerprint plus a
+// persisted random suffix — the fingerprint separates device models even when
+// storage is wiped; the random suffix separates two identical devices; the
+// localStorage cache keeps the SAME device on the SAME box (and its files)
+// across reloads. Every branch is guarded so the headless client test (no
+// navigator/screen/localStorage/crypto) still falls back to a random id.
+function fnv1a(s){let h=0x811c9dc5>>>0;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,0x01000193)>>>0;}return h.toString(36);}
+function canvasFp(){try{var c=document.createElement('canvas');var x=c.getContext('2d');if(!x)return'nocanvas';x.textBaseline='top';x.font="14px 'Arial'";x.fillStyle='#f60';x.fillRect(0,0,80,20);x.fillStyle='#069';x.fillText('optibox-fp-\u{1F600}-☃',2,2);return c.toDataURL();}catch(_){return'nocanvas';}}
+function deviceUserId(){
+  try{var q=new URLSearchParams(location.search).get('userId');if(q)return q;}catch(_){}
+  try{var s=localStorage.getItem('optibox_uid');if(s)return s;}catch(_){}
+  var id;
+  try{
+    var n=navigator, sig=[n.userAgent,n.language,(n.languages||[]).join(','),n.platform,n.hardwareConcurrency,n.deviceMemory,screen.width+'x'+screen.height+'x'+screen.colorDepth,window.devicePixelRatio,Intl.DateTimeFormat().resolvedOptions().timeZone,new Date().getTimezoneOffset(),canvasFp()].join('|');
+    var fp=fnv1a(sig)+fnv1a(sig.split('').reverse().join('')+'x');
+    var rnd;try{var a=new Uint8Array(6);crypto.getRandomValues(a);rnd=Array.from(a).map(function(b){return(b%36).toString(36);}).join('');}catch(_){rnd=Math.random().toString(36).slice(2,8);}
+    id='u-'+fp+'-'+rnd;
+    try{localStorage.setItem('optibox_uid',id);}catch(_){}
+  }catch(_){id='u-'+Math.random().toString(36).slice(2,10);}
+  return id;
+}
+let H=[]; let PRICING=null; let HARNESS_META={serverKeysAllowed:false,credentialMode:'byok-required',env:{}}; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser=deviceUserId(), selectedConversation=(new URLSearchParams(location.search).get('conversationId')||('conv-'+Math.random().toString(36).slice(2,10)));
 let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
 let autoStopInterval=null, autoStopDeadline=0, autoStopBoxId=null;
 const $=id=>document.getElementById(id);

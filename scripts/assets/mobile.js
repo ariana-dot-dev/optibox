@@ -1,3 +1,6 @@
+// Note: the hosted preview's auto-redeploy poller (deploy/redeploy.sh, box-side
+// only, not in this repo) is what picks up changes to this file within ~20s of
+// a push to main.
 // Mobile horizontal pager glue. The paging itself is native CSS scroll-snap on
 // .shell (a full-screen x-mandatory snap row: Files / Chat / Backend); this
 // script only (1) parks the view on Chat as the start page and (2) lights the

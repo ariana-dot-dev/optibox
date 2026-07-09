@@ -1095,26 +1095,25 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .path{position:relative;height:30px;display:flex;align-items:center;justify-content:center}.path .arrow{position:absolute;top:-1px;bottom:-1px;left:50%;width:2px;background:#e0e0e0;transform:translateX(-50%)}.path .arrow:after{content:"";position:absolute;left:50%;bottom:3px;width:6px;height:6px;border-right:2px solid #e0e0e0;border-bottom:2px solid #e0e0e0;transform:translateX(-50%) rotate(45deg)}.path .pathLabel{position:relative;z-index:1;background:#fff;padding:0 8px;color:#a6a6a6;font-size:10.5px;letter-spacing:.02em}
 .packet{position:absolute;left:0;top:0;z-index:3;line-height:1;transform:translate(-50%,-50%);opacity:0;transition:top .45s cubic-bezier(.5,0,.2,1),left .45s cubic-bezier(.5,0,.2,1),opacity .25s ease;pointer-events:none;color:#111;background:#fff;border:1px solid #e0e0e0;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center}.packet svg{width:14px;height:14px;display:block}.packet[data-kind="ok"]{color:#1a7f37;border-color:#1a7f37}.packet[data-kind="warn"]{color:#b54708;border-color:#b54708}
 .routeCaption{margin-top:14px;min-height:15px;font-size:11px;font-weight:400;color:#a0a0a0;line-height:1.4}.schematic[data-route="error"] .routeCaption{color:#9f1239}
-/* Mobile: the three panes become a full-screen VERTICAL pager. Chat is the home
-   page and sits at the TOP; Files then Backend stack below it, reached by
-   swiping UP (Chat → Files → Backend). Order matters: the chat has its own tall
-   scrollable history that the app pins to the newest message (its bottom edge),
-   so the only swipe direction that reliably chains out to the pager is "up"
-   (a down-scroll) — a swipe down just scrolls history. Stacking BOTH auxiliary
-   views on that un-gated side is what makes them both reachable; with Chat in
-   the middle, Backend sat above it and was walled off behind the whole
-   conversation. Native CSS scroll-snap column: the drag-reveal-commit and
-   momentum are the browser's, with no fight with the left-edge back gesture.
-   mobile.js only parks the start page on Chat and lights the position dots. */
+/* Mobile: the three panes become a full-screen HORIZONTAL pager. Chat is the
+   home page in the middle; Files sits to its LEFT (swipe right reveals it) and
+   Backend to its RIGHT (swipe left). Horizontal, not vertical: a vertical pager
+   shares its axis with the on-screen keyboard (which resizes the viewport
+   vertically) and with the chat's own vertical message-history scroll, and the
+   two fought constantly — focusing the composer, or even just the keyboard's
+   show/hide viewport resize, could force a page-snap jump. Horizontal shares no
+   axis with either, so nothing to fight. Native CSS scroll-snap row: the
+   drag-reveal-commit and momentum are the browser's; mobile.js only parks the
+   start page on Chat and lights the position dots. */
 .mobileDots{display:none}
 @media(max-width:900px){
 html{zoom:1;--z:1}
 body{overflow:hidden;overscroll-behavior:none}
-.shell{display:flex;flex-direction:column;max-width:none;width:100vw;height:100dvh;padding:0;gap:0;overflow-y:scroll;overflow-x:hidden;scroll-snap-type:y mandatory;-webkit-overflow-scrolling:touch;overscroll-behavior:none;touch-action:pan-y;scrollbar-width:none}
+.shell{display:flex;flex-direction:row;max-width:none;width:100vw;height:100dvh;padding:0;gap:0;overflow-x:scroll;overflow-y:hidden;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;overscroll-behavior:none;touch-action:pan-x;scrollbar-width:none}
 .shell::-webkit-scrollbar{display:none}
-.shell>.fsPanel,.shell>.app,.shell>.schematic{flex:0 0 100dvh;width:100vw;min-width:0;max-width:none;height:100dvh;margin:0;align-self:stretch;border:0;border-radius:0;overflow-x:clip;scroll-snap-align:start;scroll-snap-stop:always}
-.shell>.app{order:0}
-.shell>.fsPanel{order:1;padding:calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom))}
+.shell>.fsPanel,.shell>.app,.shell>.schematic{flex:0 0 100vw;height:100dvh;min-width:0;max-width:none;width:100vw;margin:0;align-self:stretch;border:0;border-radius:0;overflow-y:clip;scroll-snap-align:start;scroll-snap-stop:always}
+.shell>.fsPanel{order:0;padding:calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom))}
+.shell>.app{order:1}
 .shell>.schematic{order:2;display:flex;flex-direction:column;justify-content:center;padding:20px 16px}
 /* Mobile type + spacing: the base sizes are tuned for the desktop 1.15 zoom;
    with zoom reset to 1 they read oversized on a phone, so step them down and

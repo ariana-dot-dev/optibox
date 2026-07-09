@@ -964,7 +964,7 @@ function html() {
    aspect ratio (supported in Chrome/Edge/Safari and Firefox 126+). Viewport
    units are scaled by zoom too, so every dvh sizing divides by --z or the page
    would overflow the real viewport by 15%. */
-html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}body.hide-traces .msg.trace{display:none}
+html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body{min-height:calc(100dvh/var(--z));background:#fff}body.hide-traces .msg.trace{display:none}
 .shell{height:calc(100dvh/var(--z));max-width:1500px;margin:0 auto;display:grid;grid-template-columns:290px minmax(380px,560px) 330px;gap:24px;align-items:stretch;padding:0 24px}
 .fsPanel{align-self:center;height:min(78dvh,760px)}.app{height:calc(100dvh/var(--z));min-width:0;display:flex;flex-direction:column;background:#fff;border-left:1px solid #e0e0e0;border-right:1px solid #e0e0e0}
 .top{position:sticky;top:0;z-index:2;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid #e0e0e0;padding:calc(14px + env(safe-area-inset-top)) 16px 14px;display:grid;gap:12px}
@@ -1052,19 +1052,39 @@ html{zoom:1.15;--z:1.15}body{min-height:calc(100dvh/var(--z));background:#fff}bo
 /* Mobile: the three panes become a full-screen horizontal pager — Backend |
    Chat | Files — with Chat as home (page 1). mobile.js moves the strip 1:1
    with the finger via --dragx and commits --page on release. Zoom returns to 1
-   so 100vw/100dvh are real screen units. */
+   so 100vw/100dvh are real screen units, and every pane clips its own
+   horizontal overflow so nothing can scroll the page sideways under the pager. */
 .mobileDots{display:none}
-@media(max-width:900px){html{zoom:1;--z:1}body{overflow:hidden;overscroll-behavior-x:none}
-.shell{display:flex;max-width:none;height:100dvh;padding:0;gap:0;touch-action:pan-y;will-change:transform;transform:translate3d(calc(var(--page,1)*-100vw + var(--dragx,0px)),0,0)}
+@media(max-width:900px){
+html{zoom:1;--z:1}
+body{overflow:hidden;overscroll-behavior:none}
+.shell{display:flex;max-width:none;width:100vw;height:100dvh;padding:0;gap:0;touch-action:pan-y;will-change:transform;transform:translate3d(calc(var(--page,1)*-100vw + var(--dragx,0px)),0,0)}
 .shell.pageSnap{transition:transform .3s cubic-bezier(.22,.61,.36,1)}
-.shell>.fsPanel,.shell>.app,.shell>.schematic{flex:0 0 100vw;width:100vw;max-width:none;height:100dvh;margin:0;align-self:stretch;border:0;border-radius:0}
-.shell>.schematic{order:-1;display:flex;flex-direction:column;justify-content:center;padding:24px 20px}
-.shell>.fsPanel{order:1;padding:calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom))}
-.composer{padding-bottom:calc(16px + env(safe-area-inset-bottom))}
-.mobileDots{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(5px + env(safe-area-inset-bottom));display:flex;gap:6px;z-index:15;pointer-events:none}
+.shell>.fsPanel,.shell>.app,.shell>.schematic{flex:0 0 100vw;width:100vw;min-width:0;max-width:none;height:100dvh;margin:0;align-self:stretch;border:0;border-radius:0;overflow-x:clip}
+.shell>.schematic{order:-1;display:flex;flex-direction:column;justify-content:center;padding:20px 16px}
+.shell>.fsPanel{order:1;padding:calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom))}
+/* Mobile type + spacing: the base sizes are tuned for the desktop 1.15 zoom;
+   with zoom reset to 1 they read oversized on a phone, so step them down and
+   tighten padding to phone proportions. */
+.top{padding:calc(10px + env(safe-area-inset-top)) 12px 10px;gap:9px}
+.counters{gap:6px}.counter{padding:8px 9px;border-radius:9px}
+.label{font-size:10.5px}.value{font-size:16px}.state{font-size:11px}
+.chat{padding:14px 12px 16px;gap:9px}
+.msg{max-width:88%;font-size:14px;padding:9px 11px}
+.msg.trace{font-size:11.5px}
+.empty{font-size:13px}
+.msg .body pre{max-width:100%}
+.composer{padding:12px 12px calc(12px + env(safe-area-inset-bottom))}
+textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px input font stops iOS zoom-on-focus */
+.schematic h2{font-size:18px;margin-bottom:14px}
+.node .nodeTitle{font-size:13.5px}.node .nodeSub{font-size:11px}
+.composerBar{padding-bottom:calc(11px + env(safe-area-inset-bottom))}
+.mobileDots{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(6px + env(safe-area-inset-bottom));display:flex;gap:6px;z-index:15;pointer-events:none}
 .mobileDots span{width:6px;height:6px;border-radius:50%;background:#d4d4d4;transition:background .25s ease,transform .25s ease}
-.mobileDots span.on{background:#111;transform:scale(1.25)}}
-@media(max-width:520px){.app{max-width:none;border:0}.top{padding-left:10px;padding-right:10px}.chat{padding-left:10px;padding-right:10px}.composer{padding-left:10px;padding-right:10px}.counter{padding:10px}.value{font-size:18px}.state{font-size:12px;line-height:1.25}.msg{max-width:90%;font-size:14px}.label{font-size:11px}button{padding:0 14px}#send{right:13px}#attach{right:45px}}
+.mobileDots span.on{background:#111;transform:scale(1.25)}
+}
+/* The former ≤520px block folded into the ≤900px mobile pager rules above so a
+   single source of truth sets phone type/spacing (it was overriding them here). */
 </style><link rel="stylesheet" href="/static/fs-panel.css"/>
 <script type="module" src="/static/fs-panel.js"></script>
 <script defer src="/static/mobile.js"></script></head><body class="hide-traces"><div class="shell">
@@ -1249,7 +1269,31 @@ function syncTraceVisibility(){document.body.classList.toggle('hide-traces',!sho
 // Markdown-lite. RegExp-from-string only: this script text must parse BOTH as
 // the served page and inside the source-level regression harness, and regex
 // literals with backslashes cannot be valid at both escape levels.
+// GFM pipe tables. Runs on already-escaped text, BEFORE the inline passes, so
+// each cell still gets bold/code formatting after. Line-based (no regex) to stay
+// clear of the inline-script escape rules; a table is a row containing '|'
+// followed by an all-[-:| ] separator row that also has a '|'. Emits the whole
+// table on ONE line so the bubble's pre-wrap doesn't inject blank lines inside.
+function mdTables(s){
+  const lines=s.split('\\n');const out=[];let i=0;let inCode=false;
+  const isSep=function(l){const t=l.trim();if(t.indexOf('-')<0)return false;for(let k=0;k<t.length;k++){const ch=t.charAt(k);if(ch!=='-'&&ch!==':'&&ch!=='|'&&ch!==' ')return false;}return true;};
+  const cells=function(l){let t=l.trim();if(t.charAt(0)==='|')t=t.slice(1);if(t.charAt(t.length-1)==='|')t=t.slice(0,-1);return t.split('|').map(function(x){return x.trim();});};
+  while(i<lines.length){
+    const line=lines[i];const tl=line.trim();
+    if(tl.slice(0,3)==='\`\`\`'){inCode=!inCode;out.push(line);i++;continue;}
+    if(!inCode&&line.indexOf('|')>=0&&i+1<lines.length&&isSep(lines[i+1])&&lines[i+1].indexOf('|')>=0){
+      const head=cells(line);let j=i+2;const rows=[];
+      while(j<lines.length&&lines[j].indexOf('|')>=0&&lines[j].trim()!==''){rows.push(cells(lines[j]));j++;}
+      let h='<table class="mdt"><thead><tr>';for(let a=0;a<head.length;a++)h+='<th>'+head[a]+'</th>';h+='</tr></thead><tbody>';
+      for(let r=0;r<rows.length;r++){h+='<tr>';for(let c=0;c<head.length;c++)h+='<td>'+(rows[r][c]||'')+'</td>';h+='</tr>';}
+      h+='</tbody></table>';out.push(h);i=j;continue;
+    }
+    out.push(line);i++;
+  }
+  return out.join('\\n');
+}
 function md(t){let s=esc(t);
+s=mdTables(s);
 s=s.replace(new RegExp('\`\`\`[A-Za-z]*\\\\n?([\\\\s\\\\S]*?)\`\`\`','g'),function(_,c){return '<pre><code>'+c.replace(new RegExp('\\\\n$'),'')+'</code></pre>';});
 s=s.replace(new RegExp('\`([^\`\\\\n]+)\`','g'),'<code>$1</code>');
 s=s.replace(new RegExp('\\\\*\\\\*([^*]+)\\\\*\\\\*','g'),'<strong>$1</strong>');

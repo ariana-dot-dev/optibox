@@ -2,8 +2,9 @@
 // A horizontal drag moves the 3-pane strip 1:1 with the finger (rubber-banded
 // past the ends); releasing beyond 25% of the screen width — or a quick flick —
 // commits to the neighbouring view, anything less snaps back. The gesture
-// yields to vertical scrolling (axis lock) and to horizontally scrollable
-// content like code blocks (native scroll wins there).
+// yields to vertical scrolling (axis lock) and to genuinely horizontally
+// scrollable inner content like code blocks and the file tree (native scroll
+// wins there); the pane scrollers themselves never block paging.
 (() => {
   const shell = document.querySelector(".shell");
   if (!shell) return;
@@ -17,15 +18,25 @@
   for (let i = 0; i < PAGES; i++) dots.appendChild(document.createElement("span"));
   document.body.appendChild(dots);
 
+  // Real CSS-pixel width of one pane. window.innerWidth can report device
+  // pixels under some engines/emulators (measured 2x), which would push the
+  // commit threshold out of reach and make swiping feel dead — visualViewport
+  // is the honest number, with the pane's own box as the fallback.
+  const vw = () => (window.visualViewport && window.visualViewport.width) || shell.firstElementChild?.getBoundingClientRect().width || window.innerWidth || 1;
+
   const paint = () => {
     shell.style.setProperty("--page", String(page));
     [...dots.children].forEach((d, i) => d.classList.toggle("on", i === page));
   };
   paint();
 
+  // Panes and their own scrollers must NOT count as horizontally scrollable, or
+  // the chat's vertical scroller (overflow:auto) would swallow every swipe.
+  const isPane = (el) => el === shell || el.classList.contains("app") || el.classList.contains("fsPanel") || el.classList.contains("schematic") || el.classList.contains("chat");
   const hScrollable = (el) => {
     for (; el && el !== shell && el.nodeType === 1; el = el.parentElement) {
-      if (el.scrollWidth > el.clientWidth + 1) {
+      if (isPane(el)) continue;
+      if (el.scrollWidth > el.clientWidth + 4) {
         const o = getComputedStyle(el).overflowX;
         if (o === "auto" || o === "scroll") return true;
       }
@@ -47,12 +58,12 @@
     if (!tracking) return;
     const mx = e.touches[0].clientX - startX, my = e.touches[0].clientY - startY;
     if (!axis) {
-      if (Math.abs(mx) < 9 && Math.abs(my) < 9) return; // direction not decided yet
+      if (Math.abs(mx) < 8 && Math.abs(my) < 8) return; // direction not decided yet
       axis = Math.abs(mx) > Math.abs(my) ? "x" : "y";
       if (axis === "y") { tracking = false; return; } // vertical scroll wins
     }
     dx = mx;
-    if ((page === 0 && dx > 0) || (page === PAGES - 1 && dx < 0)) dx /= 3; // rubber-band
+    if ((page === 0 && dx > 0) || (page === PAGES - 1 && dx < 0)) dx /= 3; // rubber-band past ends
     shell.style.setProperty("--dragx", dx + "px");
     if (e.cancelable) e.preventDefault(); // horizontal is ours; touch-action:pan-y keeps vertical native
   }, { passive: false });
@@ -60,8 +71,9 @@
   const settle = () => {
     if (!tracking) return;
     tracking = false;
-    const w = window.innerWidth || 1;
-    const flick = Math.abs(dx) > 30 && Math.abs(dx) / Math.max(Date.now() - startT, 1) > 0.5;
+    const w = vw();
+    const dt = Math.max(Date.now() - startT, 1);
+    const flick = Math.abs(dx) > 24 && Math.abs(dx) / dt > 0.4; // quick flick commits on distance alone
     if (axis === "x" && (Math.abs(dx) > w * 0.25 || flick)) {
       page = Math.min(PAGES - 1, Math.max(0, page + (dx < 0 ? 1 : -1)));
     }

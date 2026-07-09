@@ -1456,11 +1456,22 @@ async function attachDesktopStream(w){
   }
   var n2=w.el.querySelector('.desktopNote');if(n2)n2.textContent='desktop stream did not start';
 }
-function addMsg(cls,tag,text,key){if(cls!=='trace')currentToolChain=null;const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');const raw=stripHidden((body.dataset.raw||'')+text);body.dataset.raw=raw;const shown=stripFileDecl(raw);body.textContent=shown;if(cls==='assistant'||cls==='user')body.innerHTML=md(shown);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;return el;}
+function addMsg(cls,tag,text,key){if(cls!=='trace')currentToolChain=null;const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');const raw=stripHidden((body.dataset.raw||'')+text);body.dataset.raw=raw;const shown=stripEndSentinel(stripFileDecl(raw));body.textContent=shown;if(cls==='assistant'||cls==='user')body.innerHTML=md(shown);
+// Rule 6: a box round that emits ONLY the <end> silence sentinel must render
+// NOTHING — no empty "user machine" bubble. Collapse it; it re-shows if real
+// text streams in later (reversible per render).
+if(cls==='assistant'&&tag&&/machine/.test(tag)&&el.style)el.style.display=shown.trim()?'':'none';
+moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;return el;}
 // The box agent declares files it created/modified in a trailing tag
 // <optibox-files>a, b</optibox-files> (see the FILE MANIFEST instruction). Strip
 // it from the visible chat (even a partial one mid-stream) and parse the names.
 function stripFileDecl(s){s=String(s);const i=s.indexOf('<optibox');return (i>=0?s.slice(0,i):s).trimEnd();}
+// Rule 6: <end> is the box agent's intentional-silence sentinel — the host must
+// NEVER show it. The server only suppresses the byte-exact string, so a stray
+// trailing newline/space (<end>\\n) slips through and leaks into chat. Strip a
+// trailing <end> token here regardless of surrounding whitespace, as a display
+// safety net. A bare-<end> message collapses to empty (see addMsg).
+function stripEndSentinel(s){return String(s).replace(/\\s*<end>\\s*$/i,'');}
 function parseFileDecl(s){s=String(s);const a=s.indexOf('<optibox-files');if(a<0)return [];const b=s.indexOf('>',a);if(b<0)return [];const c=s.indexOf('</optibox-files',b);const inner=c>=0?s.slice(b+1,c):s.slice(b+1);const out=[];const seen={};inner.split(',').forEach(function(x){let t=x.trim();while(t.charAt(0)==='.'||t.charAt(0)==='/')t=t.slice(1);if(t&&!seen[t]){seen[t]=1;out.push(t);}});return out;}
 const toolChains=[];
 let currentToolChain=null;

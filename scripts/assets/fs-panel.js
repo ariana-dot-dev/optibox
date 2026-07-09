@@ -12,6 +12,11 @@ let displayedPaths = []; // what is currently rendered (server + upload overlay)
 let entryByPath = new Map();
 let fsLive = false;
 let fsState = "none";
+// Have we seen the box actually LIVE since it started billing? Once true, a
+// single failed live-tree poll (find deadline, transient FUSE/exec miss) is a
+// hiccup, not the machine "starting" — so we neither relabel it "machine
+// starting…" nor wipe the tree. Reset only when the machine is gone/parked.
+let everLive = false;
 let refreshTimer = null;
 let refreshing = false;
 let showHidden = false;
@@ -92,20 +97,34 @@ async function refresh(first) {
   refreshing = true;
   try {
     const data = await api("/api/fs/tree", {});
+    const billingOn = Boolean(data.runtime && data.runtime.billingSinceEpochMs);
     fsLive = Boolean(data.live);
     fsState = data.state || "none";
-    const waking = !fsLive && data.runtime && data.runtime.billingSinceEpochMs;
+    // Reset the "has been live" memory only when there is genuinely no machine
+    // or it has stopped billing (parked) — NOT on a transient live-tree miss.
+    if (fsState === "none" || !billingOn) everLive = false;
+    if (fsLive) everLive = true;
+    // Machine is up (billing) and we've seen it live, but THIS poll's live tree
+    // failed: a hiccup, not a restart. Keep the "live" label and the last-good
+    // tree instead of flapping to "machine starting…" and wiping the files
+    // (which made a file flash on screen then vanish every few seconds).
+    const liveHiccup = !fsLive && billingOn && everLive;
+    const waking = !fsLive && billingOn && !everLive;
     setStatus(
       fsState === "none" ? "no machine yet"
         : fsLive ? "live"
+        : liveHiccup ? "live"
         : waking ? "machine starting…"
         : "snapshot" + (data.treeAvailable === false ? " (tree unavailable)" : ""),
-      fsLive ? "live" : waking ? "live" : "",
+      (fsLive || liveHiccup || waking) ? "live" : "",
     );
     // Hand the authoritative runtime snapshot to the page: it reconciles the
     // billing/cost/auto-stop counters from it every poll, so out-of-band wakes
     // (typing, uploads) drive the SAME UI as turn-started machines.
     try { if (window.__optiboxFs && window.__optiboxFs.onRuntime) window.__optiboxFs.onRuntime(data.runtime || null); } catch { /* page hook optional */ }
+    // On a live hiccup, preserve the last-good tree: do NOT overwrite serverPaths
+    // with this poll's fallback (snapshot or empty), which would wipe the view.
+    if (liveHiccup) return;
     const entries = data.entries || [];
     entryByPath = new Map(entries.map((e) => [e.path, e]));
     serverPaths = entries

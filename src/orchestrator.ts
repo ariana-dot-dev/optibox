@@ -229,6 +229,10 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly harnessSessions = new Map<string, string>();
   /** boxId -> the conversation that owns it, so the reaper can stop it by user/conversation. */
   private readonly boxOwners = new Map<string, { userId: string; conversationId: string; key: string }>();
+  /** boxId -> guarded-until epoch ms: boxes woken OUTSIDE a turn (typing,
+   * upload) run unbilled, which the orphan sweep reads as a leak — a guard
+   * marks them intentionally awake until it expires. */
+  private readonly boxWakeGuards = new Map<string, number>();
   /** key -> last time this conversation had any turn activity (submit or stream end). */
   private readonly lastActivityAt = new Map<string, number>();
   /** Background idle-box reaper handle (see OrchestratorOptions.idleReaperIntervalMs). */
@@ -320,6 +324,12 @@ export class ConsumerBoxAgentOrchestrator {
       if (this.options.userBoxTemplate && box.name === this.options.userBoxTemplate.name) continue;
       if (box.state === "archived" || box.state === "archiving" || box.state === "stopped") continue;
       if (this.billing.has(box.id)) { this.orphanSightings.delete(box.id); continue; }
+      // Deliberately-woken box (user typing / uploading before a turn bills it).
+      const guardUntil = this.boxWakeGuards.get(box.id);
+      if (guardUntil !== undefined) {
+        if (now < guardUntil) { this.orphanSightings.delete(box.id); continue; }
+        this.boxWakeGuards.delete(box.id);
+      }
       seenIds.add(box.id);
       const firstSeen = this.orphanSightings.get(box.id);
       if (firstSeen === undefined) { this.orphanSightings.set(box.id, now); continue; }
@@ -1703,7 +1713,7 @@ export class ConsumerBoxAgentOrchestrator {
         note: "auto-stop idle delay is disabled; stopping private Box now",
       };
     } else {
-      const deadlineEpochMs = Date.now() + delayMs;
+      let deadlineEpochMs = Date.now() + delayMs;
       yield {
         type: "autostop.timer",
         phase: "started",
@@ -1719,9 +1729,15 @@ export class ConsumerBoxAgentOrchestrator {
       // turn sequence so a new message visibly resets the timer instead of
       // leaving a hidden stop tail.
       let lastWholeSecond = Math.ceil(delayMs / 1000);
+      let heldNoted = false;
       while (true) {
         const blockers = this.idleStopBlockers(key, turnSequence);
-        if (blockers.length > 0) {
+        // Keep-alive holds (typing, attachment uploads, desktop stream) are the
+        // user's "box still needed" flag: PAUSE the countdown at full and resume
+        // fresh when the flag drops — returning here would kill this generator
+        // and nothing would ever re-arm the stop.
+        const holdOnly = blockers.length > 0 && blockers.every((b) => b.startsWith("hold:"));
+        if (blockers.length > 0 && !holdOnly) {
           yield {
             type: "autostop.timer",
             phase: "canceled",
@@ -1733,6 +1749,25 @@ export class ConsumerBoxAgentOrchestrator {
           };
           return;
         }
+        if (holdOnly) {
+          deadlineEpochMs = Date.now() + delayMs;
+          if (!heldNoted) {
+            heldNoted = true;
+            lastWholeSecond = Math.ceil(delayMs / 1000);
+            yield {
+              type: "autostop.timer",
+              phase: "tick",
+              boxId,
+              remainingMs: delayMs,
+              deadlineEpochMs,
+              reason: "idle-after-response",
+              note: `countdown held at full (${blockers.join(", ")}); it resumes when the hold clears`,
+            };
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          continue;
+        }
+        heldNoted = false;
 
         const remainingMs = Math.max(0, deadlineEpochMs - Date.now());
         const wholeSecond = Math.ceil(remainingMs / 1000);
@@ -2136,6 +2171,13 @@ export class ConsumerBoxAgentOrchestrator {
       if (owner.userId === userId && this.billing.has(boxId)) return boxId;
     }
     return undefined;
+  }
+
+  /** Mark a box as deliberately awake outside a billed turn (typing/upload
+   * wake): the orphan sweep skips it until the guard expires. Rolling — call
+   * again to extend. */
+  guardBox(boxId: string, ttlMs: number): void {
+    this.boxWakeGuards.set(boxId, Date.now() + Math.max(1_000, Math.min(ttlMs, 10 * 60_000)));
   }
 
   private startBilling(boxId: string, owner?: { userId: string; conversationId: string }): { since: number; fresh: boolean } {

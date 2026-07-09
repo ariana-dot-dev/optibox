@@ -321,6 +321,10 @@ function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversat
 
 /** Latest desktop-connect hold release per user (renewed on every poll). */
 const desktopHolds = new Map<string, () => void>();
+// Rolling "user is composing" holds: typing or staging attachments raises the
+// box-still-needed flag (countdown pauses at full); the client pings every few
+// seconds while composing, so a short TTL drops the flag soon after they stop.
+const composingHolds = new Map<string, () => void>();
 
 function fsBoxClient(credentials: DemoCredentials): BoxHttpClient {
   if (!credentials.boxApiKey) throw new Error("BOX_API_KEY is required");
@@ -400,6 +404,8 @@ async function fsWriteIntoBox(credentials: DemoCredentials, userId: string, file
     try {
       // Machine off? Boot it and wait until it actually executes a command,
       // so a drop while parked just wakes the box and completes the upload.
+      // Guard it so the orphan sweep doesn't read the unbilled wake as a leak.
+      orchestratorFor(credentials).guardBox(box.id, 120_000);
       if (!live) {
         try { await client.resume(box.id); } catch { /* may already be resuming */ }
         let up = false;
@@ -578,6 +584,46 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       return json(r.status, r.payload), true;
     }
 
+    // "User is composing": typing or staging attachments raises the flag —
+    // renew a rolling hold (pauses any running countdown at full) and wake the
+    // box if it's parked so it's warm by the time the message is sent.
+    if (pathname === "/api/fs/activity") {
+      composingHolds.get(userId)?.();
+      composingHolds.set(userId, orchestratorFor(credentials).holdUserBox(userId, "composing", 15_000));
+      if (box) {
+        orchestratorFor(credentials).guardBox(box.id, 90_000);
+        if (!live) {
+          fsLog({ route: "activity", userId, note: "composing wake", boxId: box.id, state: box.state });
+          void client.resume(box.id).catch(() => undefined);
+        }
+      }
+      return json(200, { ok: true, state: box?.state ?? "none", live }), true;
+    }
+
+    // Remove a staged attachment the user deleted from the composer before
+    // sending. ATTEMPT the live command regardless of the state string — it
+    // lags badly (a box woken by a staged upload can read "archiving" for many
+    // seconds while commands already execute). Only report off if the command
+    // itself fails; a parked box's snapshot is read-only and not worth a boot.
+    if (pathname === "/api/fs/delete") {
+      if (!filePath) return json(400, { ok: false, message: "path required" }), true;
+      if (!filePath.startsWith("attachments/")) return json(400, { ok: false, message: "only attachments/ files can be deleted here" }), true;
+      if (!box) return json(409, { ok: false, message: "no machine — nothing to delete" }), true;
+      const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+      try {
+        const out = await Promise.race([
+          client.command(box.id, { command: `cd /home/user && rm -f ${q(filePath)} && echo removed`, timeoutMs: 20_000 }),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("delete deadline")), 8_000)),
+        ]);
+        const removed = out.stdout.includes("removed");
+        fsLog({ route: "delete", userId, path: filePath, ok: removed });
+        return json(200, { ok: removed }), true;
+      } catch (e) {
+        fsLog({ route: "delete", userId, path: filePath, ok: false, error: e instanceof Error ? e.message : String(e) });
+        return json(409, { ok: false, message: "machine is off — file will be ignored" }), true;
+      }
+    }
+
     return json(404, { ok: false, message: "unknown fs endpoint" }), true;
   } catch (e) {
     return json(502, { ok: false, message: e instanceof Error ? e.message : String(e) }), true;
@@ -746,8 +792,10 @@ const server = http.createServer(async (req, res) => {
       // Chat attachments ride the send body as base64 and are written into the
       // box under attachments/ the instant it bills — see the billing.start
       // branch below (before the agent runs, so the file is always there).
+      // Attachments already staged into the box while the user composed arrive
+      // as {name, alreadyUploaded:true} with no bytes — nothing to write.
       const attachments: Array<{ name: string; contentB64: string }> = Array.isArray(body.attachments)
-        ? body.attachments.filter((a: any) => a && typeof a.name === "string" && typeof a.contentB64 === "string")
+        ? body.attachments.filter((a: any) => a && typeof a.name === "string" && typeof a.contentB64 === "string" && !a.alreadyUploaded)
         : [];
       let attachmentsUploaded = false;
       const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1265,7 +1313,9 @@ async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused'
   const userEl=addMsg('user','',msg,'user:'+localId);
   let atts=[];
   if(files&&files.length){
-    atts=await Promise.all(files.map(async f=>({name:f.name.replace(/[\\/\\\\]/g,'_'),b64:await readAsB64(f),bytes:new Uint8Array(await f.arrayBuffer())})));
+    // Files staged while composing are already in the box — send just their
+    // name (alreadyUploaded); only un-staged ones ship bytes with the message.
+    atts=await Promise.all(files.map(async f=>({name:f.name.replace(/[\\/\\\\]/g,'_'),b64:f.__uploaded?'':await readAsB64(f),bytes:new Uint8Array(await f.arrayBuffer()),uploaded:Boolean(f.__uploaded)})));
     renderAttachDeck(userEl,atts,'right');
   }
   // Tell the agent where the files landed so it can use them. Voice messages
@@ -1273,7 +1323,7 @@ async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused'
   // file only makes the shared model apologise about not "processing audio".
   // Files still upload silently so they show in chat and the panel.
   const sendMsg=(atts.length&&!opts.silent)?msg+'\\n\\n[Attached files, saved under attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
-  const attachPayload=atts.map(a=>({name:a.name,contentB64:a.b64}));
+  const attachPayload=atts.map(a=>a.uploaded?{name:a.name,alreadyUploaded:true}:{name:a.name,contentB64:a.b64});
   showWorking();setState('shared bridge starting · private Box boot requested');resetRouteForTurn();
   try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys(),attachments:attachPayload})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
@@ -1297,7 +1347,25 @@ const X_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill=
 function isAudioName(n){return AUD_RE.test(n)||/^voice-/i.test(n)||(/\\.webm$/i.test(n)&&/^voice-/i.test(n));}
 function fileExt(n){const p=(n.split('.').pop()||'').toLowerCase();return p.length>4?'file':p;}
 function readAsB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=()=>rej(new Error('read failed'));r.readAsDataURL(file);});}
-function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)break;if(f.size>150*1024*1024){addMsg('trace','attachment','"'+f.name+'" is over the 150MB message-attachment limit — drop it on the Files panel instead (larger uploads allowed there)\\n');continue;}pendingFiles.push(f);}renderPending();}
+function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)break;if(f.size>150*1024*1024){addMsg('trace','attachment','"'+f.name+'" is over the 150MB message-attachment limit — drop it on the Files panel instead (larger uploads allowed there)\\n');continue;}pendingFiles.push(f);stageAttachment(f);}renderPending();notifyComposing();}
+// Eagerly stage the attachment into the box the moment it lands in the
+// composer (raw binary, wakes a parked machine). Send then just references it
+// (alreadyUploaded) instead of re-shipping the bytes; removing it before send
+// deletes it from the box again.
+function stageAttachment(f){
+  f.__dest='attachments/'+f.name.replace(/[\\/\\\\]/g,'_');
+  f.__uploading=true;f.__uploaded=false;
+  fetch('/api/fs/upload?'+new URLSearchParams({userId:selectedUser,path:f.__dest}),{method:'POST',headers:{'content-type':'application/octet-stream','x-fs-keys':JSON.stringify(currentApiKeys())},body:f})
+    .then(async r=>{const j=await r.json().catch(()=>({}));if(!r.ok||j.ok===false)throw new Error(j.message||r.statusText);f.__uploaded=true;})
+    .catch(()=>{f.__uploaded=false;})
+    .finally(()=>{f.__uploading=false;renderPending();try{window.__optiboxFs.poke();}catch(_){}});
+}
+function unstageAttachment(f){
+  if(!f.__dest||(!f.__uploaded&&!f.__uploading))return;
+  fetch('/api/fs/delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,path:f.__dest,apiKeys:currentApiKeys()})})
+    .then(()=>{try{window.__optiboxFs.poke();}catch(_){}})
+    .catch(()=>{});
+}
 function renderPending(){
   const c=$('pendingAttach');if(!c)return;c.innerHTML='';
   updateComposerMode();
@@ -1310,8 +1378,9 @@ function renderPending(){
     else if(isAudioName(f.name)){const e=document.createElement('div');e.className='cardIcon cardAudio';e.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(e);}
     else{const e=document.createElement('div');e.className='cardIcon';e.textContent=fileExt(f.name);card.appendChild(e);}
     const nm=document.createElement('div');nm.className='cardName';nm.textContent=f.name;card.appendChild(nm);
+    if(f.__uploading){const up=document.createElement('div');up.className='cardUp';up.textContent='uploading…';card.appendChild(up);}
     const x=document.createElement('button');x.type='button';x.className='cardRemove';x.innerHTML=X_SVG;x.title='remove';
-    x.addEventListener('click',ev=>{ev.stopPropagation();pendingFiles.splice(i,1);renderPending();});card.appendChild(x);
+    x.addEventListener('click',ev=>{ev.stopPropagation();pendingFiles.splice(i,1);renderPending();unstageAttachment(f);});card.appendChild(x);
     card.addEventListener('click',async()=>{try{window.__optiboxFs.openBytes(f.name,new Uint8Array(await f.arrayBuffer()));}catch(_){}});
     c.appendChild(card);
   });
@@ -1393,7 +1462,20 @@ stopBtn.addEventListener('click',async e=>{e.preventDefault();stopBtn.disabled=t
 diagnosticsBtn?.addEventListener('click',e=>{e.preventDefault();const a=document.createElement('a');a.href='/api/diagnostics?format=json';a.download='optibox-diagnostics.json';document.body.appendChild(a);a.click();a.remove();addMsg('trace','diagnostics','downloaded redacted JSON event log from /api/diagnostics\\n');});
 msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer('textarea.enter');}});
 msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer('textarea.beforeinput');}});
-msgEl.addEventListener('input',updateComposerMode);
+msgEl.addEventListener('input',()=>{updateComposerMode();notifyComposing();});
+// "Box still needed" flag: typing or staged attachments ping the server every
+// few seconds — the rolling hold pauses any countdown at full and wakes a
+// parked machine so it's warm by the time the message is sent. Stop typing
+// and the hold expires in ~15s; the countdown resumes on its own.
+let lastComposePing=0;
+function notifyComposing(){
+  const composing=((msgEl&&msgEl.value||'').trim().length>0)||pendingFiles.length>0;
+  if(!composing)return;
+  const now=Date.now();
+  if(now-lastComposePing<4000)return;
+  lastComposePing=now;
+  fetch('/api/fs/activity',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})}).catch(()=>{});
+}
 // ---- voice messages -------------------------------------------------------
 // Telegram-style: mic shows when the box is empty; press it to record with a
 // live waveform, pause/resume, trash, or send. Send transcribes via Whisper

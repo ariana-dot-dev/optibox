@@ -150,7 +150,8 @@ function renderTree(paths) {
     renderRowDecoration: (c) => (uploading.has(c.row.path) ? { text: "uploading…", title: "upload in progress" } : null),
     unsafeCSS: `
       * { font-family: inherit; }
-      button[data-type='item'] { border-radius: 7px; }
+      :host { display: block; width: 100%; }
+      button[data-type='item'] { border-radius: 7px; width: 100%; }
     `,
   });
   tree.render({ containerWrapper: mount });

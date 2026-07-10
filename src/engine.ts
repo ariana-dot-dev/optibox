@@ -80,6 +80,12 @@ const fingerprintOf = (message: string): string =>
 
 const HOST_CMD_RE = /(?:^|[\s;|&(])host\s+(\d{2,5})(?:\s+\S+)*?\s+--(public|private)\b/;
 
+// A tool command "touches the desktop" if it drives the X session — the same
+// marks the UI uses to show the live desktop widget. The first such command in
+// a turn starts a box-side screen recording (see runBoxRound).
+const DESKTOP_MARKS = ["xdotool", "wmctrl", "xdg-open", "ydotool", "wtype", "scrot", "DISPLAY=", "chromium", "google-chrome", "firefox", "lux "];
+const isDesktopCommand = (cmd: string): boolean => DESKTOP_MARKS.some((m) => cmd.includes(m));
+
 export class Engine {
   private readonly db: Db;
   private readonly box: BoxClient;
@@ -578,6 +584,48 @@ export class Engine {
     };
   }
 
+  // ---------------------------------------------------------------- desktop recording (phase 2)
+
+  /**
+   * Start a box-side screen recording of the X display the desktop stream shows
+   * (Moonlight/noVNC both mirror :0). Detached via setsid so it outlives this
+   * command; the pid is stashed so stopDesktopRecording can SIGINT it (which
+   * lets ffmpeg flush the moov atom → a seekable, web-playable mp4). The file
+   * lands in /home/user (rides the snapshot) and downloads via /api/fs/read.
+   */
+  private async startDesktopRecording(boxId: string, turnId: string): Promise<void> {
+    const out = `/home/user/recordings/${turnId}.mp4`;
+    const pid = `/home/user/recordings/${turnId}.pid`;
+    await this.box.command(boxId, {
+      command:
+        `mkdir -p /home/user/recordings && ` +
+        // Wait (≤15s) for the X display socket before grabbing — on a fresh box
+        // the desktop may still be provisioning when the first desktop command
+        // runs. If it never appears, ffmpeg exits and the clip stays empty, so
+        // stopDesktopRecording reports nothing and no event is emitted.
+        `setsid bash -c 'for i in $(seq 1 30); do [ -S /tmp/.X11-unix/X0 ] && break; sleep 0.5; done; ` +
+        `DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 ffmpeg -y -loglevel error ` +
+        `-f x11grab -r 12 -draw_mouse 1 -i :0 -pix_fmt yuv420p -movflags +faststart ${out} ` +
+        `>/tmp/rec-${turnId}.log 2>&1 & echo $! > ${pid}'`,
+      timeoutMs: 20_000,
+    });
+  }
+
+  /** SIGINT the recorder, wait for the flush, and report the finished size (0 = none). */
+  private async stopDesktopRecording(boxId: string, turnId: string): Promise<{ ok: boolean; sizeKb: number }> {
+    const out = `/home/user/recordings/${turnId}.mp4`;
+    const pid = `/home/user/recordings/${turnId}.pid`;
+    const r = await this.box.command(boxId, {
+      command:
+        `P=$(cat ${pid} 2>/dev/null); if [ -n "$P" ]; then kill -INT "$P" 2>/dev/null; ` +
+        `for i in $(seq 1 30); do kill -0 "$P" 2>/dev/null || break; sleep 0.2; done; fi; rm -f ${pid}; ` +
+        `if [ -s ${out} ]; then echo "OK:$(( $(stat -c%s ${out}) / 1024 ))"; else echo NONE; fi`,
+      timeoutMs: 30_000,
+    });
+    const m = (r.stdout || "").match(/OK:(\d+)/);
+    return m ? { ok: true, sizeKb: Number(m[1]) } : { ok: false, sizeKb: 0 };
+  }
+
   // ---------------------------------------------------------------- render journal (reopen = replay)
 
   /** Append one rendered event to the conversation's journal (verbatim). */
@@ -744,6 +792,10 @@ export class Engine {
     signal: AbortSignal,
   ): AsyncIterable<ConsumerTurnEvent> {
     const emit = (e: EventBody): ConsumerTurnEvent => ({ ...e, turnId } as ConsumerTurnEvent);
+    // Desktop recording: armed the moment the agent's FIRST desktop-touching
+    // tool runs (see onHarnessEvent), finalized after the round (see below).
+    // recordingPath being non-null is the "a recording exists to stop" flag.
+    let recordingPath: string | null = null;
     // Serialize box rounds per conversation; collect events through a queue so
     // the generator can stream while the locked work runs.
     const queue = new EventQueue();
@@ -773,6 +825,11 @@ export class Engine {
           if (event.phase === "tool_use" && typeof event.command === "string") {
             const m = event.command.match(HOST_CMD_RE);
             if (m) void this.markHosting(input.userId, input.conversationId, box.id, Number(m[1]), m[2] as "public" | "private").catch(() => undefined);
+            // First desktop-touching command arms the screen recording (once).
+            if (!recordingPath && isDesktopCommand(event.command)) {
+              recordingPath = `recordings/${turnId}.mp4`;
+              void this.startDesktopRecording(box.id, turnId).catch(() => { recordingPath = null; });
+            }
           }
         },
       });
@@ -830,6 +887,14 @@ export class Engine {
     while (!queue.done) { await queue.wait(); for (const e of queue.drain()) yield emit(e); }
     await done;
     for (const e of queue.drain()) yield emit(e);
+
+    // Finalize any desktop recording: stop the recorder, then emit the finished
+    // clip. It's a turnId event, so the journal captures it and reopening replays
+    // the same <video> in place of the (long-gone) live stream.
+    if (recordingPath && !signal.aborted) {
+      const rec = await this.stopDesktopRecording(box.id, turnId).catch(() => ({ ok: false, sizeKb: 0 }));
+      if (rec.ok && rec.sizeKb > 0) yield emit({ type: "desktop.recording", boxId: box.id, path: recordingPath, sizeKb: rec.sizeKb });
+    }
 
     const idleMs = this.opts.autoStopIdleMs ?? 15_000;
     switch (result?.outcome) {

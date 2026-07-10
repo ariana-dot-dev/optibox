@@ -180,6 +180,31 @@ var desktopWidget=null;
 var DESKTOP_MARKS=['xdotool','wmctrl','xdg-open','ydotool','wtype','scrot','DISPLAY=','chromium','google-chrome','firefox','lux '];
 function isDesktopCommand(cmd){cmd=String(cmd||'');for(var i=0;i<DESKTOP_MARKS.length;i++)if(cmd.indexOf(DESKTOP_MARKS[i])>=0)return true;return false;}
 function endDesktopWidget(){if(!desktopWidget)return;try{if(desktopWidget.frame)desktopWidget.frame.src='about:blank';}catch(_){}desktopWidget.el.classList.add('ended');var tag=desktopWidget.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · session ended';desktopWidget=null;}
+// A finished desktop session recording (box-side ffmpeg, emitted at round end).
+// Swaps the live stream widget for a seekable <video> IN PLACE — or, on replay
+// (where the live widget was never created), makes a fresh one. Reads the mp4
+// via /api/fs/read, which serves it from the box OR its snapshot, so playback
+// works long after the machine parked. Not gated by isLatest/replaying: the
+// recording should render live AND on reopen.
+async function renderDesktopRecording(ev,localId){
+  const c=$('chat');if(!c)return;const stick=chatStick(c);
+  let el=(desktopWidget&&desktopWidget.localId===localId)?desktopWidget.el:null;
+  if(el&&desktopWidget){try{if(desktopWidget.frame)desktopWidget.frame.src='about:blank';}catch(_){}desktopWidget=null;}
+  if(!el){$('empty')?.remove();el=document.createElement('div');el.className='msg desktop';el.innerHTML='<div class="desktopTag"><span>desktop · session recording</span></div><div class="desktopWrap"></div>';c.appendChild(el);}
+  el.classList.remove('ended');
+  const tag=el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · session recording';
+  const wrap=el.querySelector('.desktopWrap');if(!wrap)return;
+  wrap.innerHTML='<div class="desktopNote">loading recording…</div>';if(stick)c.scrollTop=c.scrollHeight;
+  try{
+    const res=await fetch('/api/fs/read',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,path:ev.path,apiKeys:currentApiKeys()})});
+    if(!res.ok)throw new Error('read '+res.status);
+    const url=URL.createObjectURL(new Blob([await res.arrayBuffer()],{type:'video/mp4'}));
+    const v=document.createElement('video');v.className='desktopFrame';v.src=url;v.controls=true;v.playsInline=true;v.preload='metadata';
+    wrap.innerHTML='';wrap.appendChild(v);
+    if(!el.querySelector('a.dtDownload')){const links=el.querySelector('.dtLinks')||(function(){const s=document.createElement('span');s.className='dtLinks';el.querySelector('.desktopTag').appendChild(s);return s;})();const a=document.createElement('a');a.className='dtDownload';a.textContent='download';a.href=url;a.download=String(ev.path||'desktop.mp4').split('/').pop();links.appendChild(a);}
+  }catch(e){wrap.innerHTML='<div class="desktopNote">recording unavailable</div>';}
+  if(stick)c.scrollTop=c.scrollHeight;
+}
 function ensureDesktopWidget(localId){
   if(desktopWidget&&desktopWidget.localId===localId)return;
   endDesktopWidget();
@@ -839,6 +864,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine; stdout/SSE relays native chunks as emitted.',keyFor(ev,localId,'exec'));}
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');if(isDesktopCommand(ev.command)){if(ev.phase==='tool_use'&&localId===latestLocalId)ensureDesktopWidget(localId);}else{addToolEvent(ev,localId);}}
   else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
+  else if(ev.type==='desktop.recording'){renderDesktopRecording(ev,localId);}
   else if(ev.type==='billing.stop'){if(!replaying){stopBilling(ev.elapsedSeconds);endDesktopWidget();}}
   else if(ev.type==='autostop.timer'){if(!replaying){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));if(!replaying)setState(describeAutoStop(ev));}
   else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);renderLinkPreviews(lastAgentMsgEl);lastAgentMsgEl=null;}if(lastSharedMsgEl){renderLinkPreviews(lastSharedMsgEl);lastSharedMsgEl=null;}

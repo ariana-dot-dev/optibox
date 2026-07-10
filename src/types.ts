@@ -25,6 +25,11 @@ export type ConsumerTurnEventBody =
   | { type: "exec"; kind: "command" | "harness"; argv?: string[]; command?: string; boxId: string }
   | { type: "harness.tool"; phase: "tool_use" | "tool_result"; boxId: string; toolName?: string; command?: string; description?: string; stdout?: string; stderr?: string; isError?: boolean }
   | { type: "user-box.delta"; text: string; boxId: string; harness: string; model: string; messageId?: string; messageIndex?: number }
+  // A finished desktop session recording (box-side ffmpeg x11grab of :0). `path`
+  // is home-relative on the box (rides the snapshot); the UI reads its bytes via
+  // /api/fs/read and plays it in place of the ended live stream — live AND on
+  // replay, since it's journaled like every other turnId-bearing event.
+  | { type: "desktop.recording"; boxId: string; path: string; sizeKb: number }
   | { type: "error"; message: string }
   | { type: "turn.done"; boxId?: string; harness: string; model: string; route?: "shared" | "direct" | "bridge"; settled?: boolean };
 

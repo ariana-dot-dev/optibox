@@ -4,6 +4,7 @@ import {
   createUserBoxCapabilities,
   createRestrictedSharedCapabilities,
 } from "./capabilities.js";
+import { HarnessMissingError } from "./types.js";
 import { buildHiddenContext, BOX_PRICE_USD_PER_SECOND, BOX_PRICING } from "./context.js";
 import { ExtractiveRecapper } from "./recap.js";
 import type {
@@ -51,6 +52,8 @@ export interface EngineOptions {
   maxBillingAgeMs?: number;
   readinessPollMs?: number;
   handoffTimeoutMs?: number;
+  /** Minimum machine age before the direct (no-bridge) route applies; younger boxes bridge as if off. */
+  directMinWarmMs?: number;
   template?: { installCmd: string; warmCmd?: string };
 }
 
@@ -236,28 +239,37 @@ export class Engine {
   private async createFreshBox(userKey: string, events?: EventQueue): Promise<BoxInfo> {
     const name = this.boxName(userKey);
     const ttlSeconds = this.opts.userBoxTtlSeconds ?? 900;
-    // Fork the template ONLY when its row says the install verifiably finished
-    // (a failed build can never be forked — the poisoned-template incident).
-    const tpl = await this.db.one<{ box_id: string; status: string }>(
-      `select box_id, status from templates where instance_id=$1`, [this.opts.instanceId],
-    );
-    if (!tpl && this.opts.template) this.templateBuild ??= this.buildTemplate().catch(() => { this.templateBuild = undefined; });
-    if (tpl?.status === "ready" && this.box.fork) {
-      try {
-        const forked = await this.box.fork(tpl.box_id);
-        await this.box.update?.(forked.id, { name, ttlSeconds })?.catch(() => undefined);
-        await this.db.q(
-          `insert into boxes(id, user_key, instance_id, purpose) values($1,$2,$3,'user')`,
-          [forked.id, userKey, this.opts.instanceId],
+    // When a template is configured (the harness needs installation), a user
+    // box is ALWAYS a fork of the warm-cycled template — installed, snapshotted,
+    // resumed once with the harness actually launched (recording the FUSE
+    // lazy-restore access order), and snapshotted again. Never a plain create
+    // with the harness missing, never an in-turn install. If the template isn't
+    // ready yet, fail LOUDLY and let the user retry once the background build
+    // lands (the shared surface has already answered — rule 1 holds).
+    if (this.opts.template) {
+      const tpl = await this.db.one<{ box_id: string; status: string }>(
+        `select box_id, status from templates where instance_id=$1`, [this.opts.instanceId],
+      );
+      if (tpl?.status !== "ready") {
+        if (!tpl || tpl.status === "failed") this.templateBuild ??= this.buildTemplate().catch(() => { this.templateBuild = undefined; });
+        throw new Error(
+          tpl?.status === "failed"
+            ? "private machine template build FAILED — rebuilding in the background; check the server log for '[optibox] template box build failed' and retry in a few minutes"
+            : "private machine template is still being prepared (first boot of this deployment, ~2-3 minutes) — send your message again shortly",
         );
-        events?.push({ type: "lifecycle", boxId: forked.id, state: "forking", note: "forking pre-installed template" });
-        return await this.waitUntilReady(forked.id);
-      } catch (e) {
-        events?.push({ type: "trace", stage: "box.fork.failed", message: e instanceof Error ? e.message : String(e) });
-        // fall through to plain create — the box will lack the harness and the
-        // harness layer will fail LOUDLY (in-turn reinstall is forbidden).
       }
+      if (!this.box.fork) throw new Error("box client cannot fork — template-based provisioning requires fork support");
+      const forked = await this.box.fork(tpl.box_id);
+      await this.box.update?.(forked.id, { name, ttlSeconds })?.catch(() => undefined);
+      await this.db.q(
+        `insert into boxes(id, user_key, instance_id, purpose) values($1,$2,$3,'user')`,
+        [forked.id, userKey, this.opts.instanceId],
+      );
+      events?.push({ type: "lifecycle", boxId: forked.id, state: "forking", note: "forking pre-installed, warm-cycled template" });
+      return await this.waitUntilReady(forked.id);
     }
+    // No template configured = the harness needs no installation (generator
+    // harnesses, tests): plain create is the intended path.
     const created = await this.box.create({ name, ttlSeconds });
     await this.db.q(
       `insert into boxes(id, user_key, instance_id, purpose) values($1,$2,$3,'user')`,
@@ -393,17 +405,16 @@ export class Engine {
       await this.stopWithRetry(created.id);
       await this.waitUntilParked(created.id);
       if (template.warmCmd) {
-        // Warm pass: record the fork-cold harness launch order into the snapshot.
-        try {
-          await this.box.resume(created.id);
-          await this.waitUntilReady(created.id);
-          await this.box.command(created.id, { command: template.warmCmd, timeoutMs: 55_000 });
-          await this.stopWithRetry(created.id);
-          await this.waitUntilParked(created.id);
-        } catch (e) {
-          console.error("[engine] template warm pass failed (install snapshot still valid):", e instanceof Error ? e.message : String(e));
-          await this.box.stop(created.id).catch(() => undefined);
-        }
+        // MANDATORY warm pass: every user box must fork a template that has
+        // been resumed once with the harness actually launched (recording the
+        // FUSE lazy-restore access order) and snapshotted again. A template
+        // whose warm cycle failed is NOT ready — no fallback to the install
+        // snapshot: warm failure = build failure, rebuilt on the next demand.
+        await this.box.resume(created.id);
+        await this.waitUntilReady(created.id);
+        await this.box.command(created.id, { command: template.warmCmd, timeoutMs: 55_000 });
+        await this.stopWithRetry(created.id);
+        await this.waitUntilParked(created.id);
       }
       await this.db.q(`update templates set status='ready', built_at=now() where instance_id=$1`, [this.opts.instanceId]);
     } catch (error) {
@@ -590,12 +601,18 @@ export class Engine {
       );
       yield emit({ type: "trace", stage: "turn.submit.accepted", message: "submit reached backend", harness: harness.name, model: input.selection.model });
 
-      // Rule 5: warm + responsive box -> direct, no bridge.
+      // Rule 5: warm + responsive box -> direct, no bridge. "Warm" requires
+      // BOTH a live probe AND >=15s of machine age: a box in its first 15s of
+      // billing is still hydrating (lazy disk restore, harness boot), so a
+      // message landing then gets the shared answer exactly as if the machine
+      // were off — the direct route earns its no-bridge silence only once the
+      // machine is genuinely responsive-warm.
       const boxRow = await this.db.one<{ id: string; billing_since: string | null }>(
         `select id, billing_since from boxes where user_key=$1 and purpose='user' and retired_at is null`, [userKey],
       );
       let direct = false;
-      if (boxRow?.billing_since && !dup) {
+      const warmMinMs = this.opts.directMinWarmMs ?? 15_000;
+      if (boxRow?.billing_since && !dup && Date.now() - Date.parse(boxRow.billing_since) >= warmMinMs) {
         try {
           const probe = await this.box.command(boxRow.id, { command: "echo __UP__", timeoutMs: 3_500 });
           direct = probe.stdout.includes("__UP__");
@@ -746,7 +763,7 @@ export class Engine {
       if (sawEnd || /^\s*<end>\s*$/.test(text)) return { outcome: "silent" as const, text: "" };
       if (!visible) {
         // Rule 6 binding clause: no text and no <end> is LOUD, never silence.
-        return { outcome: "blocked" as const, text: "", diagnostic: completion.diagnostic ?? `harness ended (${completion.reason}) with no answer and no <end>` };
+        return { outcome: "blocked" as const, text: "", diagnostic: completion.diagnostic ?? `harness ended (${completion.reason}) with no answer and no <end>`, blockedEmitted: false };
       }
       await this.db.q(`insert into transcripts(user_key, conversation_id, role, content, mode) values($1,$2,'assistant',$3,'box')`, [userKey, input.conversationId, visible]);
       return { outcome: "answered" as const, text: visible };
@@ -754,7 +771,20 @@ export class Engine {
 
     // Stream queue while the locked work runs.
     let result: Awaited<typeof work> | undefined;
-    const done = work.then((r) => { result = r; queue.end(); }, (e) => { queue.push({ type: "turn.blocked", stage: "box.round.crashed", message: e instanceof Error ? (e.stack ?? e.message) : String(e), retryable: true, harness: harness.name, model: input.selection.model }); result = { outcome: "blocked", text: "", diagnostic: e instanceof Error ? e.message : String(e) }; queue.end(); });
+    const done = work.then((r) => { result = r; queue.end(); }, async (e) => {
+      // A box without its harness binary is constitutionally broken: retire the
+      // row LOUDLY so the next message provisions a fresh warm-cycled fork
+      // instead of crashing on the same corpse forever.
+      if (e instanceof HarnessMissingError) {
+        await this.db.q(`update boxes set retired_at=now(), billing_since=null where id=$1`, [box.id]).catch(() => undefined);
+        queue.push({ type: "lifecycle", boxId: box.id, state: "retired", note: "box lacks its harness (template pipeline failure) — retired; next message provisions a fresh machine" });
+      }
+      queue.push({ type: "turn.blocked", stage: "box.round.crashed", message: e instanceof Error ? (e.stack ?? e.message) : String(e), retryable: true, harness: harness.name, model: input.selection.model });
+      // blockedEmitted: the switch below must not emit a SECOND turn.blocked
+      // (observed in prod: the same error rendered twice in chat).
+      result = { outcome: "blocked", text: "", diagnostic: e instanceof Error ? e.message : String(e), blockedEmitted: true };
+      queue.end();
+    });
     while (!queue.done) { await queue.wait(); for (const e of queue.drain()) yield emit(e); }
     await done;
     for (const e of queue.drain()) yield emit(e);
@@ -775,8 +805,12 @@ export class Engine {
         break;
       default: {
         await this.finishTurn(turnId, "blocked");
-        const diag = (result && "diagnostic" in result ? (result as { diagnostic?: string }).diagnostic : undefined) ?? "box round produced no answer";
-        yield emit({ type: "turn.blocked", stage: "box.no-answer", message: diag, retryable: true, harness: harness.name, model: input.selection.model, boxId: box.id });
+        // The crash path already streamed its turn.blocked — never render the
+        // same failure twice (observed in prod as a doubled error bubble).
+        if (!(result && "blockedEmitted" in result && (result as { blockedEmitted?: boolean }).blockedEmitted)) {
+          const diag = (result && "diagnostic" in result ? (result as { diagnostic?: string }).diagnostic : undefined) ?? "box round produced no answer";
+          yield emit({ type: "turn.blocked", stage: "box.no-answer", message: diag, retryable: true, harness: harness.name, model: input.selection.model, boxId: box.id });
+        }
       }
     }
   }

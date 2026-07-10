@@ -138,6 +138,17 @@ export interface HarnessRunSpec {
  * (no visible text for a few seconds while tools run) is NOT a completion and must
  * never be treated as one.
  */
+/**
+ * A user box that lacks its harness binary is constitutionally broken (the
+ * template pipeline failed; in-turn reinstall is forbidden by spec). The
+ * engine retires such a box's row on sight — LOUDLY, the turn still blocks —
+ * so the user's next message provisions a fresh box instead of crashing on
+ * the same corpse forever.
+ */
+export class HarnessMissingError extends Error {
+  override readonly name = "HarnessMissingError";
+}
+
 export interface HarnessCompletion {
   /**
    *  - "completed": the CLI/SDK process finished its agent loop normally and the

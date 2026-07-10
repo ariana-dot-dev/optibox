@@ -14,7 +14,9 @@ import type { BoxClient, BoxInfo, CommandResult, HarnessAdapter } from "../src/t
 const baseUrl = process.env.DATABASE_URL;
 if (!baseUrl) throw new Error("DATABASE_URL required for the engine suite");
 const TEST_DB = `optibox_test_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-const adminUrl = baseUrl.replace(/\/[^/]*$/, "/optibox");
+// Admin work (create/drop the ephemeral db) runs over the configured database
+// itself — CREATE DATABASE works from any connection.
+const adminUrl = baseUrl;
 const testUrl = baseUrl.replace(/\/[^/]*$/, `/${TEST_DB}`);
 
 let db: Db;
@@ -116,15 +118,53 @@ test("rules 1+3: cold turn bridges (shared answers first), box answers on top, t
   engine.dispose();
 });
 
-test("rule 5: warm responsive box routes DIRECT with no shared bridge text", async () => {
+test("rule 5: direct route requires BOTH responsiveness and >=15s machine age", async () => {
   const box = new FakeBoxClient();
   const engine = makeEngine(box, harnessOf("h"));
   await collect(engine, "u5", "c5", "first");
-  // box is still billing (no sweep ran) -> second turn goes direct
-  const events = await collect(engine, "u5", "c5", "second");
-  assert.ok(events.some((e) => e.type === "trace" && e.stage === "route.direct"), "direct route chosen");
+  // Box billing but YOUNG (<15s of machine time): must bridge as if off.
+  const young = await collect(engine, "u5", "c5", "second while young");
+  assert.ok(young.some((e) => e.type === "shared.delta"), "young box still gets the shared answer");
+  assert.ok(!young.some((e) => e.stage === "route.direct"), "no direct route inside the warmup window");
+  // Age the machine past the window: now direct, no bridge.
+  await db.q(`update boxes set billing_since = now() - interval '20 seconds' where user_key like 'u5-%'`);
+  const events = await collect(engine, "u5", "c5", "third when warm");
+  assert.ok(events.some((e) => e.type === "trace" && e.stage === "route.direct"), "direct route chosen when warm");
   assert.ok(!events.some((e) => e.type === "shared.delta"), "no bridge text on a warm box");
   assert.ok(events.some((e) => e.type === "user-box.delta"), "box answered");
+  engine.dispose();
+});
+
+test("a box missing its harness is retired loudly ONCE; next message gets a fresh machine", async () => {
+  const { HarnessMissingError } = await import("../src/types.js");
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box, harnessOf("h", {
+    box: () => (async function* (): AsyncIterable<string> { throw new HarnessMissingError("harness 'pi' is not installed on this user box"); })(),
+  }));
+  const events = await collect(engine, "umiss", "cmiss", "do something");
+  assert.equal(events.filter((e) => e.type === "turn.blocked").length, 1, "exactly ONE blocked event (no doubled error bubble)");
+  assert.ok(events.some((e) => e.type === "lifecycle" && e.state === "retired"), "retirement is visible");
+  const firstBox = events.find((e) => e.type === "lifecycle" && e.state === "retired")?.boxId;
+  const rows = await db.q<{ retired_at: string | null }>(`select retired_at from boxes where id=$1`, [firstBox]);
+  assert.ok(rows[0]?.retired_at, "broken box row retired");
+  const fresh = await engine.ensureUserBox("umiss", "cmiss");
+  assert.notEqual(fresh.id, firstBox, "next message provisions a fresh machine");
+  engine.dispose();
+});
+
+test("template-configured engines NEVER plain-create: not-ready template fails loudly", async () => {
+  const box = new FakeBoxClient();
+  // Template configured but its build can't complete in the fake (install
+  // marker handled; the point is the not-ready window): mark row 'building'.
+  const engine = makeEngine(box, harnessOf("h"), { template: { installCmd: "echo install" } });
+  await db.q(`insert into templates(instance_id, box_id, status) values('testinst','tpl-x','building')
+              on conflict(instance_id) do update set status='building'`);
+  const events = await collect(engine, "utpl", "ctpl", "need a machine");
+  assert.ok(events.some((e) => e.type === "shared.delta"), "rule 1: shared still answered");
+  assert.ok(events.some((e) => e.type === "turn.blocked" && /template is still being prepared/.test(e.message)), "loud not-ready failure, no pi-less box");
+  const rows = await db.q(`select id from boxes where user_key like 'utpl-%' and retired_at is null`);
+  assert.equal(rows.length, 0, "no plain-created user box exists");
+  await db.q(`delete from templates where instance_id='testinst'`);
   engine.dispose();
 });
 

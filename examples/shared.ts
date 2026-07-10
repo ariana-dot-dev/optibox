@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createSharedInfraCapabilities } from "../src/capabilities.js";
 import { sharedDirectStream } from "./sharedDirectStream.js";
+import { HarnessMissingError } from "../src/index.js";
 import type { CommandResult, HarnessAdapter, HarnessOutputChunk, HarnessOutputMode, HarnessRuntime, ModelOption, SharedContext, UserBoxContext } from "../src/index.js";
 
 /** Provider->envvar pairs to inject into the Box so the harness can call the LLM. */
@@ -557,9 +558,9 @@ async function* runHarnessTurn(
     // of billed silence before the agent's first action. Crash loudly instead
     // (surfaces as turn.blocked with this text) so a broken template is
     // impossible to miss.
-    throw new Error(
+    throw new HarnessMissingError(
       `harness '${spec.bin}' is not installed on this user box — fresh boxes must fork the pre-installed template; in-turn reinstall is forbidden. ` +
-      "The template build is broken or its snapshot is missing: check the server log for '[optibox] template box build failed'.",
+      "The template build is broken or its snapshot is missing: check the server log for '[optibox] template box build failed'. This box is retired; your next message provisions a fresh machine.",
     );
   }
   if (spec.installCmd && !binInstalled) {

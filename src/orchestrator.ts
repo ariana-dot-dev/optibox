@@ -341,6 +341,10 @@ export class ConsumerBoxAgentOrchestrator {
       // External wakes (typing/upload) register billing via registerExternalWake,
       // so a deliberately-woken box is never mistaken for an orphan here.
       if (this.billing.has(box.id)) { this.orphanSightings.delete(box.id); continue; }
+      // A box HOSTING an exposed service is intentionally up even when nothing
+      // bills it (e.g. after a server restart rebuilt hosting state from the
+      // pgrep ground truth) — never orphan-reap a user's live site.
+      if ([...this.hostingByUser.values()].some((services) => [...services.values()].some((s) => s.boxId === box.id))) { this.orphanSightings.delete(box.id); continue; }
       seenIds.add(box.id);
       const firstSeen = this.orphanSightings.get(box.id);
       if (firstSeen === undefined) { this.orphanSightings.set(box.id, now); continue; }

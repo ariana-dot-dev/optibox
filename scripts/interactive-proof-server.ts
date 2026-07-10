@@ -1,7 +1,8 @@
 import http from "node:http";
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { URL } from "node:url";
+import { createHash, randomBytes } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { URL, fileURLToPath } from "node:url";
+import path from "node:path";
 import {
   BoxHttpClient,
   assertNoBoxAgent,
@@ -23,6 +24,40 @@ import { spec as opencodeSpec } from "../examples/opencode/adapter.js";
 import { spec as piSpec } from "../examples/pi/adapter.js";
 
 const port = Number(process.env.PORT ?? 4178);
+
+/**
+ * Stable per-DEPLOYMENT identity, embedded in every Box this process creates
+ * and in the orphan-reaper's own-box predicate below. Without this, two
+ * separate optibox deployments sharing one Box account (a hosted preview and
+ * someone's local dev server, say) create IDENTICALLY-named boxes
+ * (`consumer-agent-user-<userId>-<hash>` depended only on the API key/provider
+ * env, not on which machine/checkout is running), so each one's orphan sweep
+ * — which force-stops any running box matching its naming that IT isn't
+ * currently billing — reaps the OTHER deployment's boxes as if they were its
+ * own leaked orphans. Confirmed in production: a hosted instance's reaper
+ * stopped a developer's own dev-box mid-session with zero warning.
+ *
+ * Persisted next to this checkout (co-located with the script, not affected by
+ * invocation cwd), untracked by git, survives `git reset --hard` from the
+ * redeploy poller — so restarts of THIS deployment keep the same id (box
+ * adoption-by-name across restarts still works), while any other checkout,
+ * anywhere, mints its own id on first run and can never collide.
+ */
+function instanceId(): string {
+  // This module compiles to dist/scripts/interactive-proof-server.js, so ".."
+  // twice reaches the actual repo root (same level as .env), not the dist/
+  // build output — the id must not live somewhere a future "clean dist before
+  // build" step could plausibly wipe it.
+  const file = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", ".optibox-instance-id");
+  try {
+    const existing = readFileSync(file, "utf8").trim();
+    if (existing) return existing;
+  } catch { /* first run on this checkout */ }
+  const id = randomBytes(4).toString("hex");
+  try { writeFileSync(file, id); } catch { /* best effort; falls back to a fresh id next start */ }
+  return id;
+}
+const INSTANCE_ID = instanceId();
 
 // Public task-agent previews must never reuse the task agent's real Box/LLM keys.
 // Alfred/private previews can opt into the old zero-config behavior with
@@ -152,7 +187,7 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
     harnesses,
     sessions: new InMemorySessionStore(),
     providerEnv,
-    userBoxName: (userId) => `consumer-agent-user-${userId}-${cacheKey.slice(0, 8)}`,
+    userBoxName: (userId) => `consumer-agent-${INSTANCE_ID}-user-${userId}-${cacheKey.slice(0, 8)}`,
     userBoxTtlSeconds: 900,
     // Readiness is now a live command probe (boxes execute commands seconds
     // before their state field reports ready), so poll fast to actually collect
@@ -170,12 +205,19 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
     // Orphan sweep: after a server restart the in-memory billing map is empty, so
     // running consumer-agent boxes from the previous process would bill until TTL.
     // The reaper stops any running box with our naming that this process isn't
-    // billing (after a grace window). Assumes one server process per Box account.
-    orphanBoxName: (name) => name.startsWith("consumer-agent-"),
+    // billing (after a grace window). Scoped to THIS deployment's instance id —
+    // matching on the bare "consumer-agent-" prefix reaped a completely
+    // different deployment's boxes in production (confirmed 2026-07-10: a
+    // developer's own dev box got force-stopped mid-session by this server's
+    // reaper, since both used the same generic naming with no way to tell
+    // "mine" from "someone else's" apart).
+    orphanBoxName: (name) => name.startsWith(`consumer-agent-${INSTANCE_ID}-`),
     // Fresh user boxes fork this pre-installed snapshot (~16s restore) instead of
     // creating an empty box and npm-installing opencode inside it (~15-40s).
+    // Instance-scoped too, so two deployments never adopt/contend over the same
+    // template box.
     userBoxTemplate: {
-      name: "consumer-agent-template",
+      name: `consumer-agent-${INSTANCE_ID}-template`,
       // Pi is the default harness now, so it MUST be baked into the template or
       // every fresh box pays a 15-40s npm install on its first turn. opencode
       // stays installed too so switching harnesses is still instant.
@@ -346,7 +388,8 @@ function fsBoxName(credentials: DemoCredentials, userId: string): string {
     .digest("hex");
   // NOTE: no template literal here — the client regression tests locate the
   // html() template by finding this file's first returned backtick string.
-  return "consumer-agent-user-" + userId + "-" + cacheKey.slice(0, 8);
+  // Must stay byte-for-byte in sync with the userBoxName in orchestratorFor().
+  return "consumer-agent-" + INSTANCE_ID + "-user-" + userId + "-" + cacheKey.slice(0, 8);
 }
 
 /**

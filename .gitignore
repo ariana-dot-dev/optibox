@@ -4,5 +4,6 @@ evidence/
 .env
 .env.*
 !.env.example
+.optibox-instance-id
 .DS_Store
 e2e-qa-server-*.log

@@ -701,7 +701,12 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
         }).catch((e) => fsLog({ route: "activity", userId, note: "cold boot failed", message: String(e).slice(0, 140) }))
           .finally(() => coldBooting.delete(userId));
       }
-      return json(200, { ok: true, state: box?.state ?? "none", live, ...(coldBooting.has(userId) ? { booting: true } : {}) }), true;
+      // Return the SAME runtime snapshot the tree poll carries: the composing
+      // ping is the fastest channel the client has while the user types, so the
+      // header counters reconcile within one ping of billing starting instead of
+      // waiting out the 4s tree poll (which visibly raced short compose windows:
+      // machine billing server-side, header stuck at 0.0s until send).
+      return json(200, { ok: true, state: box?.state ?? "none", live, runtime: orch.userRuntimeStatus(userId), ...(coldBooting.has(userId) ? { booting: true } : {}) }), true;
     }
 
     // Remove a staged attachment the user deleted from the composer before
@@ -1168,10 +1173,18 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .deckNav.hiddenNav{display:none}
 /* OG link previews: embed cards for links the agent mentions, row under its message. */
 .ogDeck{display:flex;gap:8px;padding:8px 2px 4px}
-.ogDeck .ogCard{flex:0 0 auto;width:210px;border-radius:12px;background:#f1f1f1;overflow:hidden;cursor:pointer;text-decoration:none;color:inherit;transition:box-shadow .15s ease,transform .15s ease;display:block}
+.ogDeck .ogCard{flex:0 0 auto;width:210px;height:186px;border-radius:12px;background:#f1f1f1;overflow:hidden;cursor:pointer;text-decoration:none;color:inherit;transition:box-shadow .15s ease,transform .15s ease;display:flex;flex-direction:column}
 .ogDeck .ogCard:hover{box-shadow:0 6px 18px rgba(0,0,0,.13);transform:translateY(-2px)}
-.ogDeck .ogImg{width:100%;height:100px;object-fit:cover;display:block;background:#e6e6e6}
-.ogDeck .ogBody{padding:7px 10px 9px}
+.ogDeck .ogImg{width:100%;height:96px;flex:0 0 auto;object-fit:cover;display:block;background:#e6e6e6}
+.ogDeck .ogBody{padding:7px 10px 9px;overflow:hidden;display:flex;flex-direction:column}
+.ogDeck .ogBody .ogSite{margin-top:auto}
+/* Live embed of a site the box is hosting (*.on.ascii.dev) — same footprint as
+   the screen-share widget: the user sees their hosted site running in chat. */
+.siteEmbed{align-self:flex-start;max-width:86%;width:540px;padding:8px;background:#f6f6f6;border-radius:14px;margin:4px 0}
+.siteEmbedBar{font-size:10px;color:#555;margin:0 4px 6px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.siteEmbedBar span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.siteEmbedBar a{color:#555}
+.siteEmbed iframe{width:100%;aspect-ratio:16/10;border:0;border-radius:8px;background:#fff;display:block}
 .ogDeck .ogTitle{font-size:11.5px;font-weight:600;line-height:1.3;max-height:2.6em;overflow:hidden}
 .ogDeck .ogDesc{font-size:10.5px;color:#777;margin-top:2px;line-height:1.3;max-height:2.6em;overflow:hidden}
 .ogDeck .ogSite{font-size:9px;color:#9a9a9a;margin-top:5px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1259,13 +1272,15 @@ body{overflow:hidden;overscroll-behavior:none}
 .counters{gap:6px}.counter{padding:8px 9px;border-radius:9px}
 .label{font-size:10.5px}.value{font-size:16px}.state{font-size:11px}
 @keyframes warmPulse{0%,100%{opacity:1}50%{opacity:.4}}
-.hostingBadge{display:flex;align-items:center;gap:7px}
-.hostingBadge .value{color:#0a7d38}
-.hostingBadge .value::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:#17b45c;margin-right:5px;animation:warmPulse 1.6s ease-in-out infinite}
-.hostingStop{font-size:10px;padding:3px 9px;border-radius:999px;background:#fdecec;color:#fc4b55;cursor:pointer;user-select:none}
-.hostingStop:hover{background:#fc4b55;color:#fff}
+/* Hosting swaps into the auto-stop slot (the counters grid is exactly 3
+   columns — a 4th cell overlaps). Same .counter card as every other cell. */
+.hostingBadge .label{display:flex;align-items:center;gap:6px}
+.hostingDot{width:7px;height:7px;border-radius:50%;background:#17b45c;flex:0 0 auto;animation:warmPulse 1.6s ease-in-out infinite}
+.hostingStop{margin-left:auto;font-size:10px;line-height:1;padding:3px 8px;border-radius:6px;background:#fff;border:1px solid #e4e4e4;color:#fc4b55;cursor:pointer;user-select:none}
+.hostingStop:hover{border-color:#fc4b55}
+.hostingBadge .value{font-size:15px}
 .state.warming{animation:warmPulse 1.1s ease-in-out infinite;color:#b45309}
-.receipt{font-size:11px;color:#8a8a8a;margin:2px 0 10px;padding:0 6px;align-self:flex-start}
+.receipt{font-size:10.5px;color:#b0b0b0;margin:0 0 8px;padding:0 2px;align-self:flex-start}
 .chat{padding:14px 12px 16px;gap:9px}
 .msg{max-width:88%;font-size:14px;padding:9px 11px}
 .msg.trace{font-size:11.5px}
@@ -1314,8 +1329,8 @@ textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px inpu
     <section class="counters" aria-label="totals">
       <div class="counter"><span class="label">total spent</span><span class="value" id="totalCost">$0.000000</span></div>
       <div class="counter"><span class="label">machine time</span><span class="value" id="totalSeconds">0.0s</span></div>
-      <div class="counter"><span class="label">auto-stop</span><span class="value" id="autoStopTimer">idle</span></div>
-      <div class="counter hostingBadge" id="hostingBadge" style="display:none"><span class="label">hosting</span><span class="value" id="hostingInfo">—</span><span class="hostingStop" id="hostingStop" role="button" title="stop hosting: close the port and let the machine stop">stop</span></div>
+      <div class="counter" id="autoStopCell"><span class="label">auto-stop</span><span class="value" id="autoStopTimer">idle</span></div>
+      <div class="counter hostingBadge" id="hostingBadge" style="display:none"><span class="label"><span class="hostingDot"></span>hosting<span class="hostingStop" id="hostingStop" role="button" title="stop hosting: close the port and let the machine stop">stop</span></span><span class="value" id="hostingInfo">—</span></div>
     </section>
     <div class="state" id="machineState">shared bridge ready · private machine stopped</div>
   </header>
@@ -1634,7 +1649,16 @@ function renderToolChain(chain){const cc=$('chat');const stick=chatStick(cc);con
 function addToolEvent(ev,localId){let chain=currentToolChain;if(ev.phase==='tool_result'){const running=findRunningTool();if(running){Object.assign(running,{state:toolStateFromEvent(ev),stdout:ev.stdout||running.stdout||'',stderr:ev.stderr||running.stderr||'',isError:Boolean(ev.isError),resultSeen:true});const owner=toolChains.find(ch=>ch.calls.includes(running));if(owner)renderToolChain(owner);return owner&&owner.el;}}
 chain=ensureToolChain(localId);const call={id:'tool-'+(++toolSeq),toolName:ev.toolName||'tool',command:ev.command||'',description:ev.description||'',stdout:ev.stdout||'',stderr:ev.stderr||'',isError:Boolean(ev.isError),state:toolStateFromEvent(ev),resultSeen:ev.phase==='tool_result'};chain.calls.push(call);renderToolChain(chain);return chain.el;}
 function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date.now();if(!timer)timer=setInterval(renderTotals,100);}document.body.dataset.billing='1';setWarmingPulse(false);setState('private machine running · tools active · billing live');renderTotals();}
-function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;}if(timer){clearInterval(timer);timer=null;}delete document.body.dataset.billing;setWarmingPulse(false);clearAutoStopTimer('stopped');setState('private machine stopped · billing paused');renderTotals();}
+// totalSeconds ownership: the SERVER's cumulative billedSecondsTotal is the one
+// truth (applyRuntimeStatus ASSIGNS it from every snapshot). The += here is only
+// an optimistic bridge so the display doesn't dip in the sub-second gap between
+// a billing.stop event and the next snapshot — assignment then overwrites it,
+// so the client total can never drift from what was actually billed.
+// reconciled=true: the caller is a runtime snapshot whose billedSecondsTotal
+// ALREADY contains the just-ended window (it was assigned a line earlier in
+// applyRuntimeStatus) — folding it here too would double-count. SSE events
+// (no snapshot in hand) fold optimistically and the next snapshot overwrites.
+function stopBilling(elapsed,reconciled){if(billing){if(!reconciled)totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;}if(timer){clearInterval(timer);timer=null;}delete document.body.dataset.billing;setWarmingPulse(false);clearAutoStopTimer('stopped');setState('private machine stopped · billing paused');renderTotals();}
 // Reconcile ALL machine counters from the polled runtime snapshot (rides every
 // fs tree poll). This is the ground truth: a machine woken by typing or an
 // upload has no SSE stream, so without this the counter/cost/auto-stop UI
@@ -1645,9 +1669,9 @@ function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>
 // arrives on the same runtime snapshot as every other counter.
 function syncHostingBadge(hosting){
   try{
-    const badge=$('hostingBadge');if(!badge||!badge.style)return;
-    if(hosting){const info=$('hostingInfo');if(info)info.textContent=':'+hosting.port+' · '+hosting.mode;badge.style.display='flex';}
-    else badge.style.display='none';
+    const badge=$('hostingBadge'),autoCell=$('autoStopCell');if(!badge||!badge.style)return;
+    if(hosting){const info=$('hostingInfo');if(info)info.textContent=':'+hosting.port+' '+hosting.mode;badge.style.display='';if(autoCell&&autoCell.style)autoCell.style.display='none';}
+    else{badge.style.display='none';if(autoCell&&autoCell.style)autoCell.style.display='';}
   }catch(_){}
 }
 let hostingStopBusy=false;
@@ -1664,6 +1688,10 @@ $('hostingStop')?.addEventListener('click',async()=>{
 function applyRuntimeStatus(rt){
   if(!rt)return;
   syncHostingBadge(rt.hosting||null);
+  // Authoritative assignment (never +=): the server accumulates billed seconds
+  // in ONE place (endBilling) and every snapshot carries the total, so the
+  // header is a pure projection: total + live window since billingSinceEpochMs.
+  if(typeof rt.billedSecondsTotal==='number'&&isFinite(rt.billedSecondsTotal))totalSeconds=rt.billedSecondsTotal;
   const turnActiveClient=activeTurns.size>0;
   if(rt.billingSinceEpochMs){
     if(!billing)startBilling(rt.billingSinceEpochMs);
@@ -1679,7 +1707,7 @@ function applyRuntimeStatus(rt){
       setState('private machine idle · auto-stop counting down');
     }
   }else if(billing&&!turnActiveClient){
-    stopBilling();
+    stopBilling(null,true);
   }
 }
 const activeTurns=new Map();
@@ -1863,7 +1891,10 @@ function extractLinks(text){
   // NOTE: no \\/ escapes outside char classes here — the raw-source compile
   // check parses this template before unescaping, and \\/ ends a regex literal
   // there. [/] is equivalent and parses identically in both forms.
-  const push=u=>{u=String(u).replace(/[).,;:!?\\]'"\\u00BB]+$/,'');if(!/^https?:[/][/]/i.test(u)||OG_SKIP_RE.test(u)||u.length>600)return;if(!seen[u]){seen[u]=1;out.push(u);}};
+  // Trailing junk includes markdown emphasis (**url**, _url_, `url`) — agents
+  // routinely bold their links and the asterisks would otherwise ride into the
+  // href as %2A%2A and split one link into several "distinct" mangled ones.
+  const push=u=>{u=String(u).replace(/[).,;:!?\\]'"\\u00BB*_\\u0060]+$/,'');if(!/^https?:[/][/]/i.test(u)||OG_SKIP_RE.test(u)||u.length>600)return;if(!seen[u]){seen[u]=1;out.push(u);}};
   let m;const mdre=/\\[[^\\]]*\\]\\((https?:[/][/][^\\s)]+)\\)/g;while((m=mdre.exec(text)))push(m[1]);
   const bare=/https?:[/][/][^\\s<>"')\\]]+/g;while((m=bare.exec(text)))push(m[0]);
   return out.slice(0,4);
@@ -1874,18 +1905,35 @@ async function renderLinkPreviews(el){
     const body=el.querySelector('.body');if(!body)return;
     const shown=stripEndSentinel(stripFileDecl(body.dataset.raw||''));
     const links=extractLinks(shown);if(!links.length)return;
-    const metas=await Promise.all(links.map(u=>fetch('/api/og?url='+encodeURIComponent(u)).then(r=>r.json()).catch(()=>null)));
+    // Sites hosted from the box itself (host CLI → *.on.ascii.dev) get a LIVE
+    // iframe embed the size of the screen-share widget, not a small card.
+    const framed=links.filter(u=>/[.]on[.]ascii[.]dev/i.test(u));
+    const rest=links.filter(u=>framed.indexOf(u)<0);
+    framed.slice(0,2).forEach(u=>{
+      const box=document.createElement('div');box.className='siteEmbed';
+      const bar=document.createElement('div');bar.className='siteEmbedBar';
+      const nm=document.createElement('span');nm.textContent=u.replace(/^https?:[/][/]/i,'');bar.appendChild(nm);
+      const open=document.createElement('a');open.href=u;open.target='_blank';open.rel='noopener noreferrer';open.textContent='open in tab';bar.appendChild(open);
+      box.appendChild(bar);
+      const fr=document.createElement('iframe');fr.src=u;fr.loading='lazy';fr.setAttribute('sandbox','allow-scripts allow-same-origin allow-forms allow-popups');box.appendChild(fr);
+      el.parentNode.insertBefore(box,el.nextSibling);
+    });
+    if(!rest.length)return;
+    const metas=await Promise.all(rest.map(u=>fetch('/api/og?url='+encodeURIComponent(u)).then(r=>r.json()).catch(()=>null)));
     if(!el.parentNode)return;
     const deck=document.createElement('div');deck.className='ogDeck';
-    links.forEach((u,i)=>{
+    rest.forEach((u,i)=>{
       const meta=(metas[i]&&metas[i].ok)?metas[i]:null;
       const a=document.createElement('a');a.className='ogCard';a.href=u;a.target='_blank';a.rel='noopener noreferrer';a.title=u;
       let host='';try{host=new URL(u).hostname.replace(/^www\\./,'');}catch(_){}
       if(meta&&meta.image){const img=document.createElement('img');img.className='ogImg';img.src=meta.image;img.loading='lazy';img.addEventListener('error',()=>{try{img.remove();}catch(_){}});a.appendChild(img);}
       const b=document.createElement('div');b.className='ogBody';
-      const t=document.createElement('div');t.className='ogTitle';t.textContent=(meta&&meta.title)||host||u;b.appendChild(t);
+      const title=(meta&&meta.title)||host||u;
+      const t=document.createElement('div');t.className='ogTitle';t.textContent=title;b.appendChild(t);
       if(meta&&meta.description){const d=document.createElement('div');d.className='ogDesc';d.textContent=meta.description;b.appendChild(d);}
-      const s=document.createElement('div');s.className='ogSite';s.textContent=(meta&&meta.site)||host;b.appendChild(s);
+      // Site line only when it adds information the title doesn't already show.
+      const site=(meta&&meta.site)||host;
+      if(site&&site!==title){const s=document.createElement('div');s.className='ogSite';s.textContent=site;b.appendChild(s);}
       a.appendChild(b);deck.appendChild(a);
     });
     el.parentNode.insertBefore(makeCarousel(deck,'left'),el.nextSibling);
@@ -1919,6 +1967,8 @@ diagnosticsBtn?.addEventListener('click',e=>{e.preventDefault();const a=document
 msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer('textarea.enter');}});
 msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer('textarea.beforeinput');}});
 msgEl.addEventListener('input',()=>{updateComposerMode();notifyComposing();});
+msgEl.addEventListener('focus',()=>notifyComposing(true));
+msgEl.addEventListener('pointerdown',()=>notifyComposing(true));
 // "Box still needed" flag: typing or staged attachments ping the server every
 // few seconds — the rolling hold pauses any countdown at full and wakes a
 // parked machine so it's warm by the time the message is sent. Stop typing
@@ -1928,14 +1978,20 @@ let lastComposePing=0;
 // the status line should say so the instant the first keystroke lands, pulsing
 // until billing confirms the machine is actually up (startBilling clears it).
 function setWarmingPulse(on){const st=$('machineState');if(st&&st.classList){if(on)st.classList.add('warming');else st.classList.remove('warming');}}
-function notifyComposing(){
-  const composing=((msgEl&&msgEl.value||'').trim().length>0)||pendingFiles.length>0;
+function notifyComposing(force){
+  // force=true: focus/click in the prompt box counts as compose intent even
+  // before any text exists — the machine starts warming on the very first
+  // gesture toward writing, not the first character.
+  const composing=Boolean(force)||((msgEl&&msgEl.value||'').trim().length>0)||pendingFiles.length>0;
   if(!composing)return;
   if(!billing){setState('private machine warming · woken by your typing');setWarmingPulse(true);}
   const now=Date.now();
   if(now-lastComposePing<4000)return;
   lastComposePing=now;
-  fetch('/api/fs/activity',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()})}).catch(()=>{});
+  // The response carries the same runtime snapshot as the tree poll — apply it
+  // through the SAME reducer so the counters reconcile within one ping of the
+  // wake instead of waiting out the 4s poll (which raced short compose windows).
+  fetch('/api/fs/activity',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()})}).then(r=>r.json()).then(j=>{if(j&&j.runtime)applyRuntimeStatus(j.runtime);}).catch(()=>{});
 }
 // ---- voice messages -------------------------------------------------------
 // Telegram-style: mic shows when the box is empty; press it to record with a
@@ -2091,7 +2147,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
     // Per-turn receipt: the economic argument for per-second billing, made
     // legible per artifact — "that PDF cost you $0.0041". Only for turns that
     // actually ran the private machine, and only when a real amount accrued.
-    if(td&&td.boxStarted&&!td.receiptShown){const used=activeSeconds()-(td.startSeconds||0);if(used>=0.1&&billRate>0){td.receiptShown=true;const r=document.createElement('div');r.className='receipt';r.textContent='⚡ this turn: '+used.toFixed(1)+'s machine time · '+fmtUsd(used*billRate);const c=$('chat');const stick=chatStick(c);c.appendChild(r);if(stick)c.scrollTop=c.scrollHeight;}}}
+    if(td&&td.boxStarted&&!td.receiptShown){const used=activeSeconds()-(td.startSeconds||0);if(used>=0.1&&billRate>0){td.receiptShown=true;const r=document.createElement('div');r.className='receipt';r.textContent=used.toFixed(1)+'s machine time · '+fmtUsd(used*billRate);const c=$('chat');const stick=chatStick(c);c.appendChild(r);if(stick)c.scrollTop=c.scrollHeight;}}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};

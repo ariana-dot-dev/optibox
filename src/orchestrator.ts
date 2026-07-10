@@ -251,6 +251,13 @@ export class ConsumerBoxAgentOrchestrator {
   /** Boxes with an eager serve-prewarm in flight — dedupes the every-4s typing pings. */
   private readonly prewarmingBoxes = new Set<string>();
   /**
+   * Cumulative billed seconds per user across every ended billing lifecycle
+   * (fed only by endBilling). userRuntimeStatus surfaces it so the UI's
+   * total/cost counters are a projection of server truth instead of a
+   * client-side accumulator that drifts.
+   */
+  private readonly billedSecondsByUser = new Map<string, number>();
+  /**
    * Users whose box is actively HOSTING an exposed service (the box `host
    * <port> --public|--private` CLI ran in a tool call). Unlike boxHolds this
    * deliberately has NO TTL: a hosted site must stay reachable until the user
@@ -354,8 +361,7 @@ export class ConsumerBoxAgentOrchestrator {
       // (e.g. a stuck resume), not the conversation's current session box. When
       // `force` (over the hard billing ceiling) we stop even a "busy" conversation.
       if (!force && (this.activeTurnCounts.has(key) || this.activePrivateRound(key) || this.userBoxStarts.has(key))) return;
-      if (!this.billing.has(boxId)) return;
-      this.billing.delete(boxId);
+      if (this.endBilling(boxId) === undefined) return;
       this.boxOwners.delete(boxId);
       await this.options.box.stop(boxId).catch(() => undefined);
     } finally {
@@ -1289,15 +1295,13 @@ export class ConsumerBoxAgentOrchestrator {
       const blockedBoxId = error instanceof BoxTerminalStateError
         ? error.boxId
         : ("boxId" in resolvedStatus ? resolvedStatus.boxId : undefined);
-      if (blockedBoxId && this.billing.has(blockedBoxId)) {
-        const since = this.billing.get(blockedBoxId) ?? Date.now();
-        const elapsedSeconds = Math.max(0, (Date.now() - since) / 1000);
-        this.billing.delete(blockedBoxId);
+      const blockedElapsed = blockedBoxId ? this.endBilling(blockedBoxId) : undefined;
+      if (blockedBoxId && blockedElapsed !== undefined) {
         yield {
           type: "billing.stop",
           boxId: blockedBoxId,
-          elapsedSeconds,
-          costUsd: elapsedSeconds * BOX_PRICE_USD_PER_SECOND,
+          elapsedSeconds: blockedElapsed,
+          costUsd: blockedElapsed * BOX_PRICE_USD_PER_SECOND,
           note: "billing PAUSED — private Box boot/resume ended before it became usable",
         };
       }
@@ -2468,6 +2472,8 @@ export class ConsumerBoxAgentOrchestrator {
   userRuntimeStatus(userId: string): {
     boxId?: string;
     billingSinceEpochMs: number | null;
+    /** Seconds billed across all ENDED lifecycles; add the live (since) window for the display total. */
+    billedSecondsTotal: number;
     holds: string[];
     activeTurn: boolean;
     idleStopEtaEpochMs: number | null;
@@ -2493,7 +2499,7 @@ export class ConsumerBoxAgentOrchestrator {
       ? Math.max(Date.now(), (lastActivity || Date.now()) + idleStopMs)
       : null;
     const hostingEntry = this.hostingByUser.get(userId);
-    return { ...(boxId ? { boxId } : {}), billingSinceEpochMs: since, holds, activeTurn, idleStopEtaEpochMs, idleStopMs, hosting: hostingEntry ? { port: hostingEntry.port, mode: hostingEntry.mode, sinceEpochMs: hostingEntry.sinceEpochMs } : null };
+    return { ...(boxId ? { boxId } : {}), billingSinceEpochMs: since, billedSecondsTotal: this.billedSecondsByUser.get(userId) ?? 0, holds, activeTurn, idleStopEtaEpochMs, idleStopMs, hosting: hostingEntry ? { port: hostingEntry.port, mode: hostingEntry.mode, sinceEpochMs: hostingEntry.sinceEpochMs } : null };
   }
 
   private startBilling(boxId: string, owner?: { userId: string; conversationId: string }): { since: number; fresh: boolean } {
@@ -2507,6 +2513,27 @@ export class ConsumerBoxAgentOrchestrator {
     // can stop it by user/conversation even with no request stream attached.
     if (owner) this.boxOwners.set(boxId, { ...owner, key: `${owner.userId}:${owner.conversationId}` });
     return { since, fresh };
+  }
+
+  /**
+   * THE one way billing ends. Computes the elapsed seconds, folds them into the
+   * user's cumulative total (surfaced by userRuntimeStatus — the UI's machine
+   * counter is a pure projection of that number, not its own accumulator), and
+   * clears the live entry. Returns elapsed seconds, or undefined if the box was
+   * not billing. Every stop path routes through here; before this existed each
+   * path did its own get/compute/delete and the client kept a THIRD copy of the
+   * running total, so the header could disagree with the server (observed: a
+   * typing-woken machine billed server-side while the header showed 0.0s until
+   * the next poll happened to land).
+   */
+  private endBilling(boxId: string): number | undefined {
+    const since = this.billing.get(boxId);
+    if (since === undefined) return undefined;
+    this.billing.delete(boxId);
+    const elapsedSeconds = Math.max(0, (Date.now() - since) / 1000);
+    const owner = this.boxOwners.get(boxId);
+    if (owner) this.billedSecondsByUser.set(owner.userId, (this.billedSecondsByUser.get(owner.userId) ?? 0) + elapsedSeconds);
+    return elapsedSeconds;
   }
 
   /**
@@ -2548,7 +2575,6 @@ export class ConsumerBoxAgentOrchestrator {
       return;
     }
     const boxId = session.boxId;
-    const since = this.billing.get(boxId);
     if (canceled()) {
       yield {
         type: "autostop.timer",
@@ -2614,8 +2640,7 @@ export class ConsumerBoxAgentOrchestrator {
     // platform then spends snapshotting/archiving is not the user's time. This
     // also freezes the UI's machine counter at the countdown's zero instead of
     // letting it tick through the archive (which read as "it never stops").
-    const elapsedSeconds = since ? Math.max(0, (Date.now() - since) / 1000) : 0;
-    this.billing.delete(boxId);
+    const elapsedSeconds = this.endBilling(boxId) ?? 0;
     yield {
       type: "billing.stop",
       boxId,

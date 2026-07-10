@@ -2054,3 +2054,36 @@ test("a stalled Box create can never block the always-fast shared reply", async 
   assert.ok(events.some((e) => e.type === "shared.delta"), "shared reply is emitted even though the box never comes up");
   assert.ok(elapsedMs < 400, `shared reply took ${elapsedMs}ms — should be bounded by bootAckTimeoutMs, not the stalled box create`);
 });
+
+test("a turn that dedupe-joins a wake-on-type boot completes instead of wedging", async () => {
+  // Prod incident (2026-07-10 ~10:45 and ~11:24 UTC): wake-on-type cold-boots
+  // the user box via ensureUserBox; the user's first message then dedupe-joins
+  // that in-flight boot — whose join path dropped the turn's onBootAck, so the
+  // turn's bootAckPromise never settled and the pre-runtime checkpoint awaited
+  // it UNCAPPED: shared reply delivered, then "working" forever, round active,
+  // lock held, every later message queued behind it indefinitely.
+  const box = new FakeBoxClient();
+  const orchestrator = new ConsumerBoxAgentOrchestrator({
+    box,
+    harnesses: [probeHarness("alpha")],
+    readinessPollMs: 1,
+    autoStopIdleMs: 1,
+    bootAckTimeoutMs: 50,
+  });
+
+  // Simulate the wake-on-type warming pulse: boot starts BEFORE the turn.
+  const warm = orchestrator.ensureUserBox("u", "c");
+
+  const events: any[] = [];
+  const turn = (async () => {
+    for await (const e of orchestrator.runTurn({ userId: "u", conversationId: "c", message: "run first command", selection: { harness: "alpha", provider: "anthropic", model: "m-1" } })) events.push(e);
+  })();
+  await Promise.race([
+    turn,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("turn wedged — dedupe-joined boot starved the bootAck checkpoint again")), 2_000)),
+  ]);
+  await warm;
+
+  assert.ok(events.some((e) => e.type === "turn.done"), "turn reaches a terminal event");
+  assert.ok(events.some((e) => e.type === "user-box.delta"), "private runtime actually answered");
+});

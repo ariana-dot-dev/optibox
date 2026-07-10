@@ -425,7 +425,16 @@ export class ConsumerBoxAgentOrchestrator {
   ): Promise<BoxInfo> {
     const key = `${userId}:${conversationId}`;
     const inFlight = this.userBoxStarts.get(key);
-    if (inFlight) return inFlight;
+    if (inFlight) {
+      // A joiner's onBootAck must STILL fire, from the in-flight boot's own
+      // resolution. Dropping it (the old behavior) left the joining turn's
+      // bootAckPromise unsettled forever — and the turn's pre-runtime
+      // checkpoint awaited that promise uncapped, wedging the whole
+      // conversation. Live trigger: wake-on-type cold-boots the box, then the
+      // user's first real message dedupe-joins that in-flight boot here.
+      if (onBootAck) inFlight.then((box) => onBootAck({ action: "existing-boot", box })).catch(() => undefined);
+      return inFlight;
+    }
     const started = this.ensureUserBoxUncached(userId, conversationId, onBootAck);
     this.userBoxStarts.set(key, started);
     try {
@@ -1298,7 +1307,16 @@ export class ConsumerBoxAgentOrchestrator {
 
     try {
       if (!confirmedBootEmitted) {
-        const bootAck = await bootAckPromise.catch(() => undefined);
+        // Capped like the first checkpoint. This await previously had no
+        // ceiling on the assumption the ack always "arrives late at worst" —
+        // false: a turn that dedupe-joined an in-flight boot never got its ack
+        // at all (fixed at the join site, but belt-and-braces here), and this
+        // uncapped await wedged the conversation indefinitely: shared reply
+        // done, round active, lock held, every later message queued forever.
+        const bootAck = await Promise.race([
+          bootAckPromise,
+          new Promise<undefined>((resolve) => setTimeout(resolve, this.options.bootAckTimeoutMs ?? 1_500)),
+        ]).catch(() => undefined);
         if (bootAck) {
           confirmedBootEmitted = true;
           yield* this.emitConfirmedBootStart(bootAck, harness, input.selection.model, { userId: input.userId, conversationId: input.conversationId });

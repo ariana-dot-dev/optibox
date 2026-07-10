@@ -980,6 +980,8 @@ const server = http.createServer(async (req, res) => {
         ? body.attachments.filter((a: any) => a && typeof a.name === "string" && typeof a.contentB64 === "string" && !a.alreadyUploaded)
         : [];
       let attachmentsUploaded = false;
+      // Declared out here (not in the try) so the post-catch flush can await it.
+      let journalChain: Promise<unknown> = Promise.resolve();
       const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const selection = {
         harness: String(body.harness),
@@ -1001,6 +1003,23 @@ const server = http.createServer(async (req, res) => {
           message: String(body.message ?? ""),
           selection,
         };
+        // Render journal: persist, in order, every event that carries a turnId
+        // (the real turn stream — deltas, tool chains, lifecycle, turn.done)
+        // plus one synthetic user.message so reopening the app can REPLAY the
+        // conversation through the same renderer. Chained (ordered) but not
+        // awaited per-event, so live streaming isn't gated on Postgres; the
+        // chain is awaited before the response ends so nothing is lost — and it
+        // keeps recording even if the user closed the tab, because this loop
+        // runs to completion server-side regardless of the connection.
+        const journal = (bodyToLog: unknown, turnId: string | null) => {
+          journalChain = journalChain.then(() =>
+            orchestrator.logEvent(turnInput.userId, turnInput.conversationId, turnId, bodyToLog).catch(() => undefined),
+          );
+        };
+        const attachmentMeta = Array.isArray(body.attachments)
+          ? body.attachments.filter((a: any) => a && typeof a.name === "string").map((a: any) => ({ name: String(a.name), type: String(a.type ?? "") }))
+          : [];
+        journal({ type: "user.message", text: turnInput.message, attachments: attachmentMeta }, null);
         const receivedEvent: ConsumerTurnEvent = {
           type: "trace",
           stage: "backend.request.received",
@@ -1018,6 +1037,7 @@ const server = http.createServer(async (req, res) => {
         for await (const event of orchestrator.runTurn(turnInput)) {
           auditEvent(event as ConsumerTurnEvent, turnInput, requestId);
           const ev = event as ConsumerTurnEvent;
+          if ((ev as any).turnId) journal(ev, (ev as any).turnId); // journal the verbatim render stream
           const boxIdForDesktop = (ev as any).boxId;
           // Two box-ready signals fire before the agent runs: billing.start (a
           // COLD box's first bill) and the runtime.owner.selected trace (fires
@@ -1070,6 +1090,7 @@ const server = http.createServer(async (req, res) => {
           message: e instanceof Error ? (e.stack ?? e.message) : String(e),
         });
       }
+      await journalChain.catch(() => undefined); // flush the render journal before closing
       return void res.end();
     }
 
@@ -1078,6 +1099,27 @@ const server = http.createServer(async (req, res) => {
     // again. Triggered by the header "stop hosting" button.
     // Full user reset: delete the user's boxes + snapshots and every row about
     // them (billing ledger, transcripts, turns, holds, hosting, conversations).
+    // Render journal for reopen-and-restore: the ordered events (verbatim) the
+    // client replays through handle() to rebuild the chat + components. sinceSeq
+    // is the resume cursor — 0 loads the whole conversation; >0 tails new events
+    // to reattach to a turn that's still running (or ran while the tab was shut).
+    if (req.method === "POST" && url.pathname === "/api/history") {
+      const body = await readBody(req);
+      try {
+        const credentials = credentialsFromBody(body);
+        const events = await engineFor(credentials).getEvents(
+          String(body.userId ?? "user-a"),
+          String(body.conversationId ?? "conv-1"),
+          Number.isFinite(Number(body.sinceSeq)) ? Number(body.sinceSeq) : 0,
+        );
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ ok: true, events }));
+      } catch (e) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ ok: false, message: e instanceof Error ? e.message : String(e) }));
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/api/reset") {
       const body = await readBody(req);
       try {

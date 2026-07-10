@@ -21,7 +21,16 @@ function deviceUserId(){
   }catch(_){id='u-'+Math.random().toString(36).slice(2,10);}
   return id;
 }
-let H=[]; let PRICING=null; let HARNESS_META={serverKeysAllowed:false,credentialMode:'byok-required',env:{}}; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser=deviceUserId(), selectedConversation=(new URLSearchParams(location.search).get('conversationId')||('conv-'+Math.random().toString(36).slice(2,10)));
+// The conversation id must PERSIST across reloads (url > localStorage > new),
+// or reopening the app would start a fresh conversation and its history would
+// be empty. This is what makes reopen-and-restore resume the SAME conversation.
+function persistConversationId(id){try{localStorage.setItem('optibox_conv',id);}catch(_){}return id;}
+function loadConversationId(){
+  try{var q=new URLSearchParams(location.search).get('conversationId');if(q)return persistConversationId(q);}catch(_){}
+  try{var s=localStorage.getItem('optibox_conv');if(s)return s;}catch(_){}
+  return persistConversationId('conv-'+Math.random().toString(36).slice(2,10));
+}
+let H=[]; let PRICING=null; let HARNESS_META={serverKeysAllowed:false,credentialMode:'byok-required',env:{}}; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser=deviceUserId(), selectedConversation=loadConversationId();
 let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
 let autoStopInterval=null, autoStopDeadline=0, autoStopBoxId=null;
 const $=id=>document.getElementById(id);
@@ -496,12 +505,14 @@ function renderAttachDeck(el,atts,side){
   const deck=document.createElement('div');deck.className='attachDeck '+(side==='left'?'deckLeft':'deckRight');
   atts.forEach(a=>{
     const card=document.createElement('div');card.className='card';card.title=a.name;
-    if(IMG_RE.test(a.name)){const img=document.createElement('img');img.src=URL.createObjectURL(new Blob([a.bytes]));card.appendChild(img);}
-    else if(VID_RE.test(a.name)){const v=document.createElement('video');v.src=URL.createObjectURL(new Blob([a.bytes]));v.muted=true;card.appendChild(v);}
+    // On REPLAY we have the filename/type but not the bytes (they aren't in the
+    // journal) — fall through to the generic ext card and drop the click-open.
+    if(IMG_RE.test(a.name)&&a.bytes){const img=document.createElement('img');img.src=URL.createObjectURL(new Blob([a.bytes]));card.appendChild(img);}
+    else if(VID_RE.test(a.name)&&a.bytes){const v=document.createElement('video');v.src=URL.createObjectURL(new Blob([a.bytes]));v.muted=true;card.appendChild(v);}
     else if(isAudioName(a.name)){const ic=document.createElement('div');ic.className='cardIcon cardAudio';ic.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(ic);}
     else{const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(a.name);card.appendChild(ic);}
     const nm=document.createElement('div');nm.className='cardName';nm.textContent=a.name;card.appendChild(nm);
-    card.addEventListener('click',()=>{try{window.__optiboxFs.openBytes(a.name,a.bytes);}catch(_){}});
+    if(a.bytes)card.addEventListener('click',()=>{try{window.__optiboxFs.openBytes(a.name,a.bytes);}catch(_){}});
     deck.appendChild(card);
   });
   el.parentNode.insertBefore(makeCarousel(deck,side),el);
@@ -801,11 +812,17 @@ if(document.addEventListener)document.addEventListener('click',()=>closeDeviceMe
 updateComposerMode();
 async function drain(res,localId){if(!res){throw new Error('No response object from /api/send');}if(!res.ok){const body=await res.text().catch(()=>'');throw new Error('/api/send failed with HTTP '+res.status+' '+body);}if(!res.body){throw new Error('/api/send did not return a readable SSE body');}const reader=res.body.getReader();const dec=new TextDecoder();const sep=String.fromCharCode(10,10);const nl=String.fromCharCode(10);let buf='';while(true){const {done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split(sep);buf=parts.pop()||'';for(const p of parts){const line=p.split(nl).find(l=>l.startsWith('data:'));if(!line)continue;handle(JSON.parse(line.slice(5)),localId);}}}
 function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls+(ev.messageId?':msg:'+ev.messageId:(ev.messageIndex!=null?':msg:'+ev.messageIndex:''));}
+// When true we're REPLAYING the persisted journal on reopen (or tailing a turn
+// that ran while the tab was closed). handle() then rebuilds the chat DOM but
+// must NOT touch live counters/timers — those are owned by applyRuntimeStatus
+// from the runtime poll. (The route diagram, working indicator, receipt and
+// desktop-widget effects are already gated by isLatest/td, both false here.)
+let replaying=false;
 function handle(ev,localId){console.debug('[trace] stream event', ev);const isLatest=(localId===latestLocalId);
   // Only the latest turn's events drive the side diagram — otherwise a still-draining
   // older turn's box/billing events fight the newest turn's route and the graph desyncs.
   if(isLatest)routeEvent(ev);
-  if(['billing.start','billing.stop','exec','turn.done','lifecycle'].includes(ev.type)){try{if(window.__optiboxFs&&window.__optiboxFs.poke)window.__optiboxFs.poke();}catch(_){}}
+  if(!replaying&&['billing.start','billing.stop','exec','turn.done','lifecycle'].includes(ev.type)){try{if(window.__optiboxFs&&window.__optiboxFs.poke)window.__optiboxFs.poke();}catch(_){}}
   const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
   // "working…" stays until the LATEST turn is fully finished: both surfaces answered
   // (or the box chose <end>) and the stream reached its terminal event. An older
@@ -815,15 +832,15 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='turn.blocked'){addMsg('assistant','error',(ev.stage?'['+ev.stage+'] ':'')+(ev.message||'private runtime failed'),keyFor(ev,localId,'blocked')+':'+(ev.stage||Math.random()));setState('Private runtime error · see message');}
   else if(ev.type==='shared.delta'){lastSharedMsgEl=addMsg('assistant','shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
   else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private Box booting in parallel');}
-  else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
+  else if(ev.type==='billing.start'){if(!replaying)startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}
   else if(ev.type==='runtime.proof'){addMsg('trace','proof · no Box prompt/API','boxPromptApiUsed='+ev.boxPromptApiUsed+' · boxBuiltInAgentUsed='+ev.boxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\n',keyFor(ev,localId,'proof'));}
   else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine; stdout/SSE relays native chunks as emitted.',keyFor(ev,localId,'exec'));}
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');if(isDesktopCommand(ev.command)){if(ev.phase==='tool_use'&&localId===latestLocalId)ensureDesktopWidget(localId);}else{addToolEvent(ev,localId);}}
   else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
-  else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
-  else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
+  else if(ev.type==='billing.stop'){if(!replaying){stopBilling(ev.elapsedSeconds);endDesktopWidget();}}
+  else if(ev.type==='autostop.timer'){if(!replaying){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));if(!replaying)setState(describeAutoStop(ev));}
   else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);renderLinkPreviews(lastAgentMsgEl);lastAgentMsgEl=null;}if(lastSharedMsgEl){renderLinkPreviews(lastSharedMsgEl);lastSharedMsgEl=null;}
     // Per-turn receipt: the economic argument for per-second billing, made
     // legible per artifact — "that PDF cost you $0.0041". Only for turns that
@@ -833,6 +850,60 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};
 load();
+
+// ---- reopen & restore ------------------------------------------------------
+// The conversation's rendered event journal (Postgres, written server-side as
+// the turn streams — so it keeps recording even after you close the tab) is the
+// source of truth for what was on screen. On load we REPLAY it through the very
+// same handle() renderer, so chat + tool chains + attachment decks come back
+// exactly as they were. Counters, machine state and the hosting bar arrive
+// separately via the runtime poll (applyRuntimeStatus). If the latest turn is
+// still running (or finished while the tab was closed), we TAIL new journal
+// events until it completes — that's the "the agent kept working while I was
+// away" case.
+let historyMaxSeq=0, lastTurnComplete=true, tailTimer=0;
+function renderUserMessage(ev,seq){
+  const el=addMsg('user','',ev.text||'','user:hist:'+seq);
+  if(ev.attachments&&ev.attachments.length)
+    renderAttachDeck(el, ev.attachments.map(function(a){return {name:String((a&&a.name)||'file'),type:a&&a.type};}), 'right');
+}
+function replayEvent(ev,seq){
+  if(!ev||typeof ev!=='object')return;
+  if(seq>historyMaxSeq)historyMaxSeq=seq;
+  if(ev.type==='user.message'){lastTurnComplete=false;renderUserMessage(ev,seq);return;}
+  if(ev.type==='turn.done'||ev.type==='turn.blocked'||ev.type==='error')lastTurnComplete=true;
+  handle(ev, ev.turnId||('hist:'+seq));
+}
+async function fetchHistory(sinceSeq){
+  try{
+    const r=await(await fetch('/api/history',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,sinceSeq:sinceSeq,apiKeys:currentApiKeys()})})).json();
+    return (r&&r.ok&&Array.isArray(r.events))?r.events:[];
+  }catch(_){return [];}
+}
+function replayBatch(events){
+  replaying=true;
+  try{for(const row of events)replayEvent(row.body,row.seq||0);}
+  finally{replaying=false;}
+}
+function startTail(){
+  if(tailTimer)return;
+  const tick=async function(){
+    tailTimer=0;
+    const events=await fetchHistory(historyMaxSeq);
+    if(events.length)replayBatch(events);
+    if(lastTurnComplete){clearWorking();setState('caught up · your machine finished while you were away');return;}
+    tailTimer=setTimeout(tick,1500);
+  };
+  tailTimer=setTimeout(tick,1500);
+}
+async function restoreConversation(){
+  const events=await fetchHistory(0);
+  if(!events.length)return;
+  const emptyEl=$('empty');if(emptyEl)emptyEl.remove();
+  replayBatch(events);
+  if(!lastTurnComplete){showWorking();setState('reconnecting — your machine kept working while you were away…');startTail();}
+}
+restoreConversation();
 
 // Full user reset (bottom-right): deletes the machine + snapshots and every
 // server-side record of this user (billing total, transcripts, holds,
@@ -847,7 +918,7 @@ load();
       try{
         var r=await(await fetch('/api/reset',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
         if(!r||r.ok!==true)throw new Error((r&&r.message)||'reset failed');
-        selectedConversation='conv-'+Math.random().toString(36).slice(2,10);
+        selectedConversation=persistConversationId('conv-'+Math.random().toString(36).slice(2,10));historyMaxSeq=0;lastTurnComplete=true;if(tailTimer){clearTimeout(tailTimer);tailTimer=0;}
         var c=$('chat');if(c)c.innerHTML='<div class="empty" id="empty">Send a message to start the demo.</div>';
         totalSeconds=0;stopBilling(null,true);renderTotals();clearAutoStopTimer('idle');
         pendingFiles=[];renderPending();syncHostingBar([]);

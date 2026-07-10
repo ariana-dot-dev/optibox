@@ -297,6 +297,23 @@ test("transcripts persist across engine instances (restart is not amnesia)", asy
   engine2.dispose();
 });
 
+test("render journal: events append in order, tail by cursor, reset clears them", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box, harnessOf("h"));
+  await engine.logEvent("uj", "cj", null, { type: "user.message", text: "hi" });
+  await engine.logEvent("uj", "cj", "t1", { type: "user-box.delta", text: "answer" });
+  await engine.logEvent("uj", "cj", "t1", { type: "turn.done" });
+  const all = await engine.getEvents("uj", "cj");
+  assert.deepEqual(all.map((e: any) => e.body.type), ["user.message", "user-box.delta", "turn.done"], "returned in insertion order");
+  assert.ok(all[0]!.seq < all[1]!.seq && all[1]!.seq < all[2]!.seq, "seq is monotonic");
+  const tail = await engine.getEvents("uj", "cj", all[1]!.seq);
+  assert.deepEqual(tail.map((e: any) => e.body.type), ["turn.done"], "sinceSeq tails only newer events (reattach cursor)");
+  assert.equal((await engine.getEvents("uj", "other")).length, 0, "conversations are isolated");
+  await engine.resetUser("uj");
+  assert.equal((await engine.getEvents("uj", "cj")).length, 0, "reset wipes the journal");
+  engine.dispose();
+});
+
 test("manual stopUserBox ends billing at stop request and archives", async () => {
   const box = new FakeBoxClient();
   const engine = makeEngine(box, harnessOf("h"));

@@ -83,6 +83,23 @@ create table if not exists templates (
   status text not null check (status in ('building','ready','failed')),
   built_at timestamptz
 );
+-- UI render journal: the ordered stream of events the client rendered for a
+-- conversation, stored verbatim so reopening the app REPLAYS it through the very
+-- same handle() renderer and the chat + tool chains + attachments + desktop come
+-- back exactly as they were — including whatever the agent did while the tab was
+-- closed (turns run to completion server-side regardless of the connection).
+-- Distinct from transcripts, which is the CLEANED model-context projection; this
+-- is the raw "what was on screen". body is the ConsumerTurnEvent (or a synthetic
+-- user.message). seq gives the total render order and the resume cursor.
+create table if not exists events (
+  seq bigserial primary key,
+  user_key text not null,
+  conversation_id text not null,
+  turn_id text,
+  body jsonb not null,
+  at timestamptz not null default now()
+);
+create index if not exists events_conv on events(user_key, conversation_id, seq);
 `;
 
 export interface Db {

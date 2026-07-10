@@ -339,7 +339,7 @@ export class Engine {
         await this.box.stop(r.id).catch(() => undefined);
         await this.box.deleteBox?.(r.id)?.catch(() => undefined);
       }
-      for (const table of ["hosting", "holds", "turns", "transcripts", "conversations", "boxes"]) {
+      for (const table of ["hosting", "holds", "turns", "transcripts", "events", "conversations", "boxes"]) {
         await this.db.q(`delete from ${table} where user_key=$1`, [key]);
       }
       await this.db.q(`delete from users where key=$1`, [key]); // users keys on `key`, not user_key
@@ -576,6 +576,25 @@ export class Engine {
       idleStopMs,
       hosting: hosting.map((h) => ({ port: h.port, mode: h.mode, url: h.url, conversationId: h.conversation_id, sinceEpochMs: Date.parse(h.started_at) })),
     };
+  }
+
+  // ---------------------------------------------------------------- render journal (reopen = replay)
+
+  /** Append one rendered event to the conversation's journal (verbatim). */
+  async logEvent(userId: string, conversationId: string, turnId: string | null, body: unknown): Promise<void> {
+    await this.db.q(
+      `insert into events(user_key, conversation_id, turn_id, body) values($1,$2,$3,$4)`,
+      [this.userKey(userId), conversationId, turnId, JSON.stringify(body)],
+    );
+  }
+
+  /** The journal since a cursor (0 = from the start). Each row: its seq + the event body. */
+  async getEvents(userId: string, conversationId: string, sinceSeq = 0): Promise<Array<{ seq: number; body: unknown }>> {
+    const rows = await this.db.q<{ seq: string; body: unknown }>(
+      `select seq, body from events where user_key=$1 and conversation_id=$2 and seq > $3 order by seq`,
+      [this.userKey(userId), conversationId, sinceSeq],
+    );
+    return rows.map((r) => ({ seq: Number(r.seq), body: r.body }));
   }
 
   async getTranscript(userId: string, conversationId: string): Promise<TranscriptMessage[]> {

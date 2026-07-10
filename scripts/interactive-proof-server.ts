@@ -1195,7 +1195,7 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .msg.user .attachDeck .card .cardName{color:#fff}
 /* Deck carousel: decks never grow vertically — one row, horizontal scroll with
    no visible bar, floating circular arrows only when that direction can scroll. */
-.deckWrap{position:relative;max-width:86%;flex:0 0 auto;min-width:0}
+.deckWrap{position:relative;max-width:100%;width:100%;flex:0 0 auto;min-width:0}
 .deckWrap.deckRight{align-self:flex-end}.deckWrap.deckLeft{align-self:flex-start}
 .deckWrap>.attachDeck,.deckWrap>.ogDeck{overflow-x:auto;overflow-y:hidden;flex-wrap:nowrap;max-width:100%;scrollbar-width:none;-ms-overflow-style:none;scroll-behavior:smooth}
 /* Shadow room: an overflow scroller clips box-shadows at its padding-box edge,
@@ -1209,7 +1209,8 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .deckWrap>.attachDeck{padding:24px 24px 28px;margin:-14px -22px -24px;max-width:calc(100% + 44px)}
 .deckWrap>.ogDeck{padding:24px 24px 28px;margin:-16px -22px -24px;max-width:calc(100% + 44px)}
 .deckWrap>.attachDeck::-webkit-scrollbar,.deckWrap>.ogDeck::-webkit-scrollbar{display:none}
-.deckNav{position:absolute;top:50%;transform:translateY(-50%);width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,.94);border:1px solid #ddd;box-shadow:0 2px 8px rgba(0,0,0,.16);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;font-size:13px;line-height:1;color:#444;user-select:none}
+.deckNav{position:absolute;top:50%;transform:translateY(-50%);width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,.94);border:1px solid #ddd;box-shadow:0 2px 8px rgba(0,0,0,.16);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;color:#444;user-select:none}
+.deckNav svg{width:14px;height:14px;display:block;fill:currentColor}
 .deckNav:hover{background:#fff;border-color:#c6c6c6}
 .deckNav.left{left:-8px}.deckNav.right{right:-8px}
 .deckNav.hiddenNav{display:none}
@@ -1305,20 +1306,19 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .state.warming{animation:warmPulse 1.1s ease-in-out infinite;color:#b45309}
 /* Receipt reads exactly like a tool-call line: same size, color, placement. */
 .receipt{align-self:flex-start;max-width:92%;font-size:13px;color:#555;margin:0;padding:0}
-/* Hosting: a quiet rounded card in the header's design language (same fill and
-   radius as the counters). Dot · URL link · one small stop button. */
-.hostingBar{position:relative;display:flex;align-items:center;gap:9px;margin:10px 14px 0;padding:8px 12px;background:#f0faf3;border-radius:10px;font-size:12.5px;color:#1d5c33}
-.hbDot{width:8px;height:8px;border-radius:50%;background:#17b45c;flex:0 0 auto;animation:warmPulse 1.6s ease-in-out infinite}
-.hbText{white-space:nowrap;color:#3c7a53;font-size:12px}
-.hbLink{color:#14532d;font-weight:500;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+/* Hosting: one flat white line under the header. Dot, URL, quiet stop. */
+.hostingBar{position:relative;display:flex;align-items:center;gap:8px;margin:0;padding:7px 14px;background:#fff;border-bottom:1px solid #ececec;font-size:12.5px;color:#333}
+.hbDot{width:7px;height:7px;border-radius:50%;background:#17b45c;flex:0 0 auto;animation:warmPulse 1.6s ease-in-out infinite}
+.hbText{white-space:nowrap;color:#999;font-size:12px}
+.hbLink{color:#111;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
 .hbLink:hover{text-decoration:underline}
-.hostingBar .hbStop{margin-left:auto;flex:0 0 auto;min-height:26px;padding:0 12px;font-size:11.5px;font-weight:400;background:transparent;color:#9a3b41;border:1px solid rgba(154,59,65,.28);border-radius:999px;cursor:pointer;transition:background .15s ease,border-color .15s ease}
-.hostingBar .hbStop:hover{border-color:#c02b34;background:#fff}
-.hbMenu{position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:9;background:#fff;border:1px solid #e4efe8;border-radius:10px;box-shadow:0 8px 22px rgba(0,0,0,.10);padding:4px 0}
-.hbRow{display:flex;align-items:center;gap:10px;padding:7px 12px;font-size:12.5px}
-.hbRow a{color:#14532d;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}
+.hostingBar .hbStop{margin-left:auto;flex:0 0 auto;min-height:24px;padding:0 9px;font-size:11.5px;font-weight:400;background:transparent;color:#999;border:0;border-radius:6px;cursor:pointer}
+.hostingBar .hbStop:hover{background:#f2f2f2;color:#111}
+.hbMenu{position:absolute;top:100%;left:0;right:0;z-index:9;background:#fff;border-bottom:1px solid #ececec;box-shadow:0 8px 18px rgba(0,0,0,.06);padding:2px 0}
+.hbRow{display:flex;align-items:center;gap:10px;padding:6px 14px;font-size:12.5px}
+.hbRow a{color:#111;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}
 .hbRow a:hover{text-decoration:underline}
-.hbRow .hbStop{margin-left:auto;min-height:22px;padding:0 10px;font-size:11px}
+.hbRow .hbStop{margin-left:auto;min-height:22px;padding:0 9px;font-size:11px}
 @media(max-width:900px){
 html{zoom:1;--z:1}
 body{overflow:hidden;overscroll-behavior:none}
@@ -1894,8 +1894,11 @@ function makeCarousel(deck,side){
   try{
     const wrap=document.createElement('div');wrap.className='deckWrap '+(side==='right'?'deckRight':'deckLeft');
     wrap.appendChild(deck);
-    const mk=(dir,glyph)=>{const b=document.createElement('div');b.className='deckNav '+dir+' hiddenNav';b.textContent=glyph;b.addEventListener('click',e=>{e.stopPropagation();e.preventDefault();try{deck.scrollBy({left:(dir==='left'?-1:1)*Math.max(120,deck.clientWidth*0.8),behavior:'smooth'});}catch(_){deck.scrollLeft+=(dir==='left'?-1:1)*160;}});wrap.appendChild(b);return b;};
-    const L=mk('left','\\u2039'),R=mk('right','\\u203A');
+    // Phosphor caret-left / caret-right (256 viewBox), inline so no CDN dependency.
+    const CARET_L='<svg viewBox="0 0 256 256" aria-hidden="true"><path d="M165.66,202.34a8,8,0,0,1-11.32,11.32l-80-80a8,8,0,0,1,0-11.32l80-80a8,8,0,0,1,11.32,11.32L91.31,128Z"/></svg>';
+    const CARET_R='<svg viewBox="0 0 256 256" aria-hidden="true"><path d="M181.66,133.66l-80,80a8,8,0,0,1-11.32-11.32L164.69,128,90.34,53.66a8,8,0,0,1,11.32-11.32l80,80A8,8,0,0,1,181.66,133.66Z"/></svg>';
+    const mk=(dir)=>{const b=document.createElement('div');b.className='deckNav '+dir+' hiddenNav';b.innerHTML=dir==='left'?CARET_L:CARET_R;b.addEventListener('click',e=>{e.stopPropagation();e.preventDefault();try{deck.scrollBy({left:(dir==='left'?-1:1)*Math.max(120,deck.clientWidth*0.8),behavior:'smooth'});}catch(_){deck.scrollLeft+=(dir==='left'?-1:1)*160;}});wrap.appendChild(b);return b;};
+    const L=mk('left'),R=mk('right');
     const sync=()=>{try{const can=deck.scrollWidth-deck.clientWidth>4;L.classList.toggle('hiddenNav',!can||deck.scrollLeft<=2);R.classList.toggle('hiddenNav',!can||deck.scrollLeft+deck.clientWidth>=deck.scrollWidth-2);}catch(_){}};
     deck.addEventListener('scroll',sync);
     wrap.addEventListener('mouseenter',()=>setTimeout(sync,220));

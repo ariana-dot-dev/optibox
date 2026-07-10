@@ -1051,6 +1051,22 @@ const server = http.createServer(async (req, res) => {
       return void res.end();
     }
 
+    // Stop hosting: close the exposed port (ufw) + kill the host process on the
+    // box and release the indefinite hosting hold, so the machine can idle-stop
+    // again. Triggered by the header "stop hosting" button.
+    if (req.method === "POST" && url.pathname === "/api/host/stop") {
+      const body = await readBody(req);
+      try {
+        const credentials = credentialsFromBody(body);
+        const result = await orchestratorFor(credentials).stopHosting(String(body.userId ?? "user-a"));
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ ok: true, ...result }));
+      } catch (e) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ ok: false, message: e instanceof Error ? e.message : String(e) }));
+      }
+    }
+
     // Stop streams the full lifecycle (stopping -> archiving -> archived) and the
     // exact moment billing pauses.
     if (req.method === "POST" && url.pathname === "/api/stop") {
@@ -1243,6 +1259,11 @@ body{overflow:hidden;overscroll-behavior:none}
 .counters{gap:6px}.counter{padding:8px 9px;border-radius:9px}
 .label{font-size:10.5px}.value{font-size:16px}.state{font-size:11px}
 @keyframes warmPulse{0%,100%{opacity:1}50%{opacity:.4}}
+.hostingBadge{display:flex;align-items:center;gap:7px}
+.hostingBadge .value{color:#0a7d38}
+.hostingBadge .value::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:#17b45c;margin-right:5px;animation:warmPulse 1.6s ease-in-out infinite}
+.hostingStop{font-size:10px;padding:3px 9px;border-radius:999px;background:#fdecec;color:#fc4b55;cursor:pointer;user-select:none}
+.hostingStop:hover{background:#fc4b55;color:#fff}
 .state.warming{animation:warmPulse 1.1s ease-in-out infinite;color:#b45309}
 .receipt{font-size:11px;color:#8a8a8a;margin:2px 0 10px;padding:0 6px;align-self:flex-start}
 .chat{padding:14px 12px 16px;gap:9px}
@@ -1294,6 +1315,7 @@ textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px inpu
       <div class="counter"><span class="label">total spent</span><span class="value" id="totalCost">$0.000000</span></div>
       <div class="counter"><span class="label">machine time</span><span class="value" id="totalSeconds">0.0s</span></div>
       <div class="counter"><span class="label">auto-stop</span><span class="value" id="autoStopTimer">idle</span></div>
+      <div class="counter hostingBadge" id="hostingBadge" style="display:none"><span class="label">hosting</span><span class="value" id="hostingInfo">—</span><span class="hostingStop" id="hostingStop" role="button" title="stop hosting: close the port and let the machine stop">stop</span></div>
     </section>
     <div class="state" id="machineState">shared bridge ready · private machine stopped</div>
   </header>
@@ -1618,8 +1640,30 @@ function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>
 // upload has no SSE stream, so without this the counter/cost/auto-stop UI
 // simply never learns it is running. SSE turn events still land first and
 // faster; this corrects drift and covers the streams that don't exist.
+// Hosting indicator: the box is intentionally staying up because it exposes a
+// hosted service (host CLI). Badge + stop button live in the header; state
+// arrives on the same runtime snapshot as every other counter.
+function syncHostingBadge(hosting){
+  try{
+    const badge=$('hostingBadge');if(!badge||!badge.style)return;
+    if(hosting){const info=$('hostingInfo');if(info)info.textContent=':'+hosting.port+' · '+hosting.mode;badge.style.display='flex';}
+    else badge.style.display='none';
+  }catch(_){}
+}
+let hostingStopBusy=false;
+$('hostingStop')?.addEventListener('click',async()=>{
+  if(hostingStopBusy)return;hostingStopBusy=true;
+  try{
+    const r=await(await fetch('/api/host/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
+    addMsg('trace','hosting','stop hosting requested'+(r&&r.port?' · port '+r.port+' closed':'')+'; machine can now auto-stop\\n');
+    syncHostingBadge(null);
+    try{window.__optiboxFs.poke();}catch(_){}
+  }catch(e){addMsg('assistant','error','Stop hosting failed: '+String(e&&e.message||e));}
+  finally{hostingStopBusy=false;}
+});
 function applyRuntimeStatus(rt){
   if(!rt)return;
+  syncHostingBadge(rt.hosting||null);
   const turnActiveClient=activeTurns.size>0;
   if(rt.billingSinceEpochMs){
     if(!billing)startBilling(rt.billingSinceEpochMs);

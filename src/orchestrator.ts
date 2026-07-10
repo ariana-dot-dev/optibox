@@ -250,6 +250,15 @@ export class ConsumerBoxAgentOrchestrator {
   private readonly boxHolds = new Map<string, Map<string, { reason: string; expiresEpochMs: number }>>();
   /** Boxes with an eager serve-prewarm in flight — dedupes the every-4s typing pings. */
   private readonly prewarmingBoxes = new Set<string>();
+  /**
+   * Users whose box is actively HOSTING an exposed service (the box `host
+   * <port> --public|--private` CLI ran in a tool call). Unlike boxHolds this
+   * deliberately has NO TTL: a hosted site must stay reachable until the user
+   * explicitly stops hosting (stopHosting), so the box never idle-stops while
+   * an entry exists. Surfaced through activeHoldReasons (countdown, reaper,
+   * stop blockers all respect it) and userRuntimeStatus (header indicator).
+   */
+  private readonly hostingByUser = new Map<string, { boxId: string; port: number; mode: "public" | "private"; sinceEpochMs: number }>();
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -1724,16 +1733,65 @@ export class ConsumerBoxAgentOrchestrator {
   }
 
   private activeHoldReasons(userId: string): string[] {
-    const holds = this.boxHolds.get(userId);
-    if (!holds) return [];
-    const now = Date.now();
     const reasons: string[] = [];
+    // Hosting is an indefinite hold: an exposed service must stay reachable
+    // until the user explicitly stops it from the UI.
+    const hosting = this.hostingByUser.get(userId);
+    if (hosting) reasons.push(`hosting :${hosting.port} (${hosting.mode})`);
+    const holds = this.boxHolds.get(userId);
+    if (!holds) return reasons;
+    const now = Date.now();
     for (const [id, hold] of holds) {
       if (hold.expiresEpochMs <= now) holds.delete(id);
       else reasons.push(hold.reason);
     }
     if (holds.size === 0) this.boxHolds.delete(userId);
     return reasons;
+  }
+
+  /**
+   * Detect `host <port> --public|--private` in a tool command the box agent
+   * ran and mark the user as hosting. Idempotent; the newest invocation wins
+   * (port/mode update). Detection is command-text based because the host CLI
+   * runs detached inside arbitrary shell strings (nohup/setsid wrappers).
+   */
+  private detectHostingCommand(userId: string, boxId: string, command: string): { port: number; mode: "public" | "private" } | undefined {
+    const m = command.match(/(?:^|[\s;|&(])host\s+(\d{2,5})(?:\s+\S+)*?\s+--(public|private)\b/);
+    if (!m) return undefined;
+    const port = Number(m[1]);
+    const mode = m[2] as "public" | "private";
+    this.hostingByUser.set(userId, { boxId, port, mode, sinceEpochMs: Date.now() });
+    this.touchUserActivity(userId);
+    return { port, mode };
+  }
+
+  /** Hosting status for the UI (rides userRuntimeStatus). */
+  hostingStatus(userId: string): { boxId: string; port: number; mode: "public" | "private"; sinceEpochMs: number } | undefined {
+    return this.hostingByUser.get(userId);
+  }
+
+  /**
+   * Stop hosting: close the exposed port on the box (ufw) and kill the host
+   * process, then release the indefinite hold so the normal idle countdown
+   * takes over and the machine can park again. Best-effort on the box side —
+   * the hold is released even if the box is unreachable (it may already be
+   * stopped), because a stuck hold would pin the VM forever.
+   */
+  async stopHosting(userId: string): Promise<{ stopped: boolean; port?: number }> {
+    const hosting = this.hostingByUser.get(userId);
+    if (!hosting) return { stopped: false };
+    this.hostingByUser.delete(userId);
+    this.touchUserActivity(userId);
+    try {
+      await this.options.box.command(hosting.boxId, {
+        command:
+          `sudo -n ufw delete allow ${hosting.port}/tcp 2>/dev/null; sudo -n ufw delete allow ${hosting.port} 2>/dev/null; ` +
+          `sudo -n ufw deny ${hosting.port}/tcp 2>/dev/null; ` +
+          `pkill -f 'host[[:space:]]+${hosting.port}' 2>/dev/null; true`,
+        timeoutMs: 20_000,
+      });
+    } catch { /* box unreachable/parked: the hold release above is what matters */ }
+    return { stopped: true, port: hosting.port };
   }
 
   /** Bump the idle clock of every conversation of this user (box is per-user). */
@@ -1997,11 +2055,29 @@ export class ConsumerBoxAgentOrchestrator {
     const itc = continued[Symbol.asyncIterator]();
     const harnessName = harness.name;
     const selectionModel = input.selection.model;
+    // Hosting detection rides the tool stream: the moment the agent runs the
+    // box `host <port> --public|--private` CLI, the user is hosting and the
+    // box must not idle-stop until they stop hosting from the UI.
+    const noteHostingCommand = (command: string) => this.detectHostingCommand(input.userId, box.id, command);
     const flushExecEvents = function* (): Iterable<ConsumerTurnEvent> {
       while (execEvents.length) {
         const ev = execEvents.shift()!;
         if (ev.type === "harness.tool") {
-          if (ev.phase === "tool_use") { sawToolUse = true; toolUseCount++; if (ev.toolName) lastToolName = ev.toolName; }
+          if (ev.phase === "tool_use") {
+            sawToolUse = true; toolUseCount++; if (ev.toolName) lastToolName = ev.toolName;
+            const hosting = typeof ev.command === "string" ? noteHostingCommand(ev.command) : undefined;
+            if (hosting) {
+              yield {
+                type: "trace",
+                stage: "box.hosting.started",
+                message: `box agent exposed port ${hosting.port} (${hosting.mode}) via the host CLI; machine will stay up until hosting is stopped from the UI`,
+                harness: harnessName,
+                model: selectionModel,
+                boxId: box.id,
+                data: { port: hosting.port, mode: hosting.mode },
+              };
+            }
+          }
           // Surface tool activity in traces so the scheduler/UI can see the box
           // agent is actively working (NOT idle) even before any visible text.
           yield {
@@ -2396,6 +2472,7 @@ export class ConsumerBoxAgentOrchestrator {
     activeTurn: boolean;
     idleStopEtaEpochMs: number | null;
     idleStopMs: number;
+    hosting: { port: number; mode: "public" | "private"; sinceEpochMs: number } | null;
   } {
     const holds = this.activeHoldReasons(userId);
     let boxId: string | undefined;
@@ -2415,7 +2492,8 @@ export class ConsumerBoxAgentOrchestrator {
     const idleStopEtaEpochMs = since !== null && !activeTurn && holds.length === 0
       ? Math.max(Date.now(), (lastActivity || Date.now()) + idleStopMs)
       : null;
-    return { ...(boxId ? { boxId } : {}), billingSinceEpochMs: since, holds, activeTurn, idleStopEtaEpochMs, idleStopMs };
+    const hostingEntry = this.hostingByUser.get(userId);
+    return { ...(boxId ? { boxId } : {}), billingSinceEpochMs: since, holds, activeTurn, idleStopEtaEpochMs, idleStopMs, hosting: hostingEntry ? { port: hostingEntry.port, mode: hostingEntry.mode, sinceEpochMs: hostingEntry.sinceEpochMs } : null };
   }
 
   private startBilling(boxId: string, owner?: { userId: string; conversationId: string }): { since: number; fresh: boolean } {

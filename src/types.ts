@@ -342,5 +342,15 @@ export interface OrchestratorOptions {
     name: string;
     /** Command run inside the template box to pre-install harness dependencies. */
     installCmd: string;
+    /**
+     * Optional warm-up command run in a SECOND resume→run→stop cycle after the
+     * install snapshot. The platform's lazy-restore records the disk-access
+     * order of a run and prefetches it on later forks/resumes, so exercising
+     * the exact cold path a fork's first turn takes (launching the harness
+     * binary, faulting its module tree) makes forks replay that sequence
+     * instead of faulting pages one read at a time through FUSE (measured:
+     * cold `pi --version` 3.25s vs warm 1.07s on a fresh fork).
+     */
+    warmCmd?: string;
   };
 }

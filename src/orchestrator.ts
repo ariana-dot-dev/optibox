@@ -717,7 +717,27 @@ export class ConsumerBoxAgentOrchestrator {
       // ("no successful snapshot in the last 30 minutes" on young boxes), so a
       // single stop right after install can be rejected. Retry until accepted.
       await this.stopWithRetry(ready.id, "template-stop");
-      return await this.waitUntilArchived(ready.id, "template-snapshot", 300_000);
+      const archived = await this.waitUntilArchived(ready.id, "template-snapshot", 300_000);
+      if (!template.warmCmd) return archived;
+      // Warm pass: resume the just-snapshotted template and exercise the exact
+      // cold path a fork's first turn takes (harness launch faulting its module
+      // tree through the lazy-restore disk), then snapshot again. The platform
+      // records the resume-time access order and prefetches it on later
+      // forks/resumes, so a fork's first harness launch streams the right
+      // blocks up front instead of faulting them one read at a time (measured
+      // on a fresh fork: cold `pi --version` 3.25s vs warm 1.07s). Best-effort:
+      // a failed warm pass keeps the perfectly valid install snapshot.
+      try {
+        await this.options.box.resume(ready.id);
+        await this.waitUntilReady(ready.id, "template-warm-resume");
+        await this.options.box.command(ready.id, { command: template.warmCmd, timeoutMs: 55_000 });
+        await this.stopWithRetry(ready.id, "template-warm-stop");
+        return await this.waitUntilArchived(ready.id, "template-warm-snapshot", 300_000);
+      } catch (warmError) {
+        console.error(`[optibox] template warm pass failed (install snapshot still valid):`, warmError instanceof Error ? warmError.message : String(warmError));
+        await this.options.box.stop(ready.id).catch(() => undefined);
+        return archived;
+      }
     } catch (error) {
       // This runs detached from any turn stream, so "loud" = the server log, and
       // the box must ALWAYS be stopped on failure or it runs until its TTL.
@@ -1790,9 +1810,60 @@ export class ConsumerBoxAgentOrchestrator {
     if (!m) return undefined;
     const port = Number(m[1]);
     const mode = m[2] as "public" | "private";
-    this.hostingByUser.set(userId, { boxId, port, mode, sinceEpochMs: Date.now() });
+    this.markHosting(userId, boxId, port, mode);
     this.touchUserActivity(userId);
     return { port, mode };
+  }
+
+  private markHosting(userId: string, boxId: string, port: number, mode: "public" | "private"): void {
+    const cur = this.hostingByUser.get(userId);
+    this.hostingByUser.set(userId, {
+      boxId, port, mode,
+      sinceEpochMs: cur && cur.boxId === boxId && cur.port === port ? cur.sinceEpochMs : Date.now(),
+    });
+    // Our holds stop OUR reaper/countdown, but the PLATFORM archives the box at
+    // its own archiveAfter TTL regardless — which killed a hosted site mid-life
+    // (box created with a short TTL, archived while the badge said hosting).
+    // Best-effort: push the TTL way out while hosting; stopHosting isn't
+    // required to restore it (the normal idle-stop parks the box anyway).
+    if (!cur || cur.boxId !== boxId) {
+      void this.options.box.update?.(boxId, { ttlSeconds: 7 * 24 * 3600 }).catch(() => undefined);
+    }
+  }
+
+  /** Consecutive live probes that saw no host process, per user — grace so one
+   * flaky pgrep doesn't drop the hold of a genuinely hosted site. */
+  private readonly hostingMisses = new Map<string, number>();
+
+  /**
+   * Ground-truth reconcile from the box itself (rides the file-tree poll): a
+   * live `host` process is authoritative in both directions. Sets hosting the
+   * command-sniffer never saw (host started outside a turn, server restarted
+   * and lost the in-memory map) and clears it when the process is gone (two
+   * consecutive misses) or the box is parked (boxLive:false — an archived
+   * machine hosts nothing).
+   */
+  reconcileObservedHosting(userId: string, boxId: string, observed: { port: number; mode: "public" | "private" } | null, opts: { boxLive?: boolean } = {}): void {
+    const cur = this.hostingByUser.get(userId);
+    if (observed) {
+      this.hostingMisses.delete(userId);
+      this.markHosting(userId, boxId, observed.port, observed.mode);
+      return;
+    }
+    if (!cur || cur.boxId !== boxId) return;
+    if (opts.boxLive === false) {
+      this.hostingByUser.delete(userId);
+      this.hostingMisses.delete(userId);
+      return;
+    }
+    const misses = (this.hostingMisses.get(userId) ?? 0) + 1;
+    if (misses >= 2) {
+      this.hostingByUser.delete(userId);
+      this.hostingMisses.delete(userId);
+      this.touchUserActivity(userId);
+    } else {
+      this.hostingMisses.set(userId, misses);
+    }
   }
 
   /** Hosting status for the UI (rides userRuntimeStatus). */
@@ -2273,7 +2344,7 @@ export class ConsumerBoxAgentOrchestrator {
         boxId: box.id,
         recap,
         latestUserMessage:
-          "You already ran the necessary tools in this session and have their output. Write your final answer to the user now, in plain prose, using those results. Do not call more tools unless strictly required. If you truly have nothing to answer, return exactly <end>.",
+          "Your previous run ended WITHOUT delivering any visible reply: the user has received NOTHING — even if you believe you already answered, that answer was never shown. Write your final answer to the user now, in plain prose (1-4 sentences): what you did, where any files are, and any URL you exposed. Do not call more tools. Do NOT return <end> — you did work this turn, so silence is wrong.",
         transcript: userBoxTranscript,
         selection: input.selection,
         capabilities,

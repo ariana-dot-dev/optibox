@@ -229,6 +229,13 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
       // every fresh box pays a 15-40s npm install on its first turn. opencode
       // stays installed too so switching harnesses is still instant.
       installCmd: "npm i -g --ignore-scripts @earendil-works/pi-coding-agent >/tmp/pi-install.log 2>&1; npm i -g opencode-ai@latest >/tmp/opencode-install.log 2>&1",
+      // Second resume->run->stop cycle after the install snapshot: launching the
+      // harness binaries records their module-tree disk-access order into the
+      // final snapshot, so forks prefetch those blocks instead of faulting them
+      // through the lazy-restore FUSE layer one read at a time (~2-4s saved on a
+      // fork's first pi launch). bash -lc: pi lives under nvm's PATH, which only
+      // login shells source. || true: warm must never fail the template.
+      warmCmd: "bash -lc 'pi --version; opencode --version' >/tmp/tpl-warm.log 2>&1 || true",
     },
   });
   orchestrators.set(cacheKey, orchestrator);
@@ -528,7 +535,7 @@ async function fsResolveBox(credentials: DemoCredentials, userId: string): Promi
  * SAME path space the snapshot tree uses, so the panel behaves identically
  * whether the box is up or down. (/tmp is tmpfs and never in snapshots.)
  */
-async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<Array<{ path: string; kind: string; size?: number; mtime?: number }>> {
+async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<{ entries: Array<{ path: string; kind: string; size?: number; mtime?: number }>; hosting: { port: number; mode: "public" | "private" } | null }> {
   const out = await client.command(boxId, {
     // %T@ = mtime as epoch seconds (float): lets the chat surface files the
     // agent created/modified during a turn by comparing against a turn-start
@@ -546,18 +553,29 @@ async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<Array<{
       `\\( -name node_modules -o -name __pycache__ -o -name .git -o -name .npm ` +
       `-o -name .cache -o -name .cargo -o -name .rustup -o -name .nvm ` +
       `-o -name .vscode-server -o -name snap -o -name .bun -o -name .pnpm-store \\) -prune ` +
-      `-o -printf '%y\\t%s\\t%T@\\t%P\\n' 2>/dev/null | head -c 8000000`,
+      `-o -printf '%y\\t%s\\t%T@\\t%P\\n' 2>/dev/null | head -c 8000000; ` +
+      // GROUND-TRUTH hosting probe riding the same round trip: a live `host`
+      // process IS hosting; its absence IS not-hosting. Command-sniffing alone
+      // proved fragile (in-memory state dies on server restart and can't see a
+      // host started outside a turn). This line is parsed out of the listing.
+      `printf '__CBA_HOSTING__:%s\\n' "$(pgrep -af 'host [0-9]' 2>/dev/null | head -3 | tr '\\n' ';')"`,
     timeoutMs: 30_000,
   });
   const entries: Array<{ path: string; kind: string; size?: number; mtime?: number }> = [];
+  let hosting: { port: number; mode: "public" | "private" } | null = null;
   for (const line of out.stdout.split("\n")) {
+    if (line.startsWith("__CBA_HOSTING__:")) {
+      const m = line.match(/host\s+(\d{2,5})(?:\s+\S+)*?\s+--(public|private)\b/);
+      if (m) hosting = { port: Number(m[1]), mode: m[2] as "public" | "private" };
+      continue;
+    }
     const [y, size, mtime, ...rest] = line.split("\t");
     const p = rest.join("\t");
     if (!p || !y) continue;
     const kind = y === "d" ? "dir" : y === "l" ? "symlink" : "file";
     entries.push({ path: p, kind, ...(kind === "file" ? { size: Number(size) || 0, mtime: Math.floor(Number(mtime) || 0) } : {}) });
   }
-  return entries;
+  return { entries, hosting };
 }
 
 async function handleFsRoute(pathname: string, body: any, res: http.ServerResponse): Promise<boolean> {
@@ -577,7 +595,8 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       // One coherent runtime snapshot rides every tree poll: the page
       // reconciles ALL counters from it, so machines woken outside a turn
       // (typing, uploads) are never invisible to the UI.
-      const runtime = orchestratorFor(credentials).userRuntimeStatus(userId);
+      const orch = orchestratorFor(credentials);
+      const runtime = orch.userRuntimeStatus(userId);
       if (!box) return json(200, { ok: true, live: false, state: "none", entries: [], runtime }), true;
       if (live) {
         // Try live even while the state string still says starting/resuming —
@@ -585,13 +604,22 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
         // HANG until it is up (observed 30s tree loads), and the panel repolls
         // every 4s anyway, so serving the snapshot now beats blocking.
         try {
-          const entries = await Promise.race([
+          const { entries, hosting } = await Promise.race([
             fsLiveTree(client, box.id),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error("live-tree deadline")), 6000)),
           ]);
-          return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries, runtime }), true;
+          // Ground-truth hosting reconcile: a live host process is authoritative
+          // in BOTH directions (starts hosting the badge saw nothing about;
+          // clears it when the process is gone). Recompute the runtime AFTER so
+          // this very response carries the corrected hosting/holds state.
+          orch.reconcileObservedHosting(userId, box.id, hosting);
+          return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries, runtime: orch.userRuntimeStatus(userId) }), true;
         } catch { /* fall through to snapshot */ }
       }
+      // Parked box: hosting is de-facto over (nothing can be reachable on an
+      // archived machine) — clear a stale entry so the badge/hold don't pin a
+      // dead box forever.
+      if (box.state === "archived") orch.reconcileObservedHosting(userId, box.id, null, { boxLive: false });
       const snapshot = await client.latestSnapshot(box.id);
       if (!snapshot) return json(200, { ok: true, live: false, state: box.state, boxId: box.id, entries: [], runtime }), true;
       const tree = await client.snapshotTree(snapshot.id);
@@ -1280,7 +1308,8 @@ body{overflow:hidden;overscroll-behavior:none}
 .hostingStop:hover{border-color:#fc4b55}
 .hostingBadge .value{font-size:15px}
 .state.warming{animation:warmPulse 1.1s ease-in-out infinite;color:#b45309}
-.receipt{font-size:10.5px;color:#b0b0b0;margin:0 0 8px;padding:0 2px;align-self:flex-start}
+/* Receipt reads exactly like a tool-call line: same size, color, placement. */
+.receipt{align-self:flex-start;max-width:92%;font-size:13px;color:#555;margin:0;padding:0}
 .chat{padding:14px 12px 16px;gap:9px}
 .msg{max-width:88%;font-size:14px;padding:9px 11px}
 .msg.trace{font-size:11.5px}

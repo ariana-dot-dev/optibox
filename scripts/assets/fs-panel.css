@@ -1,34 +1,34 @@
-/* Filesystem panel + viewer dialog — follows the page's design language:
-   borderless #f6f6f6 fills, nested radii smaller than their containers,
-   inherited fonts, #fc4b55 accent, no drop shadows. */
+/* Filesystem panel + viewer dialog — speaks the app.css token language
+   (:root vars defined there): fill OR hairline never both, shadow only for
+   floats, radii 8/10/16, inks #111/#555/#9a9a9a, red/green/amber accents. */
 
-.fsPanel{display:flex;flex-direction:column;gap:10px;border-radius:16px;background:#fff;border:1px solid #e0e0e0;padding:16px;min-height:0;overflow:hidden}
-.fsPanel h2{margin:0;font-size:13px;font-weight:500;letter-spacing:.02em;color:#111;display:flex;align-items:baseline;gap:8px}
-.fsStatus{font-size:11px;color:#9a9a9a;font-weight:400}
-.fsStatus.live{color:#1a7f37}
-.fsTreeMount{flex:1;min-height:0;overflow:hidden;border-radius:9px;
+.fsPanel{display:flex;flex-direction:column;gap:8px;border-radius:var(--r-surf);background:#fff;border:1px solid var(--line);padding:16px;min-height:0;overflow:hidden}
+.fsPanel h2{margin:0;font-size:13px;font-weight:500;letter-spacing:.02em;color:var(--ink);display:flex;align-items:baseline;gap:8px}
+.fsStatus{font-size:11px;color:var(--ink3);font-weight:400}
+.fsStatus.live{color:var(--green)}
+.fsTreeMount{flex:1;min-height:0;overflow:hidden;border-radius:var(--r-ctl);
   /* The tree resolves light-dark() by color-scheme; pin it light and feed it
      the app palette through its documented -override variables. */
   color-scheme:light;
   --trees-bg-override:transparent;
-  --trees-bg-muted-override:#efefef;
-  --trees-fg-override:#111;
-  --trees-fg-muted-override:#9a9a9a;
-  --trees-selected-bg-override:#e6e6e6;
-  --trees-selected-fg-override:#111;
+  --trees-bg-muted-override:var(--fill2);
+  --trees-fg-override:var(--ink);
+  --trees-fg-muted-override:var(--ink3);
+  --trees-selected-bg-override:var(--fill2);
+  --trees-selected-fg-override:var(--ink);
   --trees-selected-focused-border-color-override:transparent;
   --trees-border-color-override:transparent;
-  --trees-accent-override:#fc4b55;
-  --trees-focus-ring-color-override:#fc4b55;
+  --trees-accent-override:var(--red);
+  --trees-focus-ring-color-override:var(--red);
   --trees-input-bg-override:#fff;
   --trees-search-bg-override:#fff;
-  --trees-search-fg-override:#111;
-  --trees-scrollbar-thumb-override:#d6d6d6;
-  --trees-indent-guide-bg-override:#e8e8e8;
-  --trees-file-icon-color:#9a9a9a;
-  --trees-file-icon-color-default:#9a9a9a;
+  --trees-search-fg-override:var(--ink);
+  --trees-scrollbar-thumb-override:var(--line2);
+  --trees-indent-guide-bg-override:var(--line);
+  --trees-file-icon-color:var(--ink3);
+  --trees-file-icon-color-default:var(--ink3);
   --trees-font-family-override:inherit;
-  --trees-font-size-override:12.5px;
+  --trees-font-size-override:12px;
   /* The tree adds its OWN 16px inline padding on top of the panel's 16px, so
      rows sat ~32px in while the "Files" title sits at 16px. Zero it so the tree
      lines up with the title and uses the full width. */
@@ -37,54 +37,54 @@
      overflow:hidden (needed for the rounded corners) clips it at the edges. */
   --trees-focus-ring-offset-override:-2px;
   --trees-focus-ring-width-override:1px;
-  --trees-border-radius-override:7px}
-.fsEmpty{color:#9a9a9a;font-size:12px;padding:14px 10px}
-.fsHidden{display:flex;align-items:center;gap:7px;font-size:11px;color:#9a9a9a;cursor:pointer;user-select:none;flex:0 0 auto}
-.fsHidden input{accent-color:#fc4b55;width:13px;height:13px;cursor:pointer;margin:0}
+  --trees-border-radius-override:var(--r-ctl)}
+.fsEmpty{color:var(--ink3);font-size:12px;padding:16px 8px}
+.fsHidden{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ink3);cursor:pointer;user-select:none;flex:0 0 auto}
+.fsHidden input{accent-color:var(--red);width:13px;height:13px;cursor:pointer;margin:0}
 /* Drop indicator as an overlay pseudo-element: a plain outline was painted
    UNDER the tree's sticky search bar, which hid its top edge. */
 .fsTreeMount{position:relative}
-.fsPanel.fsDrop .fsTreeMount::after{content:'';position:absolute;inset:0;border:2px dashed #fc4b55;border-radius:9px;background:rgba(252,75,85,.04);pointer-events:none;z-index:10}
+.fsPanel.fsDrop .fsTreeMount::after{content:'';position:absolute;inset:0;border:2px dashed var(--red);border-radius:var(--r-ctl);background:rgba(252,75,85,.04);pointer-events:none;z-index:10}
 
 /* Inverse of the page zoom: CodeMirror's cursor/click math breaks under CSS
    zoom, so the dialog interior runs at effective zoom 1 (1.15 x 1/1.15). */
 .fsViewerBackdrop{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:24px;zoom:calc(1/var(--z,1))}
-.fsViewer{position:relative;width:min(1100px,94vw);height:min(800px,90dvh);background:#fff;border-radius:16px;display:flex;flex-direction:column;overflow:hidden}
+.fsViewer{position:relative;width:min(1100px,94vw);height:min(800px,90dvh);background:#fff;border-radius:var(--r-surf);box-shadow:var(--shadow-lg);display:flex;flex-direction:column;overflow:hidden}
 .fsViewerHead{display:flex;align-items:center;justify-content:space-between;padding:12px 16px 8px}
-.fsViewerTitle{font-size:15px;color:#111;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fsViewerClose{min-height:0;width:28px;height:28px;padding:0;border:0;border-radius:50%;background:transparent;color:#8a8a8a;line-height:1;display:flex;align-items:center;justify-content:center;cursor:pointer}.fsViewerClose svg{width:15px;height:15px;display:block}.fsViewerClose:hover{color:#111}
-.fsViewerClose:hover{background:#f0f0f0;color:#111}
+.fsViewerTitle{font-size:15px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fsViewerClose{min-height:0;width:28px;height:28px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--ink3);line-height:1;display:flex;align-items:center;justify-content:center;cursor:pointer}.fsViewerClose svg{width:15px;height:15px;display:block}
+.fsViewerClose:hover{background:var(--fill2);color:var(--ink)}
 .fsViewerBody{flex:1;min-height:0;overflow:auto;padding:0 16px 16px;position:relative}
-.fsViewerSave{position:absolute;right:26px;bottom:24px;min-height:0;height:34px;padding:0 15px;border:0;border-radius:17px;background:rgba(17,17,17,.82);color:#fff;font-size:13px;cursor:pointer;z-index:2}
-.fsViewerSave:hover{background:#fc4b55}
-.fsViewerSave.err{background:#b54708}
+.fsViewerSave{position:absolute;right:26px;bottom:24px;min-height:0;height:34px;padding:0 16px;border:0;border-radius:999px;background:rgba(17,17,17,.82);color:#fff;font-size:13px;cursor:pointer;z-index:2}
+.fsViewerSave:hover{background:var(--red)}
+.fsViewerSave.err{background:var(--red)}
 
-.fsLoading{color:#9a9a9a;font-size:13px;padding:18px 4px}
-.fsNotice{color:#555;font-size:13px;padding:22px 4px;text-align:center}
-.fsMiniBtn{min-height:0;height:28px;padding:0 12px;border:0;border-radius:14px;background:#f0f0f0;color:#111;font-size:12px;cursor:pointer;margin-top:10px}
-.fsMiniBtn:hover{background:#e4e4e4}
-.fsCorner{position:absolute;right:10px;bottom:8px;margin:0;background:rgba(240,240,240,.9)}
-.fsPdf{width:100%;height:100%;border:0;border-radius:9px}
-.fsImage{max-width:100%;max-height:100%;display:block;margin:0 auto;border-radius:9px}
-.fsVideo{max-width:100%;max-height:100%;display:block;margin:0 auto;border-radius:9px;background:#111}
+.fsLoading{color:var(--ink3);font-size:13px;padding:16px 4px}
+.fsNotice{color:var(--ink2);font-size:13px;padding:24px 4px;text-align:center}
+.fsMiniBtn{min-height:0;height:28px;padding:0 12px;border:0;border-radius:999px;background:var(--fill);color:var(--ink);font-size:12px;cursor:pointer;margin-top:8px}
+.fsMiniBtn:hover{background:var(--fill2)}
+.fsCorner{position:absolute;right:12px;bottom:8px;margin:0;background:rgba(240,240,240,.9)}
+.fsPdf{width:100%;height:100%;border:0;border-radius:var(--r-ctl)}
+.fsImage{max-width:100%;max-height:100%;display:block;margin:0 auto;border-radius:var(--r-ctl)}
+.fsVideo{max-width:100%;max-height:100%;display:block;margin:0 auto;border-radius:var(--r-ctl);background:var(--ink)}
 .fsAudioWrap{display:flex;align-items:center;justify-content:center;min-height:120px;padding:16px}.fsAudio{width:min(460px,100%)}
 
-.fsTableWrap{overflow:auto;max-height:100%;border-radius:9px;background:#f6f6f6}
-.fsTable{border-collapse:collapse;font-size:13.5px;width:max-content;min-width:100%}
-.fsTable th{position:sticky;top:0;background:#ececec;color:#555;font-weight:500;text-align:left;padding:6px 10px;font-size:11px}
-.fsTable td{padding:5px 10px;border-top:1px solid #ebebeb;color:#111;white-space:pre;max-width:420px;overflow:hidden;text-overflow:ellipsis}
-.fsTable td[contenteditable="true"]:focus{outline:2px solid #fc4b55;outline-offset:-2px;background:#fff}
-.fsRowCount{color:#9a9a9a;font-size:11px;padding:6px 2px}
-.fsSheetPick{margin:0 0 8px;border:0;border-radius:9px;background:#f6f6f6;color:#111;min-height:30px;padding:4px 10px;font:inherit;font-size:12px}
+.fsTableWrap{overflow:auto;max-height:100%;border-radius:var(--r-ctl);background:var(--fill)}
+.fsTable{border-collapse:collapse;font-size:13px;width:max-content;min-width:100%}
+.fsTable th{position:sticky;top:0;background:var(--fill2);color:var(--ink2);font-weight:500;text-align:left;padding:8px 12px;font-size:11px}
+.fsTable td{padding:4px 12px;border-top:1px solid var(--line);color:var(--ink);white-space:pre;max-width:420px;overflow:hidden;text-overflow:ellipsis}
+.fsTable td[contenteditable="true"]:focus{outline:2px solid var(--red);outline-offset:-2px;background:#fff}
+.fsRowCount{color:var(--ink3);font-size:11px;padding:8px 2px}
+.fsSheetPick{margin:0 0 8px;border:0;border-radius:var(--r-ctl);background:var(--fill);color:var(--ink);min-height:30px;padding:4px 12px;font:inherit;font-size:12px}
 
-.fsPlainText{width:100%;height:100%;resize:none;border:0;border-radius:9px;background:#f6f6f6;color:#111;padding:12px;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}
+.fsPlainText{width:100%;height:100%;resize:none;border:0;border-radius:var(--r-ctl);background:var(--fill);color:var(--ink);padding:12px;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;outline:none}
 
 /* CodeMirror themed to the page */
-.fsViewerBody .CodeMirror{height:100%;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;border-radius:9px;background:#f6f6f6;color:#111}
-.fsViewerBody .CodeMirror-gutters{background:#efefef;border-right:1px solid #e6e6e6}
-.fsViewerBody .CodeMirror-linenumber{color:#a5a5a5}
-.fsViewerBody .CodeMirror-cursor{border-left:2px solid #fc4b55}
-.fsViewerBody .CodeMirror-selected{background:#e4e4e4}
+.fsViewerBody .CodeMirror{height:100%;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;border-radius:var(--r-ctl);background:var(--fill);color:var(--ink)}
+.fsViewerBody .CodeMirror-gutters{background:var(--fill2);border-right:1px solid var(--line)}
+.fsViewerBody .CodeMirror-linenumber{color:var(--ink3)}
+.fsViewerBody .CodeMirror-cursor{border-left:2px solid var(--red)}
+.fsViewerBody .CodeMirror-selected{background:var(--fill2)}
 
 /* ≤900px the panel is a full-screen page of the mobile swipe pager (see the
-   @media block in the page template) — it must NOT be display:none here. */
+   @media block in app.css) — it must NOT be display:none here. */

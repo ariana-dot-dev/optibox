@@ -361,14 +361,16 @@ async function prepareTurnWorkspace(
   // truncated by the Git-Bash-on-Windows spawn arg limit (unexpected-EOF errors).
   let prep: CommandResult;
   if (runtime.location === "user-box") {
-    // The box disk is FUSE-backed: everything is present, but the FIRST access to
-    // a not-yet-cached library (e.g. bash's libtinfo.so.6) can miss and fail the
-    // whole `bash -c` with exit 127 "error while loading shared libraries" before
-    // any prep part runs. It is transient — the second access hits cache. Retry the
-    // whole prep through that warm-up window instead of hard-failing the turn.
+    // The box disk is FUSE-backed: everything is present, but accesses during the
+    // post-resume warm-up window fail transiently — a not-yet-cached library
+    // (bash's libtinfo.so.6) misses with exit 127 "error while loading shared
+    // libraries", and WRITES can throw EIO "Input/output error" (observed on
+    // /home/user/.optibox-CONSUMER_AGENT_SYSTEM.md right after a resume). Both
+    // heal on the next attempt once the FUSE layer settles. Retry the whole prep
+    // through that window instead of hard-failing the turn.
     const isTransientExecFail = (r: CommandResult) =>
       !r.stdout.includes("__BIN_OK__") && !r.stdout.includes("__BIN_MISSING__") &&
-      (r.exitCode === 127 || /loading shared librar|libtinfo|cannot open shared object|command not found|\bbash\b.*: not found/i.test(r.stderr));
+      (r.exitCode === 127 || /loading shared librar|libtinfo|cannot open shared object|command not found|\bbash\b.*: not found|input.output error|transport endpoint is not connected|software caused connection abort/i.test(r.stderr + " " + r.stdout));
     prep = await runtime.command(parts.join(" && "));
     for (let attempt = 0; attempt < 6 && isTransientExecFail(prep); attempt++) {
       await new Promise((res) => setTimeout(res, 1500));

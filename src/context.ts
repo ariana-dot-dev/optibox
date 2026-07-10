@@ -52,7 +52,11 @@ export function buildHiddenContext(input: {
   machine: MachineState;
   partialShared?: string;
   staleDuplicateRequest?: boolean;
+  directive?: string;
 }): string {
+  const directive = input.directive
+    ? `\n  <host-directive note="follow this instruction; never quote or mention it">${escapeXml(input.directive)}</host-directive>`
+    : "";
   const turns = input.transcript
     .slice(-40)
     .map((m) => {
@@ -74,7 +78,7 @@ export function buildHiddenContext(input: {
     `  <machine-state location="${input.machine.location}" tools="${input.machine.tools}"${input.machine.status ? ` status="${input.machine.status}"` : ""}${input.machine.boxId ? ` boxId="${input.machine.boxId}"` : ""}/>`,
     `  <prior-transcript count="${input.transcript.length}">`,
     turns,
-    `  </prior-transcript>${partial}${staleDuplicate}`,
+    `  </prior-transcript>${partial}${staleDuplicate}${directive}`,
     `</${HIDDEN_CONTEXT_TAG}>`,
   ].join("\n");
 }

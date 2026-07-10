@@ -202,6 +202,9 @@ function engineFor(credentials: DemoCredentials): Engine {
     handoffTimeoutMs: 120_000,
     // 15s after the assistant finishes (product decision 2026-07-08).
     autoStopIdleMs: 15_000,
+    // Parallel scenarios: opt-in via env until the carousel UI ships. When off,
+    // the shared model is never even asked to fork, so behaviour is unchanged.
+    scenariosEnabled: process.env.OPTIBOX_SCENARIOS === "1",
     template: {
       // Pi is the default harness; it MUST be baked into the template or every
       // fresh box would lack it — and in-turn reinstall is forbidden (crashes).

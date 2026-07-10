@@ -24,7 +24,7 @@ create table if not exists boxes (
   id text primary key,
   user_key text not null,
   instance_id text not null,
-  purpose text not null check (purpose in ('user','template')),
+  purpose text not null check (purpose in ('user','template','scenario','checkpoint')),
   billing_since timestamptz,
   billing_reason text,
   retired_at timestamptz,
@@ -100,6 +100,18 @@ create table if not exists events (
   at timestamptz not null default now()
 );
 create index if not exists events_conv on events(user_key, conversation_id, seq);
+-- Parallel scenarios: a turn can fan out into N alternative private runs, each on
+-- its own box. Scenario boxes carry the group (the turn that spawned them) and a
+-- human label; transcripts written by a scenario round carry scenario_id so they
+-- don't pollute the main-line model context until a winner is merged. All
+-- nullable/additive — the one-active-user-box unique index only constrains
+-- purpose='user', so scenario boxes never touch that invariant.
+alter table boxes add column if not exists scenario_group text;
+alter table boxes add column if not exists scenario_label text;
+alter table transcripts add column if not exists scenario_id text;
+-- Widen the purpose CHECK on already-created tables to admit scenario/checkpoint.
+alter table boxes drop constraint if exists boxes_purpose_check;
+alter table boxes add constraint boxes_purpose_check check (purpose in ('user','template','scenario','checkpoint'));
 `;
 
 export interface Db {

@@ -252,6 +252,10 @@ export function buildHarnessInstructions(ctx: SharedContext | UserBoxContext, po
       ? "Output ONLY that visible reply — either the full answer or the one short holding line. Never output routing tags, XML, control markers, or an empty response. You must always produce visible text."
       : undefined,
     "When done, answer the latest user request directly and concisely. If you changed files or ran commands, summarize the concrete result.",
+    // A per-turn host directive (e.g. the parallel-scenarios fork tag). Placed
+    // LAST so it overrides earlier rules it explicitly references — the shared
+    // phase otherwise forbids all tags, which would suppress the fork tag.
+    !policy.toolsAllowed && (ctx as SharedContext).directive ? (ctx as SharedContext).directive : undefined,
   ].filter(Boolean).join("\n");
 }
 

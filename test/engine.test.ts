@@ -314,6 +314,40 @@ test("render journal: events append in order, tail by cursor, reset clears them"
   engine.dispose();
 });
 
+test("parallel scenarios: shared fork tag fans out into N scenario-tagged box rounds", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(
+    box,
+    harnessOf("h", { shared: "Two solid directions here.\n<optibox-fork>Fast MVP | Robust build</optibox-fork>", box: "scenario answer" }),
+    { scenariosEnabled: true },
+  );
+  const events = await collect(engine, "usc", "csc", "build me a thing");
+  const fork = events.find((e: any) => e.type === "scenario.fork");
+  assert.ok(fork, "scenario.fork emitted");
+  assert.deepEqual(fork.labels, ["Fast MVP", "Robust build"]);
+  const boxDeltas = events.filter((e: any) => e.type === "user-box.delta");
+  const scenIds = new Set(boxDeltas.map((e: any) => e.scenarioId));
+  assert.equal(scenIds.size, 2, "two scenarios each produced tagged deltas");
+  assert.ok([...scenIds].every(Boolean), "every scenario delta carries a scenarioId");
+  assert.ok(boxDeltas.every((e: any) => e.scenarioLabel), "and a human label");
+  const scenRows = await db.q<{ retired_at: string | null }>(`select retired_at from boxes where user_key=$1 and purpose='scenario'`, [engine.userKey("usc")]);
+  assert.equal(scenRows.length, 2, "two scenario box rows created");
+  assert.ok(scenRows.every((r) => r.retired_at), "scenario boxes retired after the fan-out (not left billing)");
+  // the one-active-user-box invariant is untouched (scenarios are a different purpose)
+  const userBoxes = await db.q(`select 1 from boxes where user_key=$1 and purpose='user' and retired_at is null`, [engine.userKey("usc")]);
+  assert.equal(userBoxes.length, 1, "still exactly one active user box");
+  engine.dispose();
+});
+
+test("scenarios OFF: the fork tag is ignored and the turn runs as a single box round", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box, harnessOf("h", { shared: "one path.\n<optibox-fork>A | B</optibox-fork>", box: "answer" })); // flag off
+  const events = await collect(engine, "usoff", "csoff", "do it");
+  assert.ok(!events.some((e: any) => e.type === "scenario.fork"), "no fan-out when flag off");
+  assert.equal((await db.q(`select 1 from boxes where user_key=$1 and purpose='scenario'`, [engine.userKey("usoff")])).length, 0, "no scenario boxes");
+  engine.dispose();
+});
+
 test("manual stopUserBox ends billing at stop request and archives", async () => {
   const box = new FakeBoxClient();
   const engine = makeEngine(box, harnessOf("h"));

@@ -55,6 +55,10 @@ export interface EngineOptions {
   /** Minimum machine age before the direct (no-bridge) route applies; younger boxes bridge as if off. */
   directMinWarmMs?: number;
   template?: { installCmd: string; warmCmd?: string };
+  /** Parallel scenarios: let the shared model fan a turn into N alternative box
+   *  runs via <optibox-fork>. Off by default — the fan-out UI ships in a later
+   *  step; when off the fork tag is ignored and turns run exactly as before. */
+  scenariosEnabled?: boolean;
 }
 
 type EventBody = ConsumerTurnEventBody;
@@ -85,6 +89,21 @@ const HOST_CMD_RE = /(?:^|[\s;|&(])host\s+(\d{2,5})(?:\s+\S+)*?\s+--(public|priv
 // a turn starts a box-side screen recording (see runBoxRound).
 const DESKTOP_MARKS = ["xdotool", "wmctrl", "xdg-open", "ydotool", "wtype", "scrot", "DISPLAY=", "chromium", "google-chrome", "firefox", "lux "];
 const isDesktopCommand = (cmd: string): boolean => DESKTOP_MARKS.some((m) => cmd.includes(m));
+
+// Parallel scenarios: the shared model marks a genuinely ambiguous request by
+// ending its reply with <optibox-fork>label A | label B</optibox-fork> (same
+// hidden-tag machinery as <optibox-files>). Labels split on "|"; 2..4 kept.
+const FORK_TAG_RE = /<optibox-fork>([\s\S]*?)<\/optibox-fork>/i;
+function parseForkLabels(text: string): string[] {
+  const m = FORK_TAG_RE.exec(text);
+  if (!m || !m[1]) return [];
+  const labels = m[1].split("|").map((s) => s.trim().replace(/\s+/g, " ")).filter(Boolean);
+  const uniq = [...new Set(labels)];
+  return uniq.length >= 2 ? uniq.slice(0, 4) : [];
+}
+// Strip the fork tag (and anything after it) from stored/spoken shared text —
+// the client already hides it via stripFileDecl, this keeps the transcript clean.
+const stripForkTag = (text: string): string => text.replace(/<optibox-fork>[\s\S]*/i, "").trimEnd();
 
 export class Engine {
   private readonly db: Db;
@@ -139,6 +158,16 @@ export class Engine {
        where user_key=$1 and purpose='user' and retired_at is null`,
       [key, reason],
     );
+  }
+
+  /** Start billing on ONE specific box (any purpose) — the per-box form used by
+   *  box rounds so a scenario box bills itself, not the user's primary box. */
+  async wakeBox(boxId: string, reason: string): Promise<void> {
+    await this.db.q(
+      `update boxes set billing_since=coalesce(billing_since, now()), billing_reason=coalesce(billing_reason,$2) where id=$1 and retired_at is null`,
+      [boxId, reason],
+    );
+    await this.db.q(`update users u set last_activity_at=now() from boxes b where b.id=$1 and b.user_key=u.key`, [boxId]);
   }
 
   /** THE one way billing ends: atomically folds elapsed into the user total.
@@ -242,9 +271,13 @@ export class Engine {
     });
   }
 
-  private async createFreshBox(userKey: string, events?: EventQueue): Promise<BoxInfo> {
+  private async createFreshBox(userKey: string, events?: EventQueue, role?: { purpose: "scenario"; group: string; label: string }): Promise<BoxInfo> {
     const name = this.boxName(userKey);
     const ttlSeconds = this.opts.userBoxTtlSeconds ?? 900;
+    const purpose = role?.purpose ?? "user";
+    const scenCols = role ? ", scenario_group, scenario_label" : "";
+    const scenVals = role ? ", $5, $6" : "";
+    const scenArgs = role ? [role.group, role.label] : [];
     // When a template is configured (the harness needs installation), a user
     // box is ALWAYS a fork of the warm-cycled template — installed, snapshotted,
     // resumed once with the harness actually launched (recording the FUSE
@@ -268,8 +301,8 @@ export class Engine {
       const forked = await this.box.fork(tpl.box_id);
       await this.box.update?.(forked.id, { name, ttlSeconds })?.catch(() => undefined);
       await this.db.q(
-        `insert into boxes(id, user_key, instance_id, purpose) values($1,$2,$3,'user')`,
-        [forked.id, userKey, this.opts.instanceId],
+        `insert into boxes(id, user_key, instance_id, purpose${scenCols}) values($1,$2,$3,$4${scenVals})`,
+        [forked.id, userKey, this.opts.instanceId, purpose, ...scenArgs],
       );
       events?.push({ type: "lifecycle", boxId: forked.id, state: "forking", note: "forking pre-installed, warm-cycled template" });
       return await this.waitUntilReady(forked.id);
@@ -278,8 +311,8 @@ export class Engine {
     // harnesses, tests): plain create is the intended path.
     const created = await this.box.create({ name, ttlSeconds });
     await this.db.q(
-      `insert into boxes(id, user_key, instance_id, purpose) values($1,$2,$3,'user')`,
-      [created.id, userKey, this.opts.instanceId],
+      `insert into boxes(id, user_key, instance_id, purpose${scenCols}) values($1,$2,$3,$4${scenVals})`,
+      [created.id, userKey, this.opts.instanceId, purpose, ...scenArgs],
     );
     events?.push({ type: "lifecycle", boxId: created.id, state: "starting", note: "creating fresh private box" });
     return this.waitUntilReady(created.id);
@@ -394,6 +427,20 @@ export class Engine {
         await this.endBilling(r.id);
         await this.box.stop(r.id).catch(() => undefined);
       });
+    }
+    // Crash safety for parallel scenarios: the fan-out stops+retires its own
+    // scenario boxes, but if a run died mid-flight a purpose='scenario' box can
+    // be left billing forever (the loop above only sweeps purpose='user'). Reap
+    // any that has billed past the absolute ceiling.
+    const orphans = await this.db.q<{ id: string }>(
+      `select id from boxes where instance_id=$1 and purpose='scenario' and retired_at is null
+         and billing_since is not null and billing_since < now() - ($2||' milliseconds')::interval`,
+      [this.opts.instanceId, String(ceilingMs)],
+    );
+    for (const o of orphans) {
+      await this.endBilling(o.id).catch(() => undefined);
+      await this.box.stop(o.id).catch(() => undefined);
+      await this.db.q(`update boxes set retired_at=now(), billing_since=null where id=$1`, [o.id]).catch(() => undefined);
     }
   }
 
@@ -647,7 +694,7 @@ export class Engine {
 
   async getTranscript(userId: string, conversationId: string): Promise<TranscriptMessage[]> {
     const rows = await this.db.q<{ role: string; content: string; mode: string | null; at: string }>(
-      `select role, content, mode, at from transcripts where user_key=$1 and conversation_id=$2 order by seq`,
+      `select role, content, mode, at from transcripts where user_key=$1 and conversation_id=$2 and scenario_id is null order by seq`,
       [this.userKey(userId), conversationId],
     );
     return rows.map((r) => {
@@ -726,6 +773,13 @@ export class Engine {
         // Rules 1+3: the shared agent answers immediately (full or holding line — its choice).
         yield emit({ type: "trace", stage: "shared.bridge.start", message: "shared no-tools agent answers first (full answer or a short wait line — its own choice)", harness: harness.name, model: input.selection.model });
         const transcript = await this.getTranscript(input.userId, input.conversationId);
+        const forkDirective = this.opts.scenariosEnabled
+          ? [
+              "PARALLEL EXPLORATION (overrides the 'never output tags' rule above, for this one tag only): the private runtime can pursue several directions AT ONCE on parallel machines. When the user's request presents two or three genuinely distinct directions — an explicit either/or ('should I do X or Y?', 'a minimal version or a full one?'), or a task with two clearly different valid approaches each worth building out in full — do NOT ask which one and do NOT pick just one.",
+              "Instead: give a brief, neutral one- or two-sentence framing that names the directions, then end your reply with EXACTLY this hidden tag on its own final line: <optibox-fork>short label A | short label B</optibox-fork> — 2 or 3 labels, each 2-4 words naming one direction, separated by ' | '. The runtime explores every labelled direction in parallel and the user keeps the winner.",
+              "This is the ONLY tag you may ever emit, and only for genuine multi-direction requests. Never mention or explain it. For a single unambiguous ask with no real alternatives, omit it entirely and answer normally.",
+            ].join(" ")
+          : undefined;
         const hidden = buildHiddenContext({ transcript, machine: { location: "shared-box", tools: false, status: "provisioning" } });
         yield emit({ type: "context.injected", scope: "shared", machine: { location: "shared-box", tools: false, status: "provisioning" }, hidden });
         try {
@@ -733,6 +787,7 @@ export class Engine {
             userId: input.userId, conversationId: input.conversationId, message: input.message,
             transcript, selection: input.selection, capabilities: createRestrictedSharedCapabilities(),
             hiddenContext: hidden, machine: { location: "shared-box", tools: false, status: "provisioning" },
+            ...(forkDirective ? { directive: forkDirective } : {}),
             signal: abort.signal,
           })) {
             const delta = typeof text === "string" ? text : (text as { text: string }).text;
@@ -742,8 +797,9 @@ export class Engine {
         } catch (e) {
           yield emit({ type: "trace", stage: "shared.bridge.failed", message: e instanceof Error ? e.message : String(e), harness: harness.name, model: input.selection.model });
         }
-        if (partialShared.trim()) {
-          await this.db.q(`insert into transcripts(user_key, conversation_id, role, content, mode) values($1,$2,'assistant',$3,'shared')`, [userKey, input.conversationId, partialShared]);
+        const sharedClean = stripForkTag(partialShared);
+        if (sharedClean.trim()) {
+          await this.db.q(`insert into transcripts(user_key, conversation_id, role, content, mode) values($1,$2,'assistant',$3,'shared')`, [userKey, input.conversationId, sharedClean]);
         }
       }
       for (const e of boot.drain()) yield emit(e);
@@ -768,7 +824,15 @@ export class Engine {
         return;
       }
 
-      yield* this.runBoxRound(input, turnId, userKey, convKey, harness, box, partialShared, abort.signal);
+      // Parallel scenarios (flagged): if the shared model marked the request
+      // ambiguous, fan out into one private run per interpretation; otherwise the
+      // ordinary single box round. The flag OFF => tag ignored => unchanged path.
+      const forkLabels = this.opts.scenariosEnabled ? parseForkLabels(partialShared) : [];
+      if (forkLabels.length >= 2) {
+        yield* this.runScenarios(input, turnId, userKey, convKey, harness, box, partialShared, forkLabels, abort.signal);
+      } else {
+        yield* this.runBoxRound(input, turnId, userKey, convKey, harness, box, partialShared, abort.signal);
+      }
     } finally {
       this.turnAborts.delete(turnId);
       await this.bumpActivity(input.userId).catch(() => undefined);
@@ -790,8 +854,12 @@ export class Engine {
     box: BoxInfo,
     partialShared: string,
     signal: AbortSignal,
+    scenario?: { scenarioId: string; label: string },
   ): AsyncIterable<ConsumerTurnEvent> {
-    const emit = (e: EventBody): ConsumerTurnEvent => ({ ...e, turnId } as ConsumerTurnEvent);
+    // In scenario mode every event is stamped with the scenario so the UI routes
+    // it to the right carousel pane; the box round otherwise runs identically.
+    const emit = (e: EventBody): ConsumerTurnEvent =>
+      ({ ...e, turnId, ...(scenario ? { scenarioId: scenario.scenarioId, scenarioLabel: scenario.label } : {}) } as ConsumerTurnEvent);
     // Desktop recording: armed the moment the agent's FIRST desktop-touching
     // tool runs (see onHarnessEvent), finalized after the round (see below).
     // recordingPath being non-null is the "a recording exists to stop" flag.
@@ -801,7 +869,8 @@ export class Engine {
     const queue = new EventQueue();
     const work = this.db.withLock("conv", convKey, async () => {
       const push = (e: EventBody) => queue.push(e);
-      await this.wake(input.userId, "turn");
+      // Bill THIS box (works for the user box and for a scenario box alike).
+      await this.wakeBox(box.id, scenario ? "scenario" : "turn");
       push({ type: "billing.start", boxId: box.id, ratePerSecond: BOX_PRICE_USD_PER_SECOND, sinceEpochMs: Date.now(), pricing: BOX_PRICING });
       const transcript = await this.getTranscript(input.userId, input.conversationId);
       const recap = await this.recapper.recap(transcript);
@@ -864,7 +933,13 @@ export class Engine {
         // Rule 6 binding clause: no text and no <end> is LOUD, never silence.
         return { outcome: "blocked" as const, text: "", diagnostic: completion.diagnostic ?? `harness ended (${completion.reason}) with no answer and no <end>`, blockedEmitted: false };
       }
-      await this.db.q(`insert into transcripts(user_key, conversation_id, role, content, mode) values($1,$2,'assistant',$3,'box')`, [userKey, input.conversationId, visible]);
+      // Scenario answers are tagged with scenario_id and kept OUT of the main
+      // model-context transcript (getTranscript filters scenario_id is null) —
+      // only the winner is merged in later. Ordinary turns write the main line.
+      await this.db.q(
+        `insert into transcripts(user_key, conversation_id, role, content, mode, scenario_id) values($1,$2,'assistant',$3,'box',$4)`,
+        [userKey, input.conversationId, visible, scenario?.scenarioId ?? null],
+      );
       return { outcome: "answered" as const, text: visible };
     });
 
@@ -900,18 +975,19 @@ export class Engine {
     switch (result?.outcome) {
       case "answered":
       case "silent": {
-        await this.finishTurn(turnId, "answered");
-        await this.bumpActivity(input.userId);
+        // In scenario mode the OUTER turn finalizes once after all scenarios;
+        // the scenario boxes are stopped by the fan-out, not an idle countdown.
+        if (!scenario) { await this.finishTurn(turnId, "answered"); await this.bumpActivity(input.userId); }
         yield emit({ type: "turn.done", boxId: box.id, harness: harness.name, model: input.selection.model, route: partialShared ? "bridge" : "direct", settled: true });
-        yield emit({ type: "autostop.timer", phase: "started", boxId: box.id, remainingMs: idleMs, deadlineEpochMs: Date.now() + idleMs, reason: "idle-after-response", note: "assistant finished; private Box auto-stops when the idle countdown reaches zero" });
+        if (!scenario) yield emit({ type: "autostop.timer", phase: "started", boxId: box.id, remainingMs: idleMs, deadlineEpochMs: Date.now() + idleMs, reason: "idle-after-response", note: "assistant finished; private Box auto-stops when the idle countdown reaches zero" });
         break;
       }
       case "interrupted":
-        await this.finishTurn(turnId, "interrupted");
+        if (!scenario) await this.finishTurn(turnId, "interrupted");
         yield emit({ type: "trace", stage: "turn.interrupted", message: "turn aborted by the user; session preserved for resume", harness: harness.name, model: input.selection.model, boxId: box.id });
         break;
       default: {
-        await this.finishTurn(turnId, "blocked");
+        if (!scenario) await this.finishTurn(turnId, "blocked");
         // The crash path already streamed its turn.blocked — never render the
         // same failure twice (observed in prod as a doubled error bubble).
         if (!(result && "blockedEmitted" in result && (result as { blockedEmitted?: boolean }).blockedEmitted)) {
@@ -919,6 +995,67 @@ export class Engine {
           yield emit({ type: "turn.blocked", stage: "box.no-answer", message: diag, retryable: true, harness: harness.name, model: input.selection.model, boxId: box.id });
         }
       }
+    }
+  }
+
+  // ---------------------------------------------------------------- parallel scenarios (fan-out)
+
+  /** Merge N concurrent scenario generators into one stream (already tagged). */
+  private async *mergeGenerators(gens: AsyncIterable<ConsumerTurnEvent>[]): AsyncIterable<ConsumerTurnEvent> {
+    const q = new EventQueue();
+    let running = gens.length;
+    if (!running) return;
+    for (const g of gens) {
+      void (async () => {
+        try { for await (const ev of g) q.push(ev as unknown as EventBody); }
+        finally { if (--running === 0) q.end(); }
+      })();
+    }
+    while (!q.done) { await q.wait(); for (const e of q.drain()) yield e as unknown as ConsumerTurnEvent; }
+  }
+
+  /**
+   * Fan a turn into one private run per interpretation. Each scenario gets its
+   * OWN fresh box (fork of the warm template) and its own conv lock, so they run
+   * truly in parallel; every event is scenario-tagged for the carousel UI. The
+   * user's own box is paused (it isn't running these). Scenario boxes are
+   * stopped+retired when the fan-out ends — step 3 (winner-select) will instead
+   * keep the chosen one and merge its branch into the main line.
+   */
+  private async *runScenarios(
+    input: ConsumerTurnInput, turnId: string, userKey: string, convKey: string,
+    harness: HarnessAdapter, userBox: BoxInfo, partialShared: string, labels: string[], signal: AbortSignal,
+  ): AsyncIterable<ConsumerTurnEvent> {
+    const emitT = (e: EventBody): ConsumerTurnEvent => ({ ...e, turnId } as ConsumerTurnEvent);
+    await this.endBilling(userBox.id).catch(() => undefined); // the user box isn't running the scenarios
+    yield emitT({ type: "scenario.fork", groupId: turnId, labels });
+
+    // Provision one scenario box per label, in parallel.
+    const provisioned = await Promise.all(labels.map((label, i) =>
+      this.createFreshBox(userKey, undefined, { purpose: "scenario", group: turnId, label })
+        .then((box) => ({ ok: true as const, box, label, id: `s${i}` }))
+        .catch((error) => ({ ok: false as const, error, label, id: `s${i}` })),
+    ));
+    const live = provisioned.filter((p): p is { ok: true; box: BoxInfo; label: string; id: string } => p.ok);
+    for (const p of provisioned) {
+      if (!p.ok) yield ({ type: "turn.blocked", stage: "scenario.provision.failed", message: `scenario "${p.label}" could not start: ${p.error instanceof Error ? p.error.message : String(p.error)}`, retryable: true, harness: harness.name, model: input.selection.model, turnId, scenarioId: p.id, scenarioLabel: p.label } as ConsumerTurnEvent);
+    }
+    try {
+      const gens = live.map((s) => this.runBoxRound(
+        { ...input, message: `${input.message}\n\n[Parallel-scenario mode: explore ONLY this interpretation — "${s.label}". Commit fully to it; do not hedge across the alternatives.]` },
+        turnId, userKey, `${convKey}:${s.id}`, harness, s.box, partialShared, signal, { scenarioId: s.id, label: s.label },
+      ));
+      yield* this.mergeGenerators(gens);
+    } finally {
+      // Pause billing + retire the scenario boxes (belt-and-suspenders: the sweep
+      // also reaps any purpose='scenario' leak from a crash mid-fan-out).
+      for (const s of live) {
+        await this.endBilling(s.box.id).catch(() => undefined);
+        await this.box.stop(s.box.id).catch(() => undefined);
+        await this.db.q(`update boxes set retired_at=now(), billing_since=null where id=$1`, [s.box.id]).catch(() => undefined);
+      }
+      await this.finishTurn(turnId, "answered").catch(() => undefined);
+      await this.bumpActivity(input.userId).catch(() => undefined);
     }
   }
 }

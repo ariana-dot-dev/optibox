@@ -30,10 +30,16 @@ export type ConsumerTurnEventBody =
   // /api/fs/read and plays it in place of the ended live stream — live AND on
   // replay, since it's journaled like every other turnId-bearing event.
   | { type: "desktop.recording"; boxId: string; path: string; sizeKb: number }
+  // A turn fanning out into parallel scenarios: labels name each interpretation.
+  // Subsequent events carry scenarioId/scenarioLabel routing them to a pane.
+  | { type: "scenario.fork"; groupId: string; labels: string[] }
   | { type: "error"; message: string }
   | { type: "turn.done"; boxId?: string; harness: string; model: string; route?: "shared" | "direct" | "bridge"; settled?: boolean };
 
-export type ConsumerTurnEvent = ConsumerTurnEventBody & { turnId?: string };
+// scenarioId/scenarioLabel are set on every event from a parallel-scenario box
+// round, so the UI routes each event to the right carousel pane and the journal
+// can replay per-scenario. Absent on ordinary single-box turns.
+export type ConsumerTurnEvent = ConsumerTurnEventBody & { turnId?: string; scenarioId?: string; scenarioLabel?: string };
 
 export interface TranscriptMessage {
   role: Role;
@@ -245,6 +251,10 @@ export interface SharedContext {
   capabilities: SafeSharedCapabilities;
   /** Hidden XML envelope (prior transcript + machine state) injected into the prompt. */
   hiddenContext: string;
+  /** Optional extra SYSTEM instruction for this shared turn (e.g. the parallel-
+   *  scenarios fork directive). Delivered as a real instruction, not passive
+   *  context — the model treats hiddenContext as inert, so behavioural asks fail there. */
+  directive?: string;
   /** Current machine/tool state — here: shared box, tools=false. */
   machine: MachineState;
   /** Last known native session id for this conversation+harness (resume target). */

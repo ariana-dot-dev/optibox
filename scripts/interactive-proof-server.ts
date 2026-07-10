@@ -535,7 +535,7 @@ async function fsResolveBox(credentials: DemoCredentials, userId: string): Promi
  * SAME path space the snapshot tree uses, so the panel behaves identically
  * whether the box is up or down. (/tmp is tmpfs and never in snapshots.)
  */
-async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<{ entries: Array<{ path: string; kind: string; size?: number; mtime?: number }>; hosting: { port: number; mode: "public" | "private" } | null }> {
+async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<{ entries: Array<{ path: string; kind: string; size?: number; mtime?: number }>; hosting: Array<{ port: number; mode: "public" | "private" }> }> {
   const out = await client.command(boxId, {
     // %T@ = mtime as epoch seconds (float): lets the chat surface files the
     // agent created/modified during a turn by comparing against a turn-start
@@ -558,15 +558,18 @@ async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<{ entri
       // process IS hosting; its absence IS not-hosting. Command-sniffing alone
       // proved fragile (in-memory state dies on server restart and can't see a
       // host started outside a turn). This line is parsed out of the listing.
-      `printf '__CBA_HOSTING__:%s\\n' "$(pgrep -af 'host [0-9]' 2>/dev/null | head -3 | tr '\\n' ';')"`,
+      `printf '__CBA_HOSTING__:%s\\n' "$(pgrep -af 'host [0-9]' 2>/dev/null | head -8 | tr '\\n' ';')"`,
     timeoutMs: 30_000,
   });
   const entries: Array<{ path: string; kind: string; size?: number; mtime?: number }> = [];
-  let hosting: { port: number; mode: "public" | "private" } | null = null;
+  const hosting: Array<{ port: number; mode: "public" | "private" }> = [];
   for (const line of out.stdout.split("\n")) {
     if (line.startsWith("__CBA_HOSTING__:")) {
-      const m = line.match(/host\s+(\d{2,5})(?:\s+\S+)*?\s+--(public|private)\b/);
-      if (m) hosting = { port: Number(m[1]), mode: m[2] as "public" | "private" };
+      const seenPorts = new Set<number>();
+      for (const m of line.matchAll(/host\s+(\d{2,5})(?:\s+\S+)*?\s+--(public|private)\b/g)) {
+        const port = Number(m[1]);
+        if (!seenPorts.has(port)) { seenPorts.add(port); hosting.push({ port, mode: m[2] as "public" | "private" }); }
+      }
       continue;
     }
     const [y, size, mtime, ...rest] = line.split("\t");
@@ -619,7 +622,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       // Parked box: hosting is de-facto over (nothing can be reachable on an
       // archived machine) — clear a stale entry so the badge/hold don't pin a
       // dead box forever.
-      if (box.state === "archived") orch.reconcileObservedHosting(userId, box.id, null, { boxLive: false });
+      if (box.state === "archived") orch.reconcileObservedHosting(userId, box.id, [], { boxLive: false });
       const snapshot = await client.latestSnapshot(box.id);
       if (!snapshot) return json(200, { ok: true, live: false, state: box.state, boxId: box.id, entries: [], runtime }), true;
       const tree = await client.snapshotTree(snapshot.id);
@@ -1091,7 +1094,8 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       try {
         const credentials = credentialsFromBody(body);
-        const result = await orchestratorFor(credentials).stopHosting(String(body.userId ?? "user-a"));
+        const port = Number.isFinite(Number(body.port)) && Number(body.port) > 0 ? Number(body.port) : undefined;
+        const result = await orchestratorFor(credentials).stopHosting(String(body.userId ?? "user-a"), port);
         res.writeHead(200, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ ok: true, ...result }));
       } catch (e) {
@@ -1300,13 +1304,19 @@ body{overflow:hidden;overscroll-behavior:none}
 .counters{gap:6px}.counter{padding:8px 9px;border-radius:9px}
 .label{font-size:10.5px}.value{font-size:16px}.state{font-size:11px}
 @keyframes warmPulse{0%,100%{opacity:1}50%{opacity:.4}}
-/* Hosting swaps into the auto-stop slot (the counters grid is exactly 3
-   columns — a 4th cell overlaps). Same .counter card as every other cell. */
-.hostingBadge .label{display:flex;align-items:center;gap:6px}
-.hostingDot{width:7px;height:7px;border-radius:50%;background:#17b45c;flex:0 0 auto;animation:warmPulse 1.6s ease-in-out infinite}
-.hostingStop{margin-left:auto;font-size:10px;line-height:1;padding:3px 8px;border-radius:6px;background:#fff;border:1px solid #e4e4e4;color:#fc4b55;cursor:pointer;user-select:none}
-.hostingStop:hover{border-color:#fc4b55}
-.hostingBadge .value{font-size:15px}
+/* Hosting bar: its own full-width strip under the header — one plain sentence,
+   the live URL, and ONE real button. Nothing shares its row, nothing overlaps. */
+.hostingBar{display:flex;align-items:center;gap:9px;padding:8px 14px;background:#f0faf3;border-bottom:1px solid #dcefe2;font-size:12.5px;color:#1d5c33}
+.hbDot{width:8px;height:8px;border-radius:50%;background:#17b45c;flex:0 0 auto;animation:warmPulse 1.6s ease-in-out infinite}
+.hbText{white-space:nowrap}
+.hbLink{color:#1d5c33;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+.hostingBar .hbStop{margin-left:auto;flex:0 0 auto;min-height:28px;padding:0 13px;font-size:12px;font-weight:400;background:#fff;color:#c02b34;border:1px solid #e3cdcf;border-radius:8px;cursor:pointer}
+.hostingBar .hbStop:hover{border-color:#c02b34;background:#fff5f5}
+.hostingBar{position:relative}
+.hbMenu{position:absolute;top:100%;left:14px;right:14px;z-index:9;background:#fff;border:1px solid #dcefe2;border-top:0;border-radius:0 0 10px 10px;box-shadow:0 8px 22px rgba(0,0,0,.10);padding:4px 0}
+.hbRow{display:flex;align-items:center;gap:10px;padding:7px 12px;font-size:12.5px}
+.hbRow a{color:#1d5c33;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}
+.hbRow .hbStop{margin-left:auto;min-height:24px;padding:0 10px;font-size:11px}
 .state.warming{animation:warmPulse 1.1s ease-in-out infinite;color:#b45309}
 /* Receipt reads exactly like a tool-call line: same size, color, placement. */
 .receipt{align-self:flex-start;max-width:92%;font-size:13px;color:#555;margin:0;padding:0}
@@ -1359,10 +1369,15 @@ textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px inpu
       <div class="counter"><span class="label">total spent</span><span class="value" id="totalCost">$0.000000</span></div>
       <div class="counter"><span class="label">machine time</span><span class="value" id="totalSeconds">0.0s</span></div>
       <div class="counter" id="autoStopCell"><span class="label">auto-stop</span><span class="value" id="autoStopTimer">idle</span></div>
-      <div class="counter hostingBadge" id="hostingBadge" style="display:none"><span class="label"><span class="hostingDot"></span>hosting<span class="hostingStop" id="hostingStop" role="button" title="stop hosting: close the port and let the machine stop">stop</span></span><span class="value" id="hostingInfo">—</span></div>
     </section>
     <div class="state" id="machineState">shared bridge ready · private machine stopped</div>
   </header>
+  <div class="hostingBar" id="hostingBar" style="display:none">
+    <span class="hbDot"></span>
+    <span class="hbText" id="hbText">hosting</span>
+    <a class="hbLink" id="hbLink" target="_blank" rel="noopener noreferrer" style="display:none"></a>
+    <button type="button" class="hbStop" id="hbStop" title="stop hosting: close the port and let the machine park">stop hosting</button>
+  </div>
   <section class="chat" id="chat" aria-live="polite"><div class="empty" id="empty">Send a message to start the demo.</div></section>
   <form class="composer" id="composer">
     <div class="pendingAttach" id="pendingAttach"></div>
@@ -1696,27 +1711,58 @@ function stopBilling(elapsed,reconciled){if(billing){if(!reconciled)totalSeconds
 // Hosting indicator: the box is intentionally staying up because it exposes a
 // hosted service (host CLI). Badge + stop button live in the header; state
 // arrives on the same runtime snapshot as every other counter.
-function syncHostingBadge(hosting){
+// Hosting bar: one uncluttered strip under the header. One service -> its URL
+// + a single stop button. Several -> "hosting N services" toggles a compact
+// dropdown with one row (link + stop) per service; the bar button stops all.
+let hostingList=[];
+async function stopHostingReq(port){
   try{
-    const badge=$('hostingBadge'),autoCell=$('autoStopCell');if(!badge||!badge.style)return;
-    if(hosting){const info=$('hostingInfo');if(info)info.textContent=':'+hosting.port+' '+hosting.mode;badge.style.display='';if(autoCell&&autoCell.style)autoCell.style.display='none';}
-    else{badge.style.display='none';if(autoCell&&autoCell.style)autoCell.style.display='';}
-  }catch(_){}
-}
-let hostingStopBusy=false;
-$('hostingStop')?.addEventListener('click',async()=>{
-  if(hostingStopBusy)return;hostingStopBusy=true;
-  try{
-    const r=await(await fetch('/api/host/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
-    addMsg('trace','hosting','stop hosting requested'+(r&&r.port?' · port '+r.port+' closed':'')+'; machine can now auto-stop\\n');
-    syncHostingBadge(null);
+    await fetch('/api/host/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,...(port?{port}:{}),apiKeys:currentApiKeys()})});
+    hostingList=port?hostingList.filter(h=>h.port!==port):[];
+    syncHostingBar(hostingList);
     try{window.__optiboxFs.poke();}catch(_){}
   }catch(e){addMsg('assistant','error','Stop hosting failed: '+String(e&&e.message||e));}
-  finally{hostingStopBusy=false;}
-});
+}
+function hostLabel(h){return (h.url||'').replace(/^https?:[/][/]/i,'')||(':'+h.port+' '+h.mode);}
+function syncHostingBar(list){
+  try{
+    list=Array.isArray(list)?list:[];hostingList=list;
+    const bar=$('hostingBar');if(!bar||!bar.style)return;
+    const menu=document.getElementById&&document.getElementById('hbMenu');
+    if(!list.length){bar.style.display='none';if(menu)menu.remove();return;}
+    bar.style.display='flex';
+    const text=$('hbText'),link=$('hbLink'),stop=$('hbStop');
+    if(list.length===1){
+      const h=list[0];
+      if(text)text.textContent='hosting';
+      if(link&&link.style){if(h.url){link.textContent=hostLabel(h);link.href=h.url;link.style.display='';}else{link.style.display='none';}}
+      if(!h.url&&text)text.textContent='hosting :'+h.port+' '+h.mode;
+      if(stop)stop.textContent='stop hosting';
+      if(menu)menu.remove();
+      if(text)text.style&&(text.style.cursor='');text&&(text.onclick=null);
+    }else{
+      if(link&&link.style)link.style.display='none';
+      if(text){text.textContent='hosting '+list.length+' services ▾';if(text.style)text.style.cursor='pointer';
+        text.onclick=()=>{
+          let m=document.getElementById('hbMenu');
+          if(m){m.remove();return;}
+          m=document.createElement('div');m.id='hbMenu';m.className='hbMenu';
+          hostingList.forEach(h=>{
+            const row=document.createElement('div');row.className='hbRow';
+            const a=document.createElement('a');a.target='_blank';a.rel='noopener noreferrer';a.textContent=hostLabel(h);if(h.url)a.href=h.url;row.appendChild(a);
+            const b=document.createElement('button');b.type='button';b.className='hbStop';b.textContent='stop';b.onclick=()=>{stopHostingReq(h.port);const mm=document.getElementById('hbMenu');if(mm)mm.remove();};row.appendChild(b);
+            m.appendChild(row);
+          });
+          bar.appendChild(m);
+        };}
+      if(stop)stop.textContent='stop all';
+    }
+  }catch(_){}
+}
+$('hbStop')?.addEventListener('click',()=>stopHostingReq());
 function applyRuntimeStatus(rt){
   if(!rt)return;
-  syncHostingBadge(rt.hosting||null);
+  syncHostingBar(rt.hosting||[]);
   // Authoritative assignment (never +=): the server accumulates billed seconds
   // in ONE place (endBilling) and every snapshot carries the total, so the
   // header is a pure projection: total + live window since billingSinceEpochMs.

@@ -265,7 +265,7 @@ export class ConsumerBoxAgentOrchestrator {
    * an entry exists. Surfaced through activeHoldReasons (countdown, reaper,
    * stop blockers all respect it) and userRuntimeStatus (header indicator).
    */
-  private readonly hostingByUser = new Map<string, { boxId: string; port: number; mode: "public" | "private"; sinceEpochMs: number }>();
+  private readonly hostingByUser = new Map<string, Map<number, { boxId: string; port: number; mode: "public" | "private"; sinceEpochMs: number; url?: string }>>();
 
   constructor(private readonly options: OrchestratorOptions) {
     this.sessions = options.sessions ?? new InMemorySessionStore();
@@ -1784,10 +1784,10 @@ export class ConsumerBoxAgentOrchestrator {
 
   private activeHoldReasons(userId: string): string[] {
     const reasons: string[] = [];
-    // Hosting is an indefinite hold: an exposed service must stay reachable
-    // until the user explicitly stops it from the UI.
+    // Hosting is an indefinite hold: exposed services must stay reachable
+    // until the user explicitly stops them from the UI.
     const hosting = this.hostingByUser.get(userId);
-    if (hosting) reasons.push(`hosting :${hosting.port} (${hosting.mode})`);
+    if (hosting && hosting.size > 0) reasons.push(`hosting ${[...hosting.values()].map((h) => `:${h.port}`).join(" ")}`);
     const holds = this.boxHolds.get(userId);
     if (!holds) return reasons;
     const now = Date.now();
@@ -1816,83 +1816,101 @@ export class ConsumerBoxAgentOrchestrator {
   }
 
   private markHosting(userId: string, boxId: string, port: number, mode: "public" | "private"): void {
-    const cur = this.hostingByUser.get(userId);
-    this.hostingByUser.set(userId, {
+    const services = this.hostingByUser.get(userId) ?? new Map<number, { boxId: string; port: number; mode: "public" | "private"; sinceEpochMs: number; url?: string }>();
+    const firstForBox = ![...services.values()].some((s) => s.boxId === boxId);
+    const cur = services.get(port);
+    services.set(port, {
       boxId, port, mode,
-      sinceEpochMs: cur && cur.boxId === boxId && cur.port === port ? cur.sinceEpochMs : Date.now(),
+      sinceEpochMs: cur && cur.boxId === boxId ? cur.sinceEpochMs : Date.now(),
+      ...(cur && cur.boxId === boxId && cur.url ? { url: cur.url } : {}),
     });
+    this.hostingByUser.set(userId, services);
     // Our holds stop OUR reaper/countdown, but the PLATFORM archives the box at
     // its own archiveAfter TTL regardless — which killed a hosted site mid-life
     // (box created with a short TTL, archived while the badge said hosting).
     // Best-effort: push the TTL way out while hosting; stopHosting isn't
     // required to restore it (the normal idle-stop parks the box anyway).
-    if (!cur || cur.boxId !== boxId) {
+    if (firstForBox) {
       void this.options.box.update?.(boxId, { ttlSeconds: 7 * 24 * 3600 }).catch(() => undefined);
+    }
+    // Resolve the public URL of the hosted service for the UI bar: the host CLI
+    // exposes <box-subdomain>-<port>.on.ascii.dev. Async best-effort; the bar
+    // shows it as soon as a later runtime poll picks it up.
+    const entry = services.get(port)!;
+    if (!entry.url) {
+      void this.options.box.get(boxId).then((b) => {
+        const base = String((b as { url?: string }).url ?? "");
+        const m = base.match(/^https:[/][/]([^.]+)[.](.+)$/);
+        if (!m) return;
+        const live = this.hostingByUser.get(userId)?.get(port);
+        if (live && live.boxId === boxId) live.url = `https://${m[1]}-${port}.${m[2]}`;
+      }).catch(() => undefined);
     }
   }
 
-  /** Consecutive live probes that saw no host process, per user — grace so one
-   * flaky pgrep doesn't drop the hold of a genuinely hosted site. */
+  /** Consecutive live probes that saw no host process, per user:port — grace so
+   * one flaky pgrep doesn't drop the hold of a genuinely hosted service. */
   private readonly hostingMisses = new Map<string, number>();
 
   /**
-   * Ground-truth reconcile from the box itself (rides the file-tree poll): a
-   * live `host` process is authoritative in both directions. Sets hosting the
-   * command-sniffer never saw (host started outside a turn, server restarted
-   * and lost the in-memory map) and clears it when the process is gone (two
-   * consecutive misses) or the box is parked (boxLive:false — an archived
-   * machine hosts nothing).
+   * Ground-truth reconcile from the box itself (rides the file-tree poll): the
+   * set of live `host` processes is authoritative in both directions. Sets
+   * services the command-sniffer never saw (host started outside a turn,
+   * server restarted and lost the in-memory map) and clears each service whose
+   * process is gone (two consecutive misses) or every service of a parked box
+   * (boxLive:false — an archived machine hosts nothing).
    */
-  reconcileObservedHosting(userId: string, boxId: string, observed: { port: number; mode: "public" | "private" } | null, opts: { boxLive?: boolean } = {}): void {
-    const cur = this.hostingByUser.get(userId);
-    if (observed) {
-      this.hostingMisses.delete(userId);
-      this.markHosting(userId, boxId, observed.port, observed.mode);
-      return;
+  reconcileObservedHosting(userId: string, boxId: string, observed: Array<{ port: number; mode: "public" | "private" }>, opts: { boxLive?: boolean } = {}): void {
+    const services = this.hostingByUser.get(userId);
+    for (const o of observed) {
+      this.hostingMisses.delete(`${userId}:${o.port}`);
+      this.markHosting(userId, boxId, o.port, o.mode);
     }
-    if (!cur || cur.boxId !== boxId) return;
-    if (opts.boxLive === false) {
-      this.hostingByUser.delete(userId);
-      this.hostingMisses.delete(userId);
-      return;
+    if (!services || services.size === 0) return;
+    const observedPorts = new Set(observed.map((o) => o.port));
+    for (const [port, entry] of services) {
+      if (entry.boxId !== boxId || observedPorts.has(port)) continue;
+      const missKey = `${userId}:${port}`;
+      if (opts.boxLive === false) { services.delete(port); this.hostingMisses.delete(missKey); continue; }
+      const misses = (this.hostingMisses.get(missKey) ?? 0) + 1;
+      if (misses >= 2) { services.delete(port); this.hostingMisses.delete(missKey); this.touchUserActivity(userId); }
+      else this.hostingMisses.set(missKey, misses);
     }
-    const misses = (this.hostingMisses.get(userId) ?? 0) + 1;
-    if (misses >= 2) {
-      this.hostingByUser.delete(userId);
-      this.hostingMisses.delete(userId);
-      this.touchUserActivity(userId);
-    } else {
-      this.hostingMisses.set(userId, misses);
-    }
+    if (services.size === 0) this.hostingByUser.delete(userId);
   }
 
-  /** Hosting status for the UI (rides userRuntimeStatus). */
-  hostingStatus(userId: string): { boxId: string; port: number; mode: "public" | "private"; sinceEpochMs: number } | undefined {
-    return this.hostingByUser.get(userId);
+  /** Hosting status for the UI (rides userRuntimeStatus): all live services. */
+  hostingStatus(userId: string): Array<{ boxId: string; port: number; mode: "public" | "private"; sinceEpochMs: number; url?: string }> {
+    return [...(this.hostingByUser.get(userId)?.values() ?? [])];
   }
 
   /**
-   * Stop hosting: close the exposed port on the box (ufw) and kill the host
-   * process, then release the indefinite hold so the normal idle countdown
-   * takes over and the machine can park again. Best-effort on the box side —
-   * the hold is released even if the box is unreachable (it may already be
-   * stopped), because a stuck hold would pin the VM forever.
+   * Stop hosting — one service (port given) or all of them. Closes the exposed
+   * port on the box (ufw) and kills the host process, then releases the
+   * indefinite hold so the normal idle countdown takes over and the machine
+   * can park again. Best-effort on the box side — state is released even if
+   * the box is unreachable (a stuck hold would pin the VM forever).
    */
-  async stopHosting(userId: string): Promise<{ stopped: boolean; port?: number }> {
-    const hosting = this.hostingByUser.get(userId);
-    if (!hosting) return { stopped: false };
-    this.hostingByUser.delete(userId);
+  async stopHosting(userId: string, port?: number): Promise<{ stopped: boolean; ports: number[] }> {
+    const services = this.hostingByUser.get(userId);
+    if (!services || services.size === 0) return { stopped: false, ports: [] };
+    const targets = [...services.values()].filter((s) => port === undefined || s.port === port);
+    if (targets.length === 0) return { stopped: false, ports: [] };
+    for (const t of targets) { services.delete(t.port); this.hostingMisses.delete(`${userId}:${t.port}`); }
+    if (services.size === 0) this.hostingByUser.delete(userId);
     this.touchUserActivity(userId);
-    try {
-      await this.options.box.command(hosting.boxId, {
-        command:
-          `sudo -n ufw delete allow ${hosting.port}/tcp 2>/dev/null; sudo -n ufw delete allow ${hosting.port} 2>/dev/null; ` +
-          `sudo -n ufw deny ${hosting.port}/tcp 2>/dev/null; ` +
-          `pkill -f 'host[[:space:]]+${hosting.port}' 2>/dev/null; true`,
-        timeoutMs: 20_000,
-      });
-    } catch { /* box unreachable/parked: the hold release above is what matters */ }
-    return { stopped: true, port: hosting.port };
+    for (const t of targets) {
+      try {
+        await this.options.box.command(t.boxId, {
+          command:
+            `sudo -n ufw delete allow ${t.port}/tcp 2>/dev/null; sudo -n ufw delete allow ${t.port} 2>/dev/null; ` +
+            `sudo -n ufw deny ${t.port}/tcp 2>/dev/null; ` +
+            `pkill -f 'host[[:space:]]+${t.port}' 2>/dev/null; true`,
+          timeoutMs: 20_000,
+        });
+      } catch { /* box unreachable/parked: the state release above is what matters */ }
+    }
+    return { stopped: true, ports: targets.map((t) => t.port) };
   }
 
   /** Bump the idle clock of every conversation of this user (box is per-user). */
@@ -2575,7 +2593,7 @@ export class ConsumerBoxAgentOrchestrator {
     activeTurn: boolean;
     idleStopEtaEpochMs: number | null;
     idleStopMs: number;
-    hosting: { port: number; mode: "public" | "private"; sinceEpochMs: number } | null;
+    hosting: Array<{ port: number; mode: "public" | "private"; sinceEpochMs: number; url?: string }> | null;
   } {
     const holds = this.activeHoldReasons(userId);
     let boxId: string | undefined;
@@ -2595,8 +2613,8 @@ export class ConsumerBoxAgentOrchestrator {
     const idleStopEtaEpochMs = since !== null && !activeTurn && holds.length === 0
       ? Math.max(Date.now(), (lastActivity || Date.now()) + idleStopMs)
       : null;
-    const hostingEntry = this.hostingByUser.get(userId);
-    return { ...(boxId ? { boxId } : {}), billingSinceEpochMs: since, billedSecondsTotal: this.billedSecondsByUser.get(userId) ?? 0, holds, activeTurn, idleStopEtaEpochMs, idleStopMs, hosting: hostingEntry ? { port: hostingEntry.port, mode: hostingEntry.mode, sinceEpochMs: hostingEntry.sinceEpochMs } : null };
+    const hostingList = this.hostingStatus(userId);
+    return { ...(boxId ? { boxId } : {}), billingSinceEpochMs: since, billedSecondsTotal: this.billedSecondsByUser.get(userId) ?? 0, holds, activeTurn, idleStopEtaEpochMs, idleStopMs, hosting: hostingList.length ? hostingList.map((h) => ({ port: h.port, mode: h.mode, sinceEpochMs: h.sinceEpochMs, ...(h.url ? { url: h.url } : {}) })) : null };
   }
 
   private startBilling(boxId: string, owner?: { userId: string; conversationId: string }): { since: number; fresh: boolean } {

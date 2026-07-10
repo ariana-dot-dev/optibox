@@ -1891,13 +1891,18 @@ function extractLinks(text){
   // NOTE: no \\/ escapes outside char classes here — the raw-source compile
   // check parses this template before unescaping, and \\/ ends a regex literal
   // there. [/] is equivalent and parses identically in both forms.
-  // Trailing junk includes markdown emphasis (**url**, _url_, `url`) — agents
-  // routinely bold their links and the asterisks would otherwise ride into the
-  // href as %2A%2A and split one link into several "distinct" mangled ones.
-  const push=u=>{u=String(u).replace(/[).,;:!?\\]'"\\u00BB*_\\u0060]+$/,'');if(!/^https?:[/][/]/i.test(u)||OG_SKIP_RE.test(u)||u.length>600)return;if(!seen[u]){seen[u]=1;out.push(u);}};
+  // Trailing junk includes markdown emphasis (**url**, _url_, backticked url):
+  // agents routinely bold their links and the asterisks would otherwise ride
+  // into the href as %2A%2A and split one link into several mangled ones.
+  const push=u=>{u=String(u).replace(/[).,;:!?\\]'"\\u00BB*_\\u0060]+$/,'');if(!/^https?:[/][/]/i.test(u)||OG_SKIP_RE.test(u)||u.length>600)return;const k=u.replace(/^https?:[/][/](www\\.)?/i,'').replace(/[/]$/,'').toLowerCase();if(!seen[k]){seen[k]=1;out.push(u);}};
   let m;const mdre=/\\[[^\\]]*\\]\\((https?:[/][/][^\\s)]+)\\)/g;while((m=mdre.exec(text)))push(m[1]);
   const bare=/https?:[/][/][^\\s<>"')\\]]+/g;while((m=bare.exec(text)))push(m[0]);
-  return out.slice(0,4);
+  // Bare domain mentions ("meteofrance.com", "Windy.com (great maps)") — agents
+  // list sites without schemes constantly. TLD-allowlisted to avoid matching
+  // filenames; (?<!@) skips e-mail addresses; scheme added for the preview.
+  const dom=/(?<![@\\w])((?:[a-z0-9-]+\\.)+(?:com|org|net|io|dev|fr|co|uk|de|app|ai|me|tv|gg|so|edu|gov|in|info|eu|es|it|nl|be|ch|at|se|no|dk|fi|pl|pt|us|ca|au|nz|jp|br|ly|to|cc|fm|sh|im|xyz|site|online|tech|live|news|store|shop|blog|cloud|wiki))(?![a-z0-9@-])((?:[/][^\\s<>"')\\]]*)?)/gi;
+  while((m=dom.exec(text)))push('https://'+m[1]+(m[2]||''));
+  return out.slice(0,8);
 }
 async function renderLinkPreviews(el){
   if(!el||el.__ogDone||!el.parentNode)return;el.__ogDone=true;

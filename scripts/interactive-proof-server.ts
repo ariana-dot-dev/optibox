@@ -684,9 +684,12 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       // them. Each poll renews a 45s hold; the TTL is the release.
       desktopHolds.get(userId)?.();
       desktopHolds.set(userId, orchestratorFor(credentials).holdUserBox(userId, "desktop-connect", 45_000));
-      // Moonlight (60fps WebRTC), not VNC. publicAccess: the tokened URL suits
-      // iframes (no cookie dance); the host stays unguessable per-box.
-      const desktop = await client.desktopStreamUrl(box.id, { theme: "light", publicAccess: true });
+      // Moonlight (60fps WebRTC) by default; body.vnc=true returns the noVNC
+      // stream instead — plain websockets, which load on networks where the
+      // WebRTC stream never connects (the widget offers an in-place switch).
+      // publicAccess: the tokened URL suits iframes (no cookie dance); the
+      // host stays unguessable per-box.
+      const desktop = await client.desktopStreamUrl(box.id, { theme: "light", publicAccess: true, ...(body.vnc ? { vnc: true } : {}) });
       return json(200, { ok: true, provisioning: desktop.provisioning, ...(desktop.desktopUrl ? { desktopUrl: desktop.desktopUrl } : {}), ...(desktop.message ? { message: desktop.message } : {}) }), true;
     }
 
@@ -1233,6 +1236,7 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .ogDeck .ogSite{font-size:9px;color:#9a9a9a;margin-top:5px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .msg.desktop{align-self:flex-start;max-width:86%;width:540px;padding:8px;background:#f6f6f6;border-radius:14px;border:0}
 .msg.desktop .desktopTag{font-size:10px;color:#555;margin:0 4px 6px;display:flex;align-items:center;justify-content:space-between}
+.msg.desktop .desktopTag .dtLinks{display:flex;gap:10px}
 .msg.desktop .desktopTag a{color:#9a9a9a;text-decoration:none}
 .msg.desktop .desktopTag a:hover{color:#111}
 .desktopWrap{position:relative;border-radius:8px;overflow:hidden;background:#111;min-height:60px}
@@ -1629,10 +1633,39 @@ function ensureDesktopWidget(localId){
   endDesktopWidget();
   const c=$('chat');const stick=chatStick(c);$('empty')?.remove();
   const el=document.createElement('div');el.className='msg desktop';
-  el.innerHTML='<div class="desktopTag"><span>desktop · connecting</span><a href="#" target="_blank" rel="noopener" style="display:none">open in tab</a></div><div class="desktopWrap"><div class="desktopNote">starting desktop stream…</div></div>';
+  el.innerHTML='<div class="desktopTag"><span>desktop · connecting</span><span class="dtLinks"><a href="#" class="dtVnc" style="display:none">switch to VNC</a><a href="#" class="dtOpen" target="_blank" rel="noopener" style="display:none">open in tab</a></span></div><div class="desktopWrap"><div class="desktopNote">starting desktop stream…</div></div>';
   c.appendChild(el);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;
-  desktopWidget={localId:localId,el:el,frame:null};
+  desktopWidget={localId:localId,el:el,frame:null,vnc:false};
+  el.querySelector('a.dtVnc').addEventListener('click',function(e){e.preventDefault();swapDesktopMode(desktopWidget);});
   attachDesktopStream(desktopWidget);
+}
+// In-place stream/VNC switch: the Moonlight WebRTC stream never connects on
+// some networks (UDP/WebRTC blocked); noVNC rides plain websockets and loads
+// where Moonlight can't. Swaps the SAME preview iframe's src — never a new
+// tab. Polls while the VNC server provisions (~20s on first switch).
+async function swapDesktopMode(w){
+  if(!w||desktopWidget!==w||w.switching)return;
+  w.switching=true;w.vnc=!w.vnc;
+  var vlink=w.el.querySelector('a.dtVnc');if(vlink)vlink.textContent=w.vnc?'switch to stream':'switch to VNC';
+  var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · switching to '+(w.vnc?'VNC':'stream')+'…';
+  try{
+    for(var i=0;i<15;i++){
+      if(desktopWidget!==w)return;
+      const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,vnc:w.vnc,apiKeys:currentApiKeys()})});
+      const j=await res.json();
+      if(desktopWidget!==w)return;
+      if(j.ok&&j.desktopUrl&&!j.provisioning){
+        if(w.frame)w.frame.src=j.desktopUrl;
+        var open=w.el.querySelector('a.dtOpen');if(open)open.href=j.desktopUrl;
+        if(tag)tag.textContent='desktop · '+(w.vnc?'VNC':'live');
+        return;
+      }
+      if(j.ok===false){if(tag)tag.textContent='desktop · switch failed: '+(j.message||'machine is off');return;}
+      await new Promise(function(r){setTimeout(r,2000);});
+    }
+    if(tag)tag.textContent='desktop · '+(w.vnc?'VNC':'stream')+' did not start';
+  }catch(_){if(tag)tag.textContent='desktop · switch failed';}
+  finally{w.switching=false;}
 }
 async function attachDesktopStream(w){
   for(var i=0;i<30;i++){
@@ -1650,7 +1683,8 @@ async function attachDesktopStream(w){
         wrap.innerHTML='';wrap.appendChild(frame);wrap.appendChild(overlay);
         w.frame=frame;
         var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · live';
-        var link=w.el.querySelector('.desktopTag a');if(link){link.href=j.desktopUrl;link.style.display='';}
+        var link=w.el.querySelector('.desktopTag a.dtOpen');if(link){link.href=j.desktopUrl;link.style.display='';}
+        var vl=w.el.querySelector('.desktopTag a.dtVnc');if(vl)vl.style.display='';
         // Heartbeat: renew the server-side desktop hold while this widget's
         // turn is still running, so the machine stays up under the stream.
         // Renew ONLY while the agent's turn is still producing its answer. Keying

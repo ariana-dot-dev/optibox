@@ -349,6 +349,14 @@ export class ConsumerBoxAgentOrchestrator {
       const firstSeen = this.orphanSightings.get(box.id);
       if (firstSeen === undefined) { this.orphanSightings.set(box.id, now); continue; }
       if (now - firstSeen < graceMs) continue;
+      // LAST-RESORT ground-truth probe before the kill: right after a server
+      // restart the in-memory hosting map is empty, and this sweep archived a
+      // user's LIVE hosted site within seconds (observed: public URL dropped
+      // to the platform fallback). A running `host` process on the box means
+      // it is deliberately up — leave it (and keep the sighting so a box whose
+      // host process ends still gets reaped on a later sweep).
+      const probe = await this.options.box.command(box.id, { command: "pgrep -af 'host [0-9]' 2>/dev/null | head -3", timeoutMs: 8_000 }).catch(() => undefined);
+      if (probe && /host\s+\d{2,5}(?:\s+\S+)*?\s+--(?:public|private)\b/.test(probe.stdout)) continue;
       this.orphanSightings.delete(box.id);
       await this.options.box.stop(box.id).catch(() => undefined);
     }

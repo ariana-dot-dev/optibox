@@ -190,9 +190,15 @@ async function swapDesktopMode(w){
   if(!w||desktopWidget!==w||w.switching)return;
   w.switching=true;w.vnc=!w.vnc;
   var vlink=w.el.querySelector('a.dtVnc');if(vlink)vlink.textContent=w.vnc?'switch to stream':'switch to VNC';
-  var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · switching to '+(w.vnc?'VNC':'stream')+'…';
+  var target=w.vnc?'VNC':'stream';
+  var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · switching to '+target+'…';
   try{
-    for(var i=0;i<15;i++){
+    // Cold VNC provisioning: the box's noVNC server is started on first switch
+    // and can take ~30-60s to come up (measured). Poll patiently (~90s) and
+    // surface the API's live status ("Preparing VNC desktop…") so the wait
+    // never looks frozen. Each poll also renews the server-side box hold, so
+    // the machine can't park out from under a switch in progress.
+    for(var i=0;i<45;i++){
       if(desktopWidget!==w)return;
       const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,vnc:w.vnc,apiKeys:currentApiKeys()})});
       const j=await res.json();
@@ -204,9 +210,10 @@ async function swapDesktopMode(w){
         return;
       }
       if(j.ok===false){if(tag)tag.textContent='desktop · switch failed: '+(j.message||'machine is off');return;}
+      if(tag)tag.textContent='desktop · '+(j.message||'preparing '+target+'…');
       await new Promise(function(r){setTimeout(r,2000);});
     }
-    if(tag)tag.textContent='desktop · '+(w.vnc?'VNC':'stream')+' did not start';
+    if(tag)tag.textContent='desktop · '+target+' is slow to start — tap “switch to '+target+'” to retry';
   }catch(_){if(tag)tag.textContent='desktop · switch failed';}
   finally{w.switching=false;}
 }

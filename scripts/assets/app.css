@@ -200,12 +200,14 @@ textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px inpu
 .mobileDots{position:fixed;right:calc(7px + env(safe-area-inset-right));top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:7px;z-index:15;pointer-events:none}
 .mobileDots span{width:6px;height:6px;border-radius:50%;background:#c9c9c9;transition:background .25s ease,transform .25s ease}
 .mobileDots span.on{background:#111;transform:scale(1.3)}
-/* Suspended while the composer textarea is focused (mobile.js toggles this):
-   iOS's native "scroll the focused input above the keyboard" maneuver targets
-   the nearest scrollable ancestor, which is this mandatory-snap pager — so
-   instead of a small nudge, focusing the textarea forced a full-page jump,
-   sometimes landing on Files/Backend and "hiding" the composer entirely. */
-.shell.kbOpen{scroll-snap-type:none}
+/* Snap stays mandatory ALWAYS — even while the composer is focused. The old
+   rule killed snap on kbOpen to dodge iOS's "scroll focused input into view"
+   jump, but that was a hangover from the VERTICAL pager (which shared the
+   keyboard's axis). This pager is horizontal and the composer lives on the
+   home page, so there's no cross-page jump to dodge — and disabling snap while
+   the textarea holds focus (which it keeps after the keyboard closes on many
+   mobiles) turned every swipe into a loose free-scroll. mobile.js still
+   re-homes on the keyboard's viewport resize; it just never suspends snap. */
 }
 /* The former ≤520px block folded into the ≤900px mobile pager rules above so a
    single source of truth sets phone type/spacing (it was overriding them here). */
@@ -214,4 +216,7 @@ textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px inpu
    possible — plain gray text that only darkens on hover. */
 .resetBtn{position:fixed;right:12px;bottom:10px;z-index:14;background:transparent;border:0;color:#b5b5b5;font-size:11px;min-height:0;padding:4px 6px;cursor:pointer;border-radius:6px}
 .resetBtn:hover{color:#333;background:#f2f2f2}
-@media(max-width:900px){.resetBtn{bottom:calc(24px + env(safe-area-inset-bottom));right:calc(10px + env(safe-area-inset-right))}}
+/* On mobile the reset control belongs only on the Backend page (it's a
+   backend/plumbing action, and it must not float over Chat or Files). mobile.js
+   sets body.atBackend from the current pager page. */
+@media(max-width:900px){.resetBtn{display:none;bottom:calc(24px + env(safe-area-inset-bottom));right:calc(10px + env(safe-area-inset-right))}body.atBackend .resetBtn{display:block}}

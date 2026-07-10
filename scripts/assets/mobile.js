@@ -30,6 +30,8 @@
   const paint = () => {
     const p = curPage();
     [...dots.children].forEach((d, i) => d.classList.toggle("on", i === p));
+    // The reset control is Backend-page-only on mobile (CSS gates on this).
+    document.body.classList.toggle("atBackend", mq.matches && p === 2);
   };
 
   // Jump to a page without a visible animation (used for the initial park and
@@ -59,18 +61,17 @@
   window.addEventListener("resize", () => { if (mq.matches && !document.body.classList.contains("kbOpen")) jumpTo(page); });
   if (mq.addEventListener) mq.addEventListener("change", (e) => { if (e.matches) jumpTo(HOME); });
 
-  // Keyboard-open safety net, kept even though horizontal paging shares no axis
-  // with the keyboard: a focused input still triggers native scroll-into-view
-  // maneuvers, and suspending snap for that duration costs nothing and avoids
-  // any edge case. Delegated (focusin/focusout bubble) so it also covers the
-  // Files panel's search input, not just the composer.
+  // Keyboard tracking — for RE-HOMING ONLY, never for suspending snap (snap now
+  // stays mandatory always; see app.css). body.kbOpen just tells the resize
+  // handlers below to hold still while the keyboard animates, so the page
+  // doesn't re-home mid-animation. Delegated (focusin/focusout bubble) so it
+  // also covers the Files panel's inputs, not just the composer.
   let kbCloseTimer = 0;
   document.addEventListener("focusin", (e) => {
     if (!mq.matches) return;
     if (!(e.target instanceof HTMLElement) || !/^(input|textarea)$/i.test(e.target.tagName)) return;
     clearTimeout(kbCloseTimer);
     document.body.classList.add("kbOpen");
-    shell.classList.add("kbOpen");
   });
   document.addEventListener("focusout", (e) => {
     if (!mq.matches) return;
@@ -78,7 +79,6 @@
     clearTimeout(kbCloseTimer);
     kbCloseTimer = setTimeout(() => {
       document.body.classList.remove("kbOpen");
-      shell.classList.remove("kbOpen");
       jumpTo(page);
     }, 320);
   });

@@ -89,6 +89,7 @@ interface DemoCredentials {
 const serverProviderEnv = allowServerKeys ? providerEnvFromProcess() : {};
 const serverBoxApiKey = allowServerKeys ? process.env.BOX_API_KEY : undefined;
 const orchestrators = new Map<string, ConsumerBoxAgentOrchestrator>();
+const ogCache = new Map<string, { at: number; data: unknown }>();
 const serverRunId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const auditRing: unknown[] = [];
 const AUDIT_RING_LIMIT = Number(process.env.OPTIBOX_AUDIT_RING_LIMIT ?? 5000);
@@ -187,7 +188,13 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
     harnesses,
     sessions: new InMemorySessionStore(),
     providerEnv,
-    userBoxName: (userId) => `consumer-agent-${INSTANCE_ID}-user-${userId}-${cacheKey.slice(0, 8)}`,
+    // "optibox-" prefix, NOT the historical "consumer-agent-": old builds'
+    // orphan reapers match startsWith("consumer-agent-"), so an instance-id
+    // SUFFIX alone still left new boxes killable by any stale process running
+    // yesterday's code (confirmed live: a dev server started before the
+    // instance-id fix kept sniping prod's suffixed boxes ~50s after creation).
+    // A disjoint prefix is immune to every historical matcher by construction.
+    userBoxName: (userId) => `optibox-${INSTANCE_ID}-user-${userId}-${cacheKey.slice(0, 8)}`,
     userBoxTtlSeconds: 900,
     // Readiness is now a live command probe (boxes execute commands seconds
     // before their state field reports ready), so poll fast to actually collect
@@ -211,13 +218,13 @@ function orchestratorFor(credentials: DemoCredentials): ConsumerBoxAgentOrchestr
     // developer's own dev box got force-stopped mid-session by this server's
     // reaper, since both used the same generic naming with no way to tell
     // "mine" from "someone else's" apart).
-    orphanBoxName: (name) => name.startsWith(`consumer-agent-${INSTANCE_ID}-`),
+    orphanBoxName: (name) => name.startsWith(`optibox-${INSTANCE_ID}-`),
     // Fresh user boxes fork this pre-installed snapshot (~16s restore) instead of
     // creating an empty box and npm-installing opencode inside it (~15-40s).
     // Instance-scoped too, so two deployments never adopt/contend over the same
     // template box.
     userBoxTemplate: {
-      name: `consumer-agent-${INSTANCE_ID}-template`,
+      name: `optibox-${INSTANCE_ID}-template`,
       // Pi is the default harness now, so it MUST be baked into the template or
       // every fresh box pays a 15-40s npm install on its first turn. opencode
       // stays installed too so switching harnesses is still instant.
@@ -389,7 +396,7 @@ function fsBoxName(credentials: DemoCredentials, userId: string): string {
   // NOTE: no template literal here — the client regression tests locate the
   // html() template by finding this file's first returned backtick string.
   // Must stay byte-for-byte in sync with the userBoxName in orchestratorFor().
-  return "consumer-agent-" + INSTANCE_ID + "-user-" + userId + "-" + cacheKey.slice(0, 8);
+  return "optibox-" + INSTANCE_ID + "-user-" + userId + "-" + cacheKey.slice(0, 8);
 }
 
 /**
@@ -815,6 +822,58 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === "GET" && url.pathname === "/api/og") {
+      // Open-Graph preview proxy for links the agent mentions in chat. The
+      // browser can't fetch cross-origin pages itself, so the host fetches the
+      // page and returns just the embed fields. Cached; failures return ok:false
+      // (the client then renders a plain domain card instead).
+      const target = url.searchParams.get("url") ?? "";
+      const send = (status: number, payload: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      try {
+        const t = new URL(target);
+        if (t.protocol !== "http:" && t.protocol !== "https:") return void send(400, { ok: false, message: "http(s) only" });
+        // Never proxy into local/private networks (SSRF guard).
+        const host = t.hostname.toLowerCase();
+        if (host === "localhost" || host === "0.0.0.0" || host.endsWith(".local") || /^127\.|^10\.|^192\.168\.|^169\.254\.|^172\.(1[6-9]|2\d|3[01])\./.test(host) || host === "::1" || host.startsWith("[")) {
+          return void send(400, { ok: false, message: "private host" });
+        }
+        const cached = ogCache.get(t.href);
+        if (cached && Date.now() - cached.at < 15 * 60_000) return void send(200, cached.data);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 6000);
+        let html = "";
+        try {
+          const page = await fetch(t.href, { signal: ctrl.signal, redirect: "follow", headers: { "user-agent": "Mozilla/5.0 (compatible; optibox-og/1.0)", accept: "text/html" } });
+          html = (await page.text()).slice(0, 400_000);
+        } finally { clearTimeout(timer); }
+        const pick = (...patterns: RegExp[]) => {
+          for (const re of patterns) { const m = html.match(re); if (m?.[1]) return m[1].replace(/&amp;/g, "&").replace(/&#x27;|&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim(); }
+          return "";
+        };
+        const meta = (prop: string) => pick(
+          new RegExp(`<meta[^>]+(?:property|name)=["']${prop}["'][^>]+content=["']([^"']+)["']`, "i"),
+          new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${prop}["']`, "i"),
+        );
+        let image = meta("og:image") || meta("twitter:image");
+        if (image) { try { image = new URL(image, t.href).href; } catch { image = ""; } }
+        const data = {
+          ok: true,
+          url: t.href,
+          title: meta("og:title") || meta("twitter:title") || pick(/<title[^>]*>([^<]+)<\/title>/i) || t.hostname,
+          description: (meta("og:description") || meta("twitter:description") || meta("description")).slice(0, 240),
+          image,
+          site: meta("og:site_name") || t.hostname.replace(/^www\./, ""),
+        };
+        ogCache.set(t.href, { at: Date.now(), data });
+        return void send(200, data);
+      } catch (e) {
+        return void send(200, { ok: false, message: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/api/harnesses") {
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(
@@ -1081,6 +1140,25 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .attachDeck .card .cardName{position:absolute;left:0;right:0;bottom:0;padding:3px 5px;font-size:8.5px;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.62));white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .attachDeck .card .cardUp{position:absolute;inset:0;background:rgba(255,255,255,.55);display:flex;align-items:center;justify-content:center;font-size:9px;color:#333}
 .msg.user .attachDeck .card .cardName{color:#fff}
+/* Deck carousel: decks never grow vertically — one row, horizontal scroll with
+   no visible bar, floating circular arrows only when that direction can scroll. */
+.deckWrap{position:relative;max-width:86%;flex:0 0 auto;min-width:0}
+.deckWrap.deckRight{align-self:flex-end}.deckWrap.deckLeft{align-self:flex-start}
+.deckWrap>.attachDeck,.deckWrap>.ogDeck{overflow-x:auto;overflow-y:hidden;flex-wrap:nowrap;max-width:100%;scrollbar-width:none;-ms-overflow-style:none;scroll-behavior:smooth}
+.deckWrap>.attachDeck::-webkit-scrollbar,.deckWrap>.ogDeck::-webkit-scrollbar{display:none}
+.deckNav{position:absolute;top:50%;transform:translateY(-50%);width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,.94);border:1px solid #ddd;box-shadow:0 2px 8px rgba(0,0,0,.16);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;font-size:13px;line-height:1;color:#444;user-select:none}
+.deckNav:hover{background:#fff;border-color:#c6c6c6}
+.deckNav.left{left:-8px}.deckNav.right{right:-8px}
+.deckNav.hiddenNav{display:none}
+/* OG link previews: embed cards for links the agent mentions, row under its message. */
+.ogDeck{display:flex;gap:8px;padding:8px 2px 4px}
+.ogDeck .ogCard{flex:0 0 auto;width:210px;border-radius:12px;background:#f1f1f1;overflow:hidden;cursor:pointer;text-decoration:none;color:inherit;transition:box-shadow .15s ease,transform .15s ease;display:block}
+.ogDeck .ogCard:hover{box-shadow:0 6px 18px rgba(0,0,0,.13);transform:translateY(-2px)}
+.ogDeck .ogImg{width:100%;height:100px;object-fit:cover;display:block;background:#e6e6e6}
+.ogDeck .ogBody{padding:7px 10px 9px}
+.ogDeck .ogTitle{font-size:11.5px;font-weight:600;line-height:1.3;max-height:2.6em;overflow:hidden}
+.ogDeck .ogDesc{font-size:10.5px;color:#777;margin-top:2px;line-height:1.3;max-height:2.6em;overflow:hidden}
+.ogDeck .ogSite{font-size:9px;color:#9a9a9a;margin-top:5px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .msg.desktop{align-self:flex-start;max-width:86%;width:540px;padding:8px;background:#f6f6f6;border-radius:14px;border:0}
 .msg.desktop .desktopTag{font-size:10px;color:#555;margin:0 4px 6px;display:flex;align-items:center;justify-content:space-between}
 .msg.desktop .desktopTag a{color:#9a9a9a;text-decoration:none}
@@ -1566,6 +1644,7 @@ const activeTurns=new Map();
 // can't desync the graph or leave a stale indicator.
 let latestLocalId=null;
 let lastAgentMsgEl=null;
+let lastSharedMsgEl=null;
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
 async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false,boxDone:false,startSeconds:activeSeconds()});document.body.dataset.busy='1';
@@ -1647,6 +1726,23 @@ function renderPending(){
 // Render the fanned deck inside a just-created user message bubble.
 // The deck sits ABOVE its message bubble as its own chat row (right-aligned for
 // the user, left for the agent), not inside the bubble.
+// Wrap a deck in a horizontal carousel: single row, hidden scrollbar, floating
+// circular arrows that only show when scrolling that direction is possible.
+// Decks must never grow the chat vertically no matter how many cards they hold.
+function makeCarousel(deck,side){
+  try{
+    const wrap=document.createElement('div');wrap.className='deckWrap '+(side==='right'?'deckRight':'deckLeft');
+    wrap.appendChild(deck);
+    const mk=(dir,glyph)=>{const b=document.createElement('div');b.className='deckNav '+dir+' hiddenNav';b.textContent=glyph;b.addEventListener('click',e=>{e.stopPropagation();e.preventDefault();try{deck.scrollBy({left:(dir==='left'?-1:1)*Math.max(120,deck.clientWidth*0.8),behavior:'smooth'});}catch(_){deck.scrollLeft+=(dir==='left'?-1:1)*160;}});wrap.appendChild(b);return b;};
+    const L=mk('left','\\u2039'),R=mk('right','\\u203A');
+    const sync=()=>{try{const can=deck.scrollWidth-deck.clientWidth>4;L.classList.toggle('hiddenNav',!can||deck.scrollLeft<=2);R.classList.toggle('hiddenNav',!can||deck.scrollLeft+deck.clientWidth>=deck.scrollWidth-2);}catch(_){}};
+    deck.addEventListener('scroll',sync);
+    wrap.addEventListener('mouseenter',()=>setTimeout(sync,220));
+    if(typeof ResizeObserver!=='undefined'){try{new ResizeObserver(sync).observe(deck);}catch(_){}}
+    setTimeout(sync,60);setTimeout(sync,600);
+    return wrap;
+  }catch(_){return deck;}
+}
 function renderAttachDeck(el,atts,side){
   if(!el||!el.parentNode)return;
   const deck=document.createElement('div');deck.className='attachDeck '+(side==='left'?'deckLeft':'deckRight');
@@ -1660,7 +1756,7 @@ function renderAttachDeck(el,atts,side){
     card.addEventListener('click',()=>{try{window.__optiboxFs.openBytes(a.name,a.bytes);}catch(_){}});
     deck.appendChild(card);
   });
-  el.parentNode.insertBefore(deck,el);
+  el.parentNode.insertBefore(makeCarousel(deck,side),el);
 }
 // Agent "attachments": files the box agent produced this turn, shown as a
 // left-aligned deck BELOW its last bubble. Primary signal is its explicit
@@ -1710,7 +1806,46 @@ async function renderAgentAttachments(el){
     deck.appendChild(card);
   });
   // BELOW the agent's last bubble (user asked for it under the message/tool line).
-  el.parentNode.insertBefore(deck,el.nextSibling);
+  el.parentNode.insertBefore(makeCarousel(deck,'left'),el.nextSibling);
+}
+// OG link previews: when the agent mentions links (markdown or bare URLs) in a
+// finished message, embed preview cards render in a row below it — same slot
+// and carousel behavior as agent file attachments. Card data comes from the
+// host's /api/og proxy (browser can't read cross-origin pages); a link whose
+// page yields no usable OG data still gets a plain domain card.
+const OG_SKIP_RE=/\\.(png|jpe?g|gif|webp|avif|svg|ico|mp4|webm|mov|mp3|wav|ogg|pdf|zip|csv|xlsx?|docx?)([?#]|$)/i;
+function extractLinks(text){
+  const out=[];const seen={};
+  // NOTE: no \\/ escapes outside char classes here — the raw-source compile
+  // check parses this template before unescaping, and \\/ ends a regex literal
+  // there. [/] is equivalent and parses identically in both forms.
+  const push=u=>{u=String(u).replace(/[).,;:!?\\]'"\\u00BB]+$/,'');if(!/^https?:[/][/]/i.test(u)||OG_SKIP_RE.test(u)||u.length>600)return;if(!seen[u]){seen[u]=1;out.push(u);}};
+  let m;const mdre=/\\[[^\\]]*\\]\\((https?:[/][/][^\\s)]+)\\)/g;while((m=mdre.exec(text)))push(m[1]);
+  const bare=/https?:[/][/][^\\s<>"')\\]]+/g;while((m=bare.exec(text)))push(m[0]);
+  return out.slice(0,4);
+}
+async function renderLinkPreviews(el){
+  if(!el||el.__ogDone||!el.parentNode)return;el.__ogDone=true;
+  try{
+    const body=el.querySelector('.body');if(!body)return;
+    const shown=stripEndSentinel(stripFileDecl(body.dataset.raw||''));
+    const links=extractLinks(shown);if(!links.length)return;
+    const metas=await Promise.all(links.map(u=>fetch('/api/og?url='+encodeURIComponent(u)).then(r=>r.json()).catch(()=>null)));
+    if(!el.parentNode)return;
+    const deck=document.createElement('div');deck.className='ogDeck';
+    links.forEach((u,i)=>{
+      const meta=(metas[i]&&metas[i].ok)?metas[i]:null;
+      const a=document.createElement('a');a.className='ogCard';a.href=u;a.target='_blank';a.rel='noopener noreferrer';a.title=u;
+      let host='';try{host=new URL(u).hostname.replace(/^www\\./,'');}catch(_){}
+      if(meta&&meta.image){const img=document.createElement('img');img.className='ogImg';img.src=meta.image;img.loading='lazy';img.addEventListener('error',()=>{try{img.remove();}catch(_){}});a.appendChild(img);}
+      const b=document.createElement('div');b.className='ogBody';
+      const t=document.createElement('div');t.className='ogTitle';t.textContent=(meta&&meta.title)||host||u;b.appendChild(t);
+      if(meta&&meta.description){const d=document.createElement('div');d.className='ogDesc';d.textContent=meta.description;b.appendChild(d);}
+      const s=document.createElement('div');s.className='ogSite';s.textContent=(meta&&meta.site)||host;b.appendChild(s);
+      a.appendChild(b);deck.appendChild(a);
+    });
+    el.parentNode.insertBefore(makeCarousel(deck,'left'),el.nextSibling);
+  }catch(_){}
 }
 function submitComposer(source){
   const text=msgEl.value.trim();
@@ -1897,7 +2032,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   if(isLatest&&(ev.type==='turn.done'||ev.type==='turn.blocked'||ev.type==='error'||ev.type==='stream.end'))clearWorking();
   if(ev.type==='trace'){addMsg('trace','trace · '+(ev.stage||'event'),(ev.message||JSON.stringify(ev))+'\\n',keyFor(ev,localId,'trace')+':'+(ev.stage||Math.random()));if(/bridge/.test(ev.stage||''))setState('Shared bridge active · private Box booting');else if(/backend|submit/.test(ev.stage||''))setState('Request received · shared bridge starting');}
   else if(ev.type==='turn.blocked'){addMsg('assistant','error',(ev.stage?'['+ev.stage+'] ':'')+(ev.message||'private runtime failed'),keyFor(ev,localId,'blocked')+':'+(ev.stage||Math.random()));setState('Private runtime error · see message');}
-  else if(ev.type==='shared.delta'){addMsg('assistant','shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
+  else if(ev.type==='shared.delta'){lastSharedMsgEl=addMsg('assistant','shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
   else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private Box booting in parallel');}
   else if(ev.type==='billing.start'){startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
@@ -1908,7 +2043,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
   else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
-  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);lastAgentMsgEl=null;}
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);renderLinkPreviews(lastAgentMsgEl);lastAgentMsgEl=null;}if(lastSharedMsgEl){renderLinkPreviews(lastSharedMsgEl);lastSharedMsgEl=null;}
     // Per-turn receipt: the economic argument for per-second billing, made
     // legible per artifact — "that PDF cost you $0.0041". Only for turns that
     // actually ran the private machine, and only when a real amount accrued.

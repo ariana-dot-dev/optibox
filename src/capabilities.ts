@@ -482,6 +482,16 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
 
     const started = Date.now();
     let offset = 0;
+    // Consecutive poll failures = the BOX is gone, not a network blip. When a
+    // box is stopped externally mid-run (another process's reaper, a manual
+    // `box stop`, platform eviction), EVERY poll throws — and silently retrying
+    // until the 10-minute safety timeout held the conversation's lock with zero
+    // events the whole time (observed in prod: "working" forever, Files panel
+    // dropped to snapshot, next message queued behind the lock indefinitely).
+    // A handful of consecutive failures fails the run loudly within seconds;
+    // isolated failures still retry as before.
+    const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+    let pollFailures = 0;
     try {
     while (Date.now() - started < timeoutMs) {
       if (aborted) { reportCompletion({ reason: "aborted" }); return; }
@@ -496,7 +506,16 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
         const aliveMatch = polled.match(/\n?__CBA_ALIVE__:(\w+)\s*$/);
         alive = aliveMatch?.[1] ?? "unknown";
         content = polled.replace(/\n?__CBA_ALIVE__:\w+\s*$/g, "");
-      } catch { /* transient command failure; retry next poll */ }
+        pollFailures = 0;
+      } catch (e) {
+        pollFailures++;
+        if (pollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+          yield noteChunk({ text: `\n[machine became unreachable mid-run (${pollFailures} consecutive poll failures): ${e instanceof Error ? e.message : String(e)}]`, messageId: "stdout-0", messageIndex: 0 });
+          reportCompletion({ reason: "process-exited" });
+          return;
+        }
+        continue; // transient failure; retry next poll
+      }
       const exitMatch = content.match(/__CBA_EXIT__:(\d+)\s*$/);
       const visible = content.replace(/\n?__CBA_EXIT__:\d+\s*$/g, "");
       rawTail = visible.slice(-600);

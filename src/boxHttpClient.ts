@@ -105,6 +105,10 @@ export class BoxHttpClient implements BoxClient {
     return json.box ?? { ok: json.ok };
   }
 
+  async deleteBox(boxId: string): Promise<void> {
+    await this.request(`/boxes/${encodeURIComponent(boxId)}`, { method: "DELETE" });
+  }
+
   async fork(boxId: string): Promise<BoxInfo> {
     const json = await this.request<{ box?: BoxInfo; id?: string }>(`/boxes/${encodeURIComponent(boxId)}/fork`, { method: "POST", body: JSON.stringify({}) });
     const box = json.box ?? (json.id ? await this.get(json.id) : undefined);

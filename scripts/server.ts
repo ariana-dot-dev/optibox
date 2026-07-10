@@ -1064,6 +1064,21 @@ const server = http.createServer(async (req, res) => {
     // Stop hosting: close the exposed port (ufw) + kill the host process on the
     // box and release the indefinite hosting hold, so the machine can idle-stop
     // again. Triggered by the header "stop hosting" button.
+    // Full user reset: delete the user's boxes + snapshots and every row about
+    // them (billing ledger, transcripts, turns, holds, hosting, conversations).
+    if (req.method === "POST" && url.pathname === "/api/reset") {
+      const body = await readBody(req);
+      try {
+        const credentials = credentialsFromBody(body);
+        const result = await engineFor(credentials).resetUser(String(body.userId ?? "user-a"));
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify(result));
+      } catch (e) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ ok: false, message: e instanceof Error ? e.message : String(e) }));
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/api/host/stop") {
       const body = await readBody(req);
       try {

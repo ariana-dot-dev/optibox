@@ -73,6 +73,8 @@ export interface BoxClient {
   update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo>;
   stop(boxId: string): Promise<BoxInfo | { ok: boolean }>;
   resume(boxId: string): Promise<BoxInfo | { ok: boolean }>;
+  /** Permanently delete a box record (DELETE /boxes/{id}). Optional: legacy clients may lack it. */
+  deleteBox?(boxId: string): Promise<void>;
   /** Fork a box from its latest snapshot (POST /boxes/{id}/fork). Optional: legacy clients may lack it. */
   fork?(boxId: string): Promise<BoxInfo>;
   command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number; env?: Record<string, string> }): Promise<CommandResult>;

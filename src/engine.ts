@@ -324,6 +324,29 @@ export class Engine {
     yield { type: "lifecycle", boxId: row.id, state: "archived", note: "archived — disk snapshot kept, resumes with no cold start", turnId };
   }
 
+  /**
+   * Full user reset: stop+delete every box (and its snapshots) the user ever
+   * had under this credential set, and erase all rows — billing ledger,
+   * transcripts, turns, holds, hosting, conversations. Under the user lock so
+   * it cannot race a turn's provisioning.
+   */
+  async resetUser(userId: string): Promise<{ ok: true; boxesDeleted: number }> {
+    const key = this.userKey(userId);
+    return this.db.withLock("user", key, async () => {
+      const rows = await this.db.q<{ id: string }>(`select id from boxes where user_key=$1`, [key]);
+      for (const r of rows) {
+        await this.endBilling(r.id).catch(() => undefined);
+        await this.box.stop(r.id).catch(() => undefined);
+        await this.box.deleteBox?.(r.id)?.catch(() => undefined);
+      }
+      for (const table of ["hosting", "holds", "turns", "transcripts", "conversations", "boxes"]) {
+        await this.db.q(`delete from ${table} where user_key=$1`, [key]);
+      }
+      await this.db.q(`delete from users where key=$1`, [key]); // users keys on `key`, not user_key
+      return { ok: true as const, boxesDeleted: rows.length };
+    });
+  }
+
   // ---------------------------------------------------------------- sweeper (rule 4)
 
   /**

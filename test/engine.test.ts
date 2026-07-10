@@ -311,6 +311,24 @@ test("manual stopUserBox ends billing at stop request and archives", async () =>
   engine.dispose();
 });
 
+test("resetUser deletes the box and every row about the user", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box, harnessOf("h"));
+  const events = await collect(engine, "ureset", "creset", "make some state");
+  const boxId = events.find((e) => e.type === "turn.done")?.boxId;
+  const result = await engine.resetUser("ureset");
+  assert.equal(result.ok, true);
+  assert.equal(result.boxesDeleted, 1);
+  assert.equal((await box.get(boxId)).state, "archived", "box stopped");
+  for (const [table, col] of [["boxes", "user_key"], ["transcripts", "user_key"], ["turns", "user_key"], ["conversations", "user_key"], ["users", "key"]] as const) {
+    const rows = await db.q(`select 1 from ${table} where ${col} like 'ureset-%'`);
+    assert.equal(rows.length, 0, `${table} wiped`);
+  }
+  const rt = await engine.userRuntimeStatus("ureset");
+  assert.equal(rt.billedSecondsTotal, 0, "billing ledger gone");
+  engine.dispose();
+});
+
 test("billing total is a pure projection: no double count between stop paths", async () => {
   const box = new FakeBoxClient();
   const engine = makeEngine(box, harnessOf("h"));

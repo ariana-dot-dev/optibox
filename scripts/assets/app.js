@@ -826,3 +826,29 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};
 load();
+
+// Full user reset (bottom-right): deletes the machine + snapshots and every
+// server-side record of this user (billing total, transcripts, holds,
+// hosting), then starts a clean conversation locally.
+(function(){
+  try{
+    var b=document.createElement('button');
+    b.type='button';b.className='resetBtn';b.textContent='reset my data';
+    b.addEventListener('click',async function(){
+      if(!window.confirm('Delete your machine, its snapshots, and all messages/billing history?'))return;
+      b.disabled=true;b.textContent='resetting…';
+      try{
+        var r=await(await fetch('/api/reset',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
+        if(!r||r.ok!==true)throw new Error((r&&r.message)||'reset failed');
+        selectedConversation='conv-'+Math.random().toString(36).slice(2,10);
+        var c=$('chat');if(c)c.innerHTML='<div class="empty" id="empty">Send a message to start the demo.</div>';
+        totalSeconds=0;stopBilling(null,true);renderTotals();clearAutoStopTimer('idle');
+        pendingFiles=[];renderPending();syncHostingBar([]);
+        try{window.__optiboxFs.poke();}catch(_){}
+        setState('fresh start · machine deleted, history erased');
+      }catch(e){addMsg('assistant','error','Reset failed: '+String(e&&e.message||e));}
+      finally{b.disabled=false;b.textContent='reset my data';}
+    });
+    document.body.appendChild(b);
+  }catch(_){}
+})();

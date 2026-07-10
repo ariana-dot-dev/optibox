@@ -6,7 +6,7 @@
   "description": "Prototype orchestration library for consumer agents on top of Box: shared prewarm, restricted safe mode, per-user Box handoff, and lifecycle control.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/engine.test.js dist/test/client.test.js",
+    "test": "npm run build && node --env-file=.env --test dist/test/engine.test.js dist/test/client.test.js",
     "proof:interactive": "npm run build && node --env-file=.env dist/scripts/server.js",
     "start": "node --env-file=.env dist/scripts/server.js"
   },

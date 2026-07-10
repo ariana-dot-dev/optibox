@@ -72,13 +72,8 @@ class FakeElement {
   }
 }
 
-function extractClientScript(source: string) {
-  const match = source.match(/return `([\s\S]*)`;\n}\s*$/);
-  assert(match, "interactive demo html() template should be extractable");
-  const html = Function(`return \`${match[1]}\`;`)() as string;
-  const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
-  assert(script, "interactive demo should include inline client script");
-  return script;
+function extractClientScript(_source: string) {
+  return readFileSync("scripts/assets/app.js", "utf8");
 }
 
 function makeReadableSse(events: unknown[]) {
@@ -99,7 +94,7 @@ function makeReadableSse(events: unknown[]) {
 }
 
 test("interactive demo client sends exactly one /api/send after page load", async () => {
-  const script = extractClientScript(readFileSync("scripts/interactive-proof-server.ts", "utf8"));
+  const script = extractClientScript("");
   const elements = new Map<string, FakeElement>();
   const getElement = (id: string) => {
     let el = elements.get(id);
@@ -206,7 +201,7 @@ test("interactive demo client sends exactly one /api/send after page load", asyn
 });
 
 test("interactive demo client renders distinct Box assistant messages by native message id", async () => {
-  const script = extractClientScript(readFileSync("scripts/interactive-proof-server.ts", "utf8"));
+  const script = extractClientScript("");
   const elements = new Map<string, FakeElement>();
   const getElement = (id: string) => {
     let el = elements.get(id);
@@ -279,7 +274,7 @@ test("interactive demo client renders distinct Box assistant messages by native 
 
 
 test("interactive demo client groups consecutive tool calls into minimal chains", async () => {
-  const script = extractClientScript(readFileSync("scripts/interactive-proof-server.ts", "utf8"));
+  const script = extractClientScript("");
   const elements = new Map<string, FakeElement>();
   const getElement = (id: string) => {
     let el = elements.get(id);

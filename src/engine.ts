@@ -132,16 +132,25 @@ export class Engine {
     );
   }
 
-  /** THE one way billing ends: atomically folds elapsed into the user total. */
+  /** THE one way billing ends: atomically folds elapsed into the user total.
+   * NOTE the `old` subquery: RETURNING on an UPDATE sees the NEW row, so
+   * referencing billing_since directly after nulling it yields NULL elapsed
+   * (and a NULL ledger — caught by the suite). The pre-image must be selected
+   * FOR UPDATE first. */
   private async endBilling(boxId: string): Promise<number> {
     const row = await this.db.one<{ elapsed: number }>(
-      `with ended as (
-         update boxes set billing_since=null, billing_reason=null
-         where id=$1 and billing_since is not null
-         returning user_key, extract(epoch from now()-billing_since) as elapsed
+      `with old as (
+         select id, user_key, billing_since from boxes
+          where id=$1 and billing_since is not null
+          for update
+       ),
+       ended as (
+         update boxes b set billing_since=null, billing_reason=null
+           from old where b.id = old.id
+         returning old.user_key, extract(epoch from now() - old.billing_since) as elapsed
        )
        update users u set billed_seconds = u.billed_seconds + ended.elapsed
-       from ended where u.key = ended.user_key
+         from ended where u.key = ended.user_key
        returning ended.elapsed`,
       [boxId],
     );

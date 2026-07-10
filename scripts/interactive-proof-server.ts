@@ -1198,6 +1198,16 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .deckWrap{position:relative;max-width:86%;flex:0 0 auto;min-width:0}
 .deckWrap.deckRight{align-self:flex-end}.deckWrap.deckLeft{align-self:flex-start}
 .deckWrap>.attachDeck,.deckWrap>.ogDeck{overflow-x:auto;overflow-y:hidden;flex-wrap:nowrap;max-width:100%;scrollbar-width:none;-ms-overflow-style:none;scroll-behavior:smooth}
+/* Shadow room: an overflow scroller clips box-shadows at its padding-box edge,
+   which amputated every deck card's shadow (worst on hover: 22px blur + 8px
+   lift against the decks' own 2-4px padding). Pad the scrollport enough to
+   contain the largest shadow and pull it back with equal-and-opposite negative
+   margins (new pad minus each deck's original 10/2/4 and 8/2/4 padding), so
+   card positions and the layout footprint stay pixel-identical — only the
+   clip box grows. max-width grows by the side margins so 100% still means
+   "the wrap's width" for the visible content. */
+.deckWrap>.attachDeck{padding:24px 24px 28px;margin:-14px -22px -24px;max-width:calc(100% + 44px)}
+.deckWrap>.ogDeck{padding:24px 24px 28px;margin:-16px -22px -24px;max-width:calc(100% + 44px)}
 .deckWrap>.attachDeck::-webkit-scrollbar,.deckWrap>.ogDeck::-webkit-scrollbar{display:none}
 .deckNav{position:absolute;top:50%;transform:translateY(-50%);width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,.94);border:1px solid #ddd;box-shadow:0 2px 8px rgba(0,0,0,.16);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;font-size:13px;line-height:1;color:#444;user-select:none}
 .deckNav:hover{background:#fff;border-color:#c6c6c6}
@@ -1288,6 +1298,27 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
    drag-reveal-commit and momentum are the browser's; mobile.js only parks the
    start page on Chat and lights the position dots. */
 .mobileDots{display:none}
+/* NOTE: everything below until the @media close is MOBILE-ONLY. App-wide rules
+   (like the hosting bar and warming pulse) must live ABOVE this line — CSS
+   anchored inside the media block silently never applies on desktop. */
+@keyframes warmPulse{0%,100%{opacity:1}50%{opacity:.4}}
+.state.warming{animation:warmPulse 1.1s ease-in-out infinite;color:#b45309}
+/* Receipt reads exactly like a tool-call line: same size, color, placement. */
+.receipt{align-self:flex-start;max-width:92%;font-size:13px;color:#555;margin:0;padding:0}
+/* Hosting: a quiet rounded card in the header's design language (same fill and
+   radius as the counters). Dot · URL link · one small stop button. */
+.hostingBar{position:relative;display:flex;align-items:center;gap:9px;margin:10px 14px 0;padding:8px 12px;background:#f0faf3;border-radius:10px;font-size:12.5px;color:#1d5c33}
+.hbDot{width:8px;height:8px;border-radius:50%;background:#17b45c;flex:0 0 auto;animation:warmPulse 1.6s ease-in-out infinite}
+.hbText{white-space:nowrap;color:#3c7a53;font-size:12px}
+.hbLink{color:#14532d;font-weight:500;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+.hbLink:hover{text-decoration:underline}
+.hostingBar .hbStop{margin-left:auto;flex:0 0 auto;min-height:26px;padding:0 12px;font-size:11.5px;font-weight:400;background:transparent;color:#9a3b41;border:1px solid rgba(154,59,65,.28);border-radius:999px;cursor:pointer;transition:background .15s ease,border-color .15s ease}
+.hostingBar .hbStop:hover{border-color:#c02b34;background:#fff}
+.hbMenu{position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:9;background:#fff;border:1px solid #e4efe8;border-radius:10px;box-shadow:0 8px 22px rgba(0,0,0,.10);padding:4px 0}
+.hbRow{display:flex;align-items:center;gap:10px;padding:7px 12px;font-size:12.5px}
+.hbRow a{color:#14532d;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}
+.hbRow a:hover{text-decoration:underline}
+.hbRow .hbStop{margin-left:auto;min-height:22px;padding:0 10px;font-size:11px}
 @media(max-width:900px){
 html{zoom:1;--z:1}
 body{overflow:hidden;overscroll-behavior:none}
@@ -1303,23 +1334,6 @@ body{overflow:hidden;overscroll-behavior:none}
 .top{padding:calc(10px + env(safe-area-inset-top)) 12px 10px;gap:9px}
 .counters{gap:6px}.counter{padding:8px 9px;border-radius:9px}
 .label{font-size:10.5px}.value{font-size:16px}.state{font-size:11px}
-@keyframes warmPulse{0%,100%{opacity:1}50%{opacity:.4}}
-/* Hosting bar: its own full-width strip under the header — one plain sentence,
-   the live URL, and ONE real button. Nothing shares its row, nothing overlaps. */
-.hostingBar{display:flex;align-items:center;gap:9px;padding:8px 14px;background:#f0faf3;border-bottom:1px solid #dcefe2;font-size:12.5px;color:#1d5c33}
-.hbDot{width:8px;height:8px;border-radius:50%;background:#17b45c;flex:0 0 auto;animation:warmPulse 1.6s ease-in-out infinite}
-.hbText{white-space:nowrap}
-.hbLink{color:#1d5c33;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
-.hostingBar .hbStop{margin-left:auto;flex:0 0 auto;min-height:28px;padding:0 13px;font-size:12px;font-weight:400;background:#fff;color:#c02b34;border:1px solid #e3cdcf;border-radius:8px;cursor:pointer}
-.hostingBar .hbStop:hover{border-color:#c02b34;background:#fff5f5}
-.hostingBar{position:relative}
-.hbMenu{position:absolute;top:100%;left:14px;right:14px;z-index:9;background:#fff;border:1px solid #dcefe2;border-top:0;border-radius:0 0 10px 10px;box-shadow:0 8px 22px rgba(0,0,0,.10);padding:4px 0}
-.hbRow{display:flex;align-items:center;gap:10px;padding:7px 12px;font-size:12.5px}
-.hbRow a{color:#1d5c33;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto;min-width:0}
-.hbRow .hbStop{margin-left:auto;min-height:24px;padding:0 10px;font-size:11px}
-.state.warming{animation:warmPulse 1.1s ease-in-out infinite;color:#b45309}
-/* Receipt reads exactly like a tool-call line: same size, color, placement. */
-.receipt{align-self:flex-start;max-width:92%;font-size:13px;color:#555;margin:0;padding:0}
 .chat{padding:14px 12px 16px;gap:9px}
 .msg{max-width:88%;font-size:14px;padding:9px 11px}
 .msg.trace{font-size:11.5px}

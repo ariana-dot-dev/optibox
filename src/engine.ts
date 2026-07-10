@@ -840,9 +840,14 @@ export class Engine {
 }
 
 function hostingKillCommand(port: number): string {
+  // `host hide <port>` is the CLI's authoritative takedown: it removes the port
+  // from `host list` (so the ground-truth probe immediately sees it gone) and
+  // drops the public exposure. ufw belt-and-suspenders in case a raw rule
+  // lingers. The old `pkill -f 'host <port>'` is deliberately gone — it matched
+  // the same phantom the probe did (any process whose argv contained the text).
   return (
+    `host hide ${port} 2>/dev/null; ` +
     `sudo -n ufw delete allow ${port}/tcp 2>/dev/null; sudo -n ufw delete allow ${port} 2>/dev/null; ` +
-    `sudo -n ufw deny ${port}/tcp 2>/dev/null; ` +
-    `pkill -f 'host[[:space:]]+${port}' 2>/dev/null; true`
+    `sudo -n ufw deny ${port}/tcp 2>/dev/null; true`
   );
 }

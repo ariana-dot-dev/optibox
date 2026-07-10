@@ -267,7 +267,7 @@ test("hosting: tool command detection writes a row with provenance; stop intent 
   await engine.reconcileObservedHosting("uh", boxId, [{ port: 8080, mode: "public" }]);
   rt = await engine.userRuntimeStatus("uh");
   assert.equal(rt.hosting.length, 0, "stopped hosting never resurrects from observation");
-  assert.ok(box.commands.some((c) => c.includes("pkill -f 'host[[:space:]]+8080'")), "kill enforced on the observed box");
+  assert.ok(box.commands.some((c) => c.includes("host hide 8080")), "authoritative takedown enforced on the observed box");
   engine.dispose();
 });
 

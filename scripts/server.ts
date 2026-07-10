@@ -496,22 +496,34 @@ async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<{ entri
       `-o -name .cache -o -name .cargo -o -name .rustup -o -name .nvm ` +
       `-o -name .vscode-server -o -name snap -o -name .bun -o -name .pnpm-store \\) -prune ` +
       `-o -printf '%y\\t%s\\t%T@\\t%P\\n' 2>/dev/null | head -c 8000000; ` +
-      // GROUND-TRUTH hosting probe riding the same round trip: a live `host`
-      // process IS hosting; its absence IS not-hosting. Command-sniffing alone
-      // proved fragile (in-memory state dies on server restart and can't see a
-      // host started outside a turn). This line is parsed out of the listing.
-      `printf '__CBA_HOSTING__:%s\\n' "$(pgrep -af 'host [0-9]' 2>/dev/null | head -8 | tr '\\n' ';')"`,
+      // GROUND-TRUTH hosting probe riding the same round trip. `host list` is
+      // the box's own authoritative registry of publicly-exposed ports — the
+      // real source of truth in BOTH directions (a port present IS hosting; its
+      // absence IS not-hosting). This REPLACES the old `pgrep -af 'host [0-9]'`
+      // probe, which matched any process whose command line merely CONTAINED
+      // that string — including the pi harness itself, because its argv embeds
+      // the system prompt and the prompt contains the literal text "host 8080
+      // --public". That produced a phantom hosting banner during every turn.
+      // We prefix each data row (skipping the header) so it's parsed below.
+      `host list 2>/dev/null | tail -n +2 | sed 's/^/__CBA_HOSTING__:/'`,
     timeoutMs: 30_000,
   });
   const entries: Array<{ path: string; kind: string; size?: number; mtime?: number }> = [];
   const hosting: Array<{ port: number; mode: "public" | "private" }> = [];
+  const seenPorts = new Set<number>();
+  // noVNC's websocket bridge: the desktop "switch to VNC" feature exposes it via
+  // `host 6080`, so it shows up in `host list` — but it's OUR infrastructure,
+  // not something the user asked to host. Never surface it as user hosting.
+  const INFRA_PORTS = new Set([6080]);
   for (const line of out.stdout.split("\n")) {
     if (line.startsWith("__CBA_HOSTING__:")) {
-      const seenPorts = new Set<number>();
-      for (const m of line.matchAll(/host\s+(\d{2,5})(?:\s+\S+)*?\s+--(public|private)\b/g)) {
-        const port = Number(m[1]);
-        if (!seenPorts.has(port)) { seenPorts.add(port); hosting.push({ port, mode: m[2] as "public" | "private" }); }
-      }
+      const row = line.slice("__CBA_HOSTING__:".length).trim();
+      const port = Number(row.split(/\s+/)[0]);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) continue; // header/blank/garbage row
+      if (INFRA_PORTS.has(port) || seenPorts.has(port)) continue;
+      seenPorts.add(port);
+      // `host list` tags token-gated ports "(gated)"; an ungated URL is --public.
+      hosting.push({ port, mode: row.includes("(gated)") ? "private" : "public" });
       continue;
     }
     const [y, size, mtime, ...rest] = line.split("\t");

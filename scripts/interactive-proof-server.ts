@@ -1121,6 +1121,9 @@ body{overflow:hidden;overscroll-behavior:none}
 .top{padding:calc(10px + env(safe-area-inset-top)) 12px 10px;gap:9px}
 .counters{gap:6px}.counter{padding:8px 9px;border-radius:9px}
 .label{font-size:10.5px}.value{font-size:16px}.state{font-size:11px}
+@keyframes warmPulse{0%,100%{opacity:1}50%{opacity:.4}}
+.state.warming{animation:warmPulse 1.1s ease-in-out infinite;color:#b45309}
+.receipt{font-size:11px;color:#8a8a8a;margin:2px 0 10px;padding:0 6px;align-self:flex-start}
 .chat{padding:14px 12px 16px;gap:9px}
 .msg{max-width:88%;font-size:14px;padding:9px 11px}
 .msg.trace{font-size:11.5px}
@@ -1487,8 +1490,8 @@ function toggleToolChain(chain){chain.open=!chain.open;chain.el.classList.toggle
 function renderToolChain(chain){const cc=$('chat');const stick=chatStick(cc);const count=chain.calls.length;chain.label.textContent=toolLabel(count);if(count!==chain.lastCount){chain.label.classList.remove('bump');void chain.label.offsetWidth;chain.label.classList.add('bump');setTimeout(()=>chain.label.classList.remove('bump'),180);chain.lastCount=count;}const running=chain.calls.some(c=>!isToolFinished(c));chain.el.classList.toggle('running',running);chain.details.innerHTML=chain.calls.map((call,idx)=>{const status=call.state==='error'?'error':(isToolFinished(call)?'finished':'running');const bits=[];if(call.command)bits.push('command: '+compactToolText(call.command,300));if(call.description)bits.push('description: '+compactToolText(call.description,300));if(call.stderr)bits.push('stderr: '+compactToolText(call.stderr,800));const out=call.stdout?'<pre class="toolCallOutput">'+esc(compactToolText(call.stdout,2000))+'</pre>':'';return '<div class="toolCallDetail"><div class="toolCallHead">'+(idx+1)+'. '+esc(toolTitle(call))+' · '+esc(status)+'</div>'+(bits.length?'<div class="toolCallMeta">'+esc(bits.join('\\n'))+'</div>':'')+out+'</div>';}).join('');if(stick)cc.scrollTop=cc.scrollHeight;}
 function addToolEvent(ev,localId){let chain=currentToolChain;if(ev.phase==='tool_result'){const running=findRunningTool();if(running){Object.assign(running,{state:toolStateFromEvent(ev),stdout:ev.stdout||running.stdout||'',stderr:ev.stderr||running.stderr||'',isError:Boolean(ev.isError),resultSeen:true});const owner=toolChains.find(ch=>ch.calls.includes(running));if(owner)renderToolChain(owner);return owner&&owner.el;}}
 chain=ensureToolChain(localId);const call={id:'tool-'+(++toolSeq),toolName:ev.toolName||'tool',command:ev.command||'',description:ev.description||'',stdout:ev.stdout||'',stderr:ev.stderr||'',isError:Boolean(ev.isError),state:toolStateFromEvent(ev),resultSeen:ev.phase==='tool_result'};chain.calls.push(call);renderToolChain(chain);return chain.el;}
-function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date.now();if(!timer)timer=setInterval(renderTotals,100);}document.body.dataset.billing='1';setState('private machine running · tools active · billing live');renderTotals();}
-function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;}if(timer){clearInterval(timer);timer=null;}delete document.body.dataset.billing;clearAutoStopTimer('stopped');setState('private machine stopped · billing paused');renderTotals();}
+function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date.now();if(!timer)timer=setInterval(renderTotals,100);}document.body.dataset.billing='1';setWarmingPulse(false);setState('private machine running · tools active · billing live');renderTotals();}
+function stopBilling(elapsed){if(billing){totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;}if(timer){clearInterval(timer);timer=null;}delete document.body.dataset.billing;setWarmingPulse(false);clearAutoStopTimer('stopped');setState('private machine stopped · billing paused');renderTotals();}
 // Reconcile ALL machine counters from the polled runtime snapshot (rides every
 // fs tree poll). This is the ground truth: a machine woken by typing or an
 // upload has no SSE stream, so without this the counter/cost/auto-stop UI
@@ -1522,7 +1525,7 @@ let latestLocalId=null;
 let lastAgentMsgEl=null;
 function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false,boxDone:false});document.body.dataset.busy='1';
+async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false,boxDone:false,startSeconds:activeSeconds()});document.body.dataset.busy='1';
   const userEl=addMsg('user','',msg,'user:'+localId);
   let atts=[];
   if(files&&files.length){
@@ -1699,9 +1702,14 @@ msgEl.addEventListener('input',()=>{updateComposerMode();notifyComposing();});
 // parked machine so it's warm by the time the message is sent. Stop typing
 // and the hold expires in ~15s; the countdown resumes on its own.
 let lastComposePing=0;
+// Make the wake-on-type VISIBLE: the machine wakes because the user typed, so
+// the status line should say so the instant the first keystroke lands, pulsing
+// until billing confirms the machine is actually up (startBilling clears it).
+function setWarmingPulse(on){const st=$('machineState');if(st&&st.classList){if(on)st.classList.add('warming');else st.classList.remove('warming');}}
 function notifyComposing(){
   const composing=((msgEl&&msgEl.value||'').trim().length>0)||pendingFiles.length>0;
   if(!composing)return;
+  if(!billing){setState('private machine warming · woken by your typing');setWarmingPulse(true);}
   const now=Date.now();
   if(now-lastComposePing<4000)return;
   lastComposePing=now;
@@ -1857,7 +1865,11 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
   else if(ev.type==='billing.stop'){stopBilling(ev.elapsedSeconds);endDesktopWidget();}
   else if(ev.type==='autostop.timer'){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('0s');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));setState(describeAutoStop(ev));}
-  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);lastAgentMsgEl=null;}}
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);lastAgentMsgEl=null;}
+    // Per-turn receipt: the economic argument for per-second billing, made
+    // legible per artifact — "that PDF cost you $0.0041". Only for turns that
+    // actually ran the private machine, and only when a real amount accrued.
+    if(td&&td.boxStarted&&!td.receiptShown){const used=activeSeconds()-(td.startSeconds||0);if(used>=0.1&&billRate>0){td.receiptShown=true;const r=document.createElement('div');r.className='receipt';r.textContent='⚡ this turn: '+used.toFixed(1)+'s machine time · '+fmtUsd(used*billRate);const c=$('chat');const stick=chatStick(c);c.appendChild(r);if(stick)c.scrollTop=c.scrollHeight;}}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};

@@ -1,0 +1,85 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<title>Box chat demo</title>
+<link rel="stylesheet" href="/static/app.css"/><link rel="stylesheet" href="/static/fs-panel.css"/>
+<script type="module" src="/static/fs-panel.js"></script>
+<script defer src="/static/mobile.js"></script></head><body class="hide-traces"><div class="shell">
+<aside class="fsPanel" id="fsPanel" aria-label="files">
+  <h2>Files <span class="fsStatus" id="fsStatus">…</span></h2>
+  <div class="fsTreeMount" id="fsTree"></div>
+  <label class="fsHidden"><input type="checkbox" id="fsShowHidden"/> show hidden files</label>
+</aside>
+<main class="app">
+  <header class="top" aria-label="machine summary">
+    <section class="counters" aria-label="totals">
+      <div class="counter"><span class="label">total spent</span><span class="value" id="totalCost">$0.000000</span></div>
+      <div class="counter"><span class="label">machine time</span><span class="value" id="totalSeconds">0.0s</span></div>
+      <div class="counter" id="autoStopCell"><span class="label">auto-stop</span><span class="value" id="autoStopTimer">idle</span></div>
+    </section>
+    <div class="state" id="machineState">shared bridge ready · private machine stopped</div>
+  </header>
+  <div class="hostingBar" id="hostingBar" style="display:none">
+    <span class="hbDot"></span>
+    <span class="hbText" id="hbText">hosting</span>
+    <a class="hbLink" id="hbLink" target="_blank" rel="noopener noreferrer" style="display:none"></a>
+    <button type="button" class="hbStop" id="hbStop" title="stop hosting: close the port and let the machine park">stop hosting</button>
+  </div>
+  <section class="chat" id="chat" aria-live="polite"><div class="empty" id="empty">Send a message to start the demo.</div></section>
+  <form class="composer" id="composer">
+    <div class="pendingAttach" id="pendingAttach"></div>
+    <textarea id="msg" placeholder="Message…" aria-label="Message"></textarea>
+    <button id="attach" type="button" aria-label="Attach files" title="Attach files"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M209.66,122.34a8,8,0,0,1,0,11.32l-82.05,82a56,56,0,0,1-79.2-79.21L147.67,35.73a40,40,0,1,1,56.61,56.55L105,193A24,24,0,1,1,71,159L154.3,74.38A8,8,0,1,1,165.7,85.6L82.39,170.31a8,8,0,1,0,11.27,11.36L192.93,81A24,24,0,1,0,159,47L59.76,147.68a40,40,0,1,0,56.53,56.62l82.06-82A8,8,0,0,1,209.66,122.34Z"/></svg></button>
+    <input id="fileInput" type="file" multiple hidden aria-hidden="true"/>
+    <button id="mic" type="button" aria-label="Record voice message" title="Record voice message"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M80,128V64a48,48,0,0,1,96,0v64a48,48,0,0,1-96,0Zm128,0a8,8,0,0,0-16,0,64,64,0,0,1-128,0,8,8,0,0,0-16,0,80.11,80.11,0,0,0,72,79.6V240a8,8,0,0,0,16,0V207.6A80.11,80.11,0,0,0,208,128Z"/></svg></button>
+    <button id="send" type="submit" aria-label="Send" title="Send"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68ZM157.83,231.85l-.05.14,0-.07-40.06-82.3,48-48a8,8,0,0,0-11.31-11.31l-48,48L24.08,98.25l-.07,0,.14,0L216,40Z"/></svg></button>
+    <div class="recBar" id="recBar" aria-hidden="true">
+      <button type="button" class="recBtn recTrash" id="recTrash" aria-label="Discard recording" title="Discard"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M216,48H176V40a24,24,0,0,0-24-24H104A24,24,0,0,0,80,40v8H40a8,8,0,0,0,0,16h8V208a16,16,0,0,0,16,16H192a16,16,0,0,0,16-16V64h8a8,8,0,0,0,0-16ZM112,168a8,8,0,0,1-16,0V104a8,8,0,0,1,16,0Zm48,0a8,8,0,0,1-16,0V104a8,8,0,0,1,16,0Zm0-120H96V40a8,8,0,0,1,8-8h48a8,8,0,0,1,8,8Z"/></svg></button>
+      <span class="recDot" id="recDot"></span>
+      <canvas class="recWave" id="recWave"></canvas>
+      <button type="button" class="recDevice" id="recDevice" aria-label="Choose microphone" title="Choose microphone"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z"/></svg></button>
+      <span class="recTime" id="recTime">0:00</span>
+      <button type="button" class="recBtn recPause" id="recPause" aria-label="Pause recording" title="Pause"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M216,48V208a16,16,0,0,1-16,16H160a16,16,0,0,1-16-16V48a16,16,0,0,1,16-16h40A16,16,0,0,1,216,48ZM96,32H56A16,16,0,0,0,40,48V208a16,16,0,0,0,16,16H96a16,16,0,0,0,16-16V48A16,16,0,0,0,96,32Z"/></svg></button>
+      <button type="button" class="recBtn recSend" id="recSend" aria-label="Send voice message" title="Send"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68Z"/></svg></button>
+    </div>
+    <div class="recDeviceMenu" id="recDeviceMenu" aria-label="Microphone devices"></div>
+  </form>
+  <footer class="composerBar" aria-label="controls">
+    <button id="stopBox" type="button">Pause Box now</button>
+    <button id="downloadDiagnostics" type="button">Download diagnostics</button>
+    <label class="traceToggle"><input id="showTraces" type="checkbox"/> Show traces</label>
+    <button id="settingsOpen" class="iconButton" type="button" aria-label="Settings" title="Settings"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M237.94,107.21a8,8,0,0,0-3.89-5.4l-29.83-17-.12-33.62a8,8,0,0,0-2.83-6.08,111.91,111.91,0,0,0-36.72-20.67,8,8,0,0,0-6.46.59L128,41.85,97.88,25a8,8,0,0,0-6.47-.6A111.92,111.92,0,0,0,54.73,45.15a8,8,0,0,0-2.83,6.07l-.15,33.65-29.83,17a8,8,0,0,0-3.89,5.4,106.47,106.47,0,0,0,0,41.56,8,8,0,0,0,3.89,5.4l29.83,17,.12,33.63a8,8,0,0,0,2.83,6.08,111.91,111.91,0,0,0,36.72,20.67,8,8,0,0,0,6.46-.59L128,214.15,158.12,231a7.91,7.91,0,0,0,3.9,1,8.09,8.09,0,0,0,2.57-.42,112.1,112.1,0,0,0,36.68-20.73,8,8,0,0,0,2.83-6.07l.15-33.65,29.83-17a8,8,0,0,0,3.89-5.4A106.47,106.47,0,0,0,237.94,107.21ZM128,168a40,40,0,1,1,40-40A40,40,0,0,1,128,168Z"/></svg></button>
+  </footer>
+</main>
+<aside class="schematic" id="schematic" data-route="idle" aria-label="backend flow diagram">
+  <h2>Backend</h2>
+  <div class="route" id="routeFlow">
+    <div class="packet" id="packet" data-kind="mail" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M224,48H32a8,8,0,0,0-8,8V192a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A8,8,0,0,0,224,48ZM203.43,64,128,133.15,52.57,64ZM216,192H40V74.19l82.59,75.71a8,8,0,0,0,10.82,0L216,74.19V192Z"/></svg></div>
+    <div class="node user-node" data-node="you"><span class="nodeTitle">You</span><span class="nodeSub">the message, and the answer that comes back</span></div>
+    <div class="path to-shared"><span class="arrow"></span><span class="pathLabel">fast path</span></div>
+    <div class="node shared-node" data-node="shared"><span class="nodeTitle">Shared infra</span><span class="nodeSub">instant answer, or a holding line while tools warm up</span></div>
+    <div class="path to-private"><span class="arrow"></span><span class="pathLabel">handoff</span></div>
+    <div class="node private-node" data-node="private"><span class="nodeTitle">User machine</span><span class="nodeSub">private Box · tools + billing</span><span class="toolsLine">using tools</span></div>
+  </div>
+  <div class="routeCaption" id="routeStatus" aria-live="polite"></div>
+</aside>
+</div>
+<div class="settingsBackdrop" id="settingsBackdrop" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+  <section class="settingsDialog">
+    <div class="settingsHead">
+      <div><h2 id="settingsTitle">Demo settings</h2><p>Choose harness/model and bring your own keys for public/dev previews.</p></div>
+      <button id="settingsClose" class="iconButton" type="button" aria-label="Close settings"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></svg></button>
+    </div>
+    <div class="settingsGrid">
+      <label>Harness<select id="settingsHarness"></select></label>
+      <label>Model<select id="settingsModel"></select></label>
+    </div>
+    <label>BOX_API_KEY<input id="settingsBoxKey" type="password" autocomplete="off" placeholder="bx_…"/></label>
+    <label>ANTHROPIC_API_KEY<input id="settingsAnthropicKey" type="password" autocomplete="off" placeholder="sk-ant-…"/></label>
+    <label>OPENAI_API_KEY<input id="settingsOpenaiKey" type="password" autocomplete="off" placeholder="sk-…"/></label>
+    <label>OPENROUTER_API_KEY<input id="settingsOpenrouterKey" type="password" autocomplete="off" placeholder="sk-or-…"/></label>
+    <div class="settingsNote" id="settingsNote">Loading credential mode…</div>
+    <div class="settingsStatus" id="settingsStatus"></div>
+    <div class="settingsActions"><button id="settingsClear" class="secondary" type="button">Clear BYOK</button><button id="settingsSave" type="button">Save</button></div>
+  </section>
+</div>
+<script src="/static/app.js"></script></body></html>

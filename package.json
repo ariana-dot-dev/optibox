@@ -6,13 +6,14 @@
   "description": "Prototype orchestration library for consumer agents on top of Box: shared prewarm, restricted safe mode, per-user Box handoff, and lifecycle control.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/orchestrator.test.js dist/test/client-send-regression.test.js",
-    "qa:e2e": "npm run build && node --env-file=.env dist/scripts/e2e-qa.js",
-    "test:real-box": "npm run build && node dist/test/real-box-smoke.js",
-    "demo:real-e2e": "npm run build && node dist/scripts/real-e2e-demo.js",
-    "proof:interactive": "npm run build && node --env-file=.env dist/scripts/interactive-proof-server.js"
+    "test": "npm run build && node --test dist/test/engine.test.js dist/test/client.test.js",
+    "proof:interactive": "npm run build && node --env-file=.env dist/scripts/server.js",
+    "start": "node --env-file=.env dist/scripts/server.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@types/pg": "^8.20.0",
+    "pg": "^8.22.0"
+  },
   "devDependencies": {
     "@types/node": "^22.15.30",
     "typescript": "^5.8.3"

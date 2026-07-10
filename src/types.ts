@@ -1,6 +1,34 @@
 import type { MachineState } from "./context.js";
+import type { BOX_PRICING } from "./context.js";
 
 export type Role = "user" | "assistant" | "system";
+
+export interface ConsumerTurnInput {
+  userId: string;
+  conversationId: string;
+  message: string;
+  selection: HarnessSelection;
+}
+
+/** The event contract between engine and UI — unchanged from the pre-redesign
+ * stream so the client renders identically. Every event carries a turnId. */
+export type ConsumerTurnEventBody =
+  | { type: "trace"; stage: string; message: string; harness?: string; model?: string; boxId?: string; data?: Record<string, unknown> }
+  | { type: "turn.blocked"; stage: string; message: string; retryable: boolean; harness?: string; model?: string; boxId?: string }
+  | { type: "shared.delta"; text: string; harness: string; final?: boolean }
+  | { type: "context.injected"; scope: "shared" | "user-box"; machine: MachineState; hidden: string }
+  | { type: "lifecycle"; state: string; boxId: string; note?: string }
+  | { type: "autostop.timer"; phase: "started" | "tick" | "canceled" | "stopping" | "held"; boxId?: string | undefined; remainingMs: number; deadlineEpochMs?: number; reason: "idle-after-response" | "new-user-message" | "disabled"; note: string }
+  | { type: "billing.start"; boxId: string; ratePerSecond: number; sinceEpochMs: number; pricing: typeof BOX_PRICING }
+  | { type: "billing.stop"; boxId: string; elapsedSeconds: number; costUsd: number; note: string }
+  | { type: "handoff.started"; recap: string; boxId: string; harness: string; model: string }
+  | { type: "exec"; kind: "command" | "harness"; argv?: string[]; command?: string; boxId: string }
+  | { type: "harness.tool"; phase: "tool_use" | "tool_result"; boxId: string; toolName?: string; command?: string; description?: string; stdout?: string; stderr?: string; isError?: boolean }
+  | { type: "user-box.delta"; text: string; boxId: string; harness: string; model: string; messageId?: string; messageIndex?: number }
+  | { type: "error"; message: string }
+  | { type: "turn.done"; boxId?: string; harness: string; model: string; route?: "shared" | "direct" | "bridge"; settled?: boolean };
+
+export type ConsumerTurnEvent = ConsumerTurnEventBody & { turnId?: string };
 
 export interface TranscriptMessage {
   role: Role;

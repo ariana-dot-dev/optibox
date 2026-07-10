@@ -47,6 +47,9 @@ class FakeBoxClient implements BoxClient {
       throw new Error(`fake box ${boxId} cannot run commands in state ${state}`);
     }
     this.commands.push(input.command);
+    // Model the detached template install's exit marker: in the fake substrate
+    // any launched install "finishes" instantly and successfully.
+    if (input.command.startsWith("cat /tmp/.tpl-install.exit")) return { exitCode: 0, stdout: "0", stderr: "" };
     return { exitCode: 0, stdout: `ran:${input.command}`, stderr: "" };
   }
   async readFile(_boxId: string, path: string): Promise<string> { return `file:${path}`; }
@@ -1991,7 +1994,9 @@ test("missing template kicks off a background build and this boot falls back to 
   assert.ok(events.some((e) => e.type === "user-box.delta"), "legacy create path still answers");
   await waitFor(async () => [...box.boxes.values()].some((b: any) => b.name === "tpl-being-built"), 2000);
   const tpl = [...box.boxes.values()].find((b: any) => b.name === "tpl-being-built") as any;
-  assert.ok(box.commands.some((c: string) => c === "echo install"), "background build ran the template installCmd");
+  // The install launches detached inside a nohup wrapper — assert the
+  // installCmd was launched, not that it ran as a bare synchronous command.
+  assert.ok(box.commands.some((c: string) => c.includes("echo install")), "background build launched the template installCmd");
   await waitFor(async () => (await box.get(tpl.id)).state === "archived", 2000);
 });
 

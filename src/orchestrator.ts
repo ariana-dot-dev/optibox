@@ -683,9 +683,35 @@ export class ConsumerBoxAgentOrchestrator {
       const created = await this.options.box.create({ name: template.name, ttlSeconds: 3600 });
       boxId = created.id;
       const ready = await this.waitUntilReady(created.id, "template-create");
-      const installed = await this.options.box.command(ready.id, { command: template.installCmd, timeoutMs: 55_000 });
-      if (installed.exitCode !== 0) {
-        throw new Error(`template install failed (exit=${installed.exitCode}): ${installed.stderr.trim().slice(-300)}`);
+      // Detached install + exit-marker polling, NOT one synchronous command: npm
+      // installs routinely exceed the Box command API's hard 60s execution cap
+      // (and previously also the HTTP client's 30s request cap, which aborted
+      // every 30-60s build mid-flight — the template never built, so each fresh
+      // user box npm-installed the harness inside the user's first turn: 15-60s
+      // of billed silence before the agent's first action).
+      const script = `( ${template.installCmd} ) >/tmp/.tpl-install.log 2>&1; echo $? >/tmp/.tpl-install.exit`;
+      await this.options.box.command(ready.id, {
+        command: `rm -f /tmp/.tpl-install.exit; nohup bash -c '${script.replace(/'/g, `'\\''`)}' >/dev/null 2>&1 & echo started`,
+        timeoutMs: 15_000,
+      });
+      // Poll cadence scales with readinessPollMs (tests run it at 1ms); total
+      // budget stays 5 minutes regardless of cadence.
+      const installPollMs = Math.min(5_000, Math.max(1, this.options.readinessPollMs ?? 5_000));
+      const installDeadline = Date.now() + 300_000;
+      let installExit: string | undefined;
+      while (installExit === undefined && Date.now() < installDeadline) {
+        await new Promise((r) => setTimeout(r, installPollMs));
+        const probe = await this.options.box
+          .command(ready.id, { command: "cat /tmp/.tpl-install.exit 2>/dev/null || true", timeoutMs: 15_000 })
+          .catch(() => undefined);
+        const out = probe?.stdout.trim();
+        if (out) installExit = out;
+      }
+      if (installExit !== "0") {
+        const tail = await this.options.box
+          .command(ready.id, { command: "tail -c 400 /tmp/.tpl-install.log 2>/dev/null || true", timeoutMs: 15_000 })
+          .catch(() => undefined);
+        throw new Error(`template install ${installExit === undefined ? "timed out after 300s" : `failed (exit=${installExit})`}: ${(tail?.stdout ?? "").trim().slice(-300)}`);
       }
       // The platform refuses to stop a box until it has a successful snapshot
       // ("no successful snapshot in the last 30 minutes" on young boxes), so a

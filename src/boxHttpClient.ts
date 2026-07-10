@@ -38,7 +38,7 @@ export class BoxHttpClient implements BoxClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private async request<T>(path: string, init: RequestInit = {}, timeoutOverrideMs?: number): Promise<T> {
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${this.apiKey}`);
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -47,7 +47,8 @@ export class BoxHttpClient implements BoxClient {
     const abortFromUpstream = () => controller.abort(upstreamSignal?.reason);
     if (upstreamSignal?.aborted) abortFromUpstream();
     else upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
-    const timer = setTimeout(() => controller.abort(new Error(`Box API request timed out after ${this.requestTimeoutMs}ms: ${path}`)), this.requestTimeoutMs);
+    const requestTimeoutMs = timeoutOverrideMs ?? this.requestTimeoutMs;
+    const timer = setTimeout(() => controller.abort(new Error(`Box API request timed out after ${requestTimeoutMs}ms: ${path}`)), requestTimeoutMs);
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
@@ -120,7 +121,14 @@ export class BoxHttpClient implements BoxClient {
     // of sending an out-of-range value; anything longer must run detached (nohup)
     // and be polled — which is exactly how runHarness executes agent loops.
     const timeoutSeconds = input.timeoutMs ? Math.min(60, Math.max(1, Math.ceil(input.timeoutMs / 1000))) : undefined;
-    const json = await this.request<{ result?: CommandResult; exitCode?: number; stdout?: string; stderr?: string }>(`/boxes/${encodeURIComponent(boxId)}/commands`, { method: "POST", body: JSON.stringify({ command, cwd: input.cwd, timeoutSeconds }) });
+    // The HTTP layer must outlive the command's box-side execution window or it
+    // aborts a legitimately-running command mid-flight. The default 30s request
+    // cap silently killed every 30-60s command (observed: the template's npm
+    // install died at exactly 30s despite its 55s command timeout, so the
+    // template never built and every fresh user box paid a full in-turn
+    // install). Request timeout = command window + transport headroom.
+    const httpTimeoutMs = Math.max(this.requestTimeoutMs, ((timeoutSeconds ?? 30) * 1000) + 15_000);
+    const json = await this.request<{ result?: CommandResult; exitCode?: number; stdout?: string; stderr?: string }>(`/boxes/${encodeURIComponent(boxId)}/commands`, { method: "POST", body: JSON.stringify({ command, cwd: input.cwd, timeoutSeconds }) }, httpTimeoutMs);
     return json.result ?? { exitCode: json.exitCode ?? 0, stdout: json.stdout ?? "", stderr: json.stderr ?? "" };
   }
 

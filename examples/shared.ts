@@ -549,10 +549,22 @@ async function* runHarnessTurn(
   }
   const { cwd, systemInstructionPath, binInstalled, binPath: preppedBinPath } = await prepareTurnWorkspace(runtime, spec, ctx, policy.phase, bundle.instructions, delivery, extraFiles);
   let binPath = preppedBinPath;
+  if (spec.installCmd && !binInstalled && runtime.location === "user-box") {
+    // NO in-turn reinstall on a user box, EVER. The harness is baked into the
+    // template box every fresh user box forks from; a box without the binary
+    // means the template pipeline is broken, and silently npm-installing here
+    // hid that breakage for hours while every user's first turn burned 15-60s
+    // of billed silence before the agent's first action. Crash loudly instead
+    // (surfaces as turn.blocked with this text) so a broken template is
+    // impossible to miss.
+    throw new Error(
+      `harness '${spec.bin}' is not installed on this user box — fresh boxes must fork the pre-installed template; in-turn reinstall is forbidden. ` +
+      "The template build is broken or its snapshot is missing: check the server log for '[optibox] template box build failed'.",
+    );
+  }
   if (spec.installCmd && !binInstalled) {
-    // NOTE: no user-visible text here. Install progress already surfaces via the
-    // runtime's exec audit event; a text yield would count as the box agent's
-    // "answer" and mask the loud no-answer failure when the real run errors out.
+    // Shared-infra runtime (a local process, not a user box): no template
+    // exists there by design — installing locally once is the intended path.
     await runtime.command(spec.installCmd, { timeoutMs: 180_000 });
   }
   if (spec.prepare) await spec.prepare(runtime);

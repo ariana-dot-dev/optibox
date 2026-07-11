@@ -512,16 +512,28 @@ export class Engine {
   /** Eager resident-runtime boot on wake (pure latency optimization). */
   prewarmBoxServe(boxId: string): void {
     if (this.prewarming.has(boxId)) return;
+    void this.warmBoxServe(boxId);
+  }
+
+  /**
+   * Boot the resident harness serve on a box and WAIT for it to answer. Fresh
+   * forks (scenario boxes especially) have serve NOT running — processes don't
+   * survive fork, only disk — so the first turn otherwise boots serve inline and
+   * pi streams flakily during that ~90s boot (observed: one scenario answers, its
+   * cold sibling streams 0 chunks and box.no-answer's). Warming to completion
+   * before the round makes every scenario hit a warm serve, same as a typed turn.
+   * Idempotent (the preamble health-checks serve); deduped via `prewarming`.
+   */
+  private async warmBoxServe(boxId: string): Promise<void> {
+    if (this.prewarming.has(boxId)) return;
     const warmers = [...this.harnesses.values()].filter((h) => typeof h.prewarm === "function");
     if (warmers.length === 0) return;
     this.prewarming.add(boxId);
-    void (async () => {
-      try {
-        const caps = createUserBoxCapabilities(this.box, boxId, { ...(this.opts.providerEnv ? { providerEnv: this.opts.providerEnv } : {}) });
-        await this.waitUntilReady(boxId).catch(() => undefined);
-        for (const h of warmers) { const p = h.prewarm; if (!p) continue; try { await p.call(h, caps); } catch { /* the turn's own boot covers it */ } }
-      } finally { this.prewarming.delete(boxId); }
-    })();
+    try {
+      const caps = createUserBoxCapabilities(this.box, boxId, { ...(this.opts.providerEnv ? { providerEnv: this.opts.providerEnv } : {}) });
+      await this.waitUntilReady(boxId).catch(() => undefined);
+      for (const h of warmers) { const p = h.prewarm; if (!p) continue; try { await p.call(h, caps); } catch { /* the turn's own boot covers it */ } }
+    } finally { this.prewarming.delete(boxId); }
   }
 
   // ---------------------------------------------------------------- hosting
@@ -1040,6 +1052,13 @@ export class Engine {
     for (const p of provisioned) {
       if (!p.ok) yield ({ type: "turn.blocked", stage: "scenario.provision.failed", message: `scenario "${p.label}" could not start: ${p.error instanceof Error ? p.error.message : String(p.error)}`, retryable: true, harness: harness.name, model: input.selection.model, turnId, scenarioId: p.id, scenarioLabel: p.label } as ConsumerTurnEvent);
     }
+    // Warm each fresh scenario box's resident serve to COMPLETION before its
+    // round, in parallel — matters for resident-serve harnesses (opencode), whose
+    // forks boot serve inline otherwise. No-op for pi (one-shot, no serve). NOTE:
+    // the scenario box.no-answer flakiness was NOT a warmth problem — it was the
+    // Box command-output cap truncating pi's answer off the end of a long log
+    // (fixed in capabilities.ts runHarness by reading the log from a byte offset).
+    await Promise.all(live.map((s) => this.warmBoxServe(s.box.id).catch(() => undefined)));
     try {
       const gens = live.map((s) => this.runBoxRound(
         { ...input, message: `${input.message}\n\n[Parallel-scenario mode: explore ONLY this interpretation — "${s.label}". Commit fully to it; do not hedge across the alternatives.]` },

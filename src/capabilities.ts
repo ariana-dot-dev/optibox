@@ -481,7 +481,17 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     spec.signal?.addEventListener("abort", onAbort, { once: true });
 
     const started = Date.now();
+    // `offset` is the number of LOG-FILE BYTES already consumed. We read only the
+    // new bytes each poll (not the whole file): pi's `--mode json` embeds a
+    // CUMULATIVE message snapshot in EVERY event, so a long agent run's log grows
+    // past the Box command-output cap (524288 bytes, measured). `cat`-from-start
+    // then truncated the TAIL — and pi streams its final answer text LAST, after
+    // all tool calls — so `sawText` stayed false and a fully-answered turn wrongly
+    // reported box.no-answer (seen on long scenario builds). Reading from `offset`
+    // with `wc -c` as the ground-truth size removes the ceiling on total output.
     let offset = 0;
+    // Bytes per poll must stay under the 524288 cap with room for the meta suffix.
+    const READ_WINDOW = 500_000;
     // Consecutive poll failures = the BOX is gone, not a network blip. When a
     // box is stopped externally mid-run (another process's reaper, a manual
     // `box stop`, platform eviction), EVERY poll throws — and silently retrying
@@ -501,11 +511,21 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
       // (A separate `kill -0` command doubled the HTTP polls for zero benefit.)
       let content = "";
       let alive = "unknown";
+      let fileSize = offset;
       try {
-        const polled = (await box.command(boxId, { command: `cat ${shq(log)} 2>/dev/null || true; printf '\\n__CBA_ALIVE__:%s\\n' "$(kill -0 ${pid || "0"} 2>/dev/null && echo up || echo down)"`, timeoutMs: 15_000 })).stdout;
-        const aliveMatch = polled.match(/\n?__CBA_ALIVE__:(\w+)\s*$/);
-        alive = aliveMatch?.[1] ?? "unknown";
-        content = polled.replace(/\n?__CBA_ALIVE__:\w+\s*$/g, "");
+        // ONE round trip: the NEW log bytes (from `offset`, capped at the read
+        // window), the true file size (wc -c — the ground truth for advancing
+        // offset, immune to any multibyte mangling at the window boundary), and
+        // process aliveness. `tail -c +N` is 1-indexed, so +offset+1.
+        const cmd =
+          `sz=$(wc -c < ${shq(log)} 2>/dev/null || echo 0); ` +
+          `tail -c +$((${offset} + 1)) ${shq(log)} 2>/dev/null | head -c ${READ_WINDOW}; ` +
+          `printf '\\n__CBA_META__:%s:%s\\n' "$sz" "$(kill -0 ${pid || "0"} 2>/dev/null && echo up || echo down)"`;
+        const polled = (await box.command(boxId, { command: cmd, timeoutMs: 15_000 })).stdout;
+        const metaMatch = polled.match(/\n?__CBA_META__:(\d+):(\w+)\s*$/);
+        fileSize = metaMatch ? Number(metaMatch[1]) : offset;
+        alive = metaMatch?.[2] ?? "unknown";
+        content = polled.replace(/\n?__CBA_META__:\d+:\w+\s*$/g, "");
         pollFailures = 0;
       } catch (e) {
         pollFailures++;
@@ -516,15 +536,21 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
         }
         continue; // transient failure; retry next poll
       }
+      // Advance by the exact bytes available this poll (from the true file size),
+      // NOT the decoded string length — a multibyte char split at the window edge
+      // would otherwise desync the offset and corrupt a later line.
+      const bytesThisPoll = Math.min(READ_WINDOW, Math.max(0, fileSize - offset));
       const exitMatch = content.match(/__CBA_EXIT__:(\d+)\s*$/);
-      const visible = content.replace(/\n?__CBA_EXIT__:\d+\s*$/g, "");
-      rawTail = visible.slice(-600);
-      if (visible.length > offset) {
-        const rawDelta = visible.slice(offset);
+      const rawDelta = content.replace(/\n?__CBA_EXIT__:\d+\s*$/g, "");
+      if (rawDelta) {
+        rawTail = (rawTail + rawDelta).slice(-600);
         for (const chunk of parseHarnessOutput(rawDelta, parser)) yield noteChunk(chunk);
-        offset = visible.length;
       }
-      if (exitMatch) {
+      offset += bytesThisPoll;
+      // A large tail can exceed one read window; keep draining before deciding the
+      // run is over (both the clean-exit and the crash paths need the true tail).
+      const moreToDrain = fileSize > offset;
+      if (exitMatch && !moreToDrain) {
         if (parser.mode !== "raw-stdout" && parser.lineBuffer.trim()) {
           const text = parseHarnessJsonLine(parser.lineBuffer.replace(/\r$/, ""), parser);
           parser.lineBuffer = "";
@@ -534,9 +560,13 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
         reportCompletion({ reason: "completed", exitCode: Number(exitMatch[1]) });
         return;
       }
+      if (moreToDrain) continue; // more tail than one window holds — keep reading
       // process gone but no exit marker -> stop polling (crash/kill, not a clean end)
       if (pid && alive === "down") {
-        if (visible.length > offset) yield noteChunk({ text: visible.slice(offset), messageId: "stdout-0", messageIndex: 0 });
+        if (parser.mode !== "raw-stdout" && parser.lineBuffer.trim()) {
+          yield noteChunk({ text: parser.lineBuffer, messageId: "stdout-0", messageIndex: 0 });
+          parser.lineBuffer = "";
+        }
         reportCompletion({ reason: "process-exited" });
         return;
       }

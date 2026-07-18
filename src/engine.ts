@@ -677,7 +677,10 @@ export class Engine {
     const r = await this.box.command(boxId, {
       command:
         `P=$(cat ${pid} 2>/dev/null); if [ -n "$P" ]; then kill -INT "$P" 2>/dev/null; ` +
-        `for i in $(seq 1 30); do kill -0 "$P" 2>/dev/null || break; sleep 0.2; done; fi; rm -f ${pid}; ` +
+        // Wait for ffmpeg to EXIT, not just flush something: the moov atom
+        // (+faststart) is written at finalize, so a still-running ffmpeg means
+        // an unplayable clip. ~15s headroom for long turns on a loaded box.
+        `for i in $(seq 1 75); do kill -0 "$P" 2>/dev/null || break; sleep 0.2; done; fi; rm -f ${pid}; ` +
         `if [ -s ${out} ]; then echo "OK:$(( $(stat -c%s ${out}) / 1024 ))"; else echo NONE; fi`,
       timeoutMs: 30_000,
     });
@@ -916,6 +919,7 @@ export class Engine {
       });
 
       let text = "";
+      let flushed = 0; // bytes of `text` already streamed as user-box.delta
       let sawEnd = false;
       let completion: HarnessCompletion = { reason: "completed" };
       for await (const chunk of harness.userBox({
@@ -935,11 +939,32 @@ export class Engine {
         const t = typeof chunk === "string" ? chunk : (chunk as { text: string }).text;
         if (!t) continue;
         text += t;
-        if (text.trim() === "<end>") { sawEnd = true; continue; }
-        push({ type: "user-box.delta", text: t, boxId: box.id, harness: harness.name, model: input.selection.model, messageId: "assistant-0", messageIndex: 0 });
+        if (text.trim() === "<end>") sawEnd = true;
+        if (sawEnd) continue; // once the sentinel lands, anything after it stays hidden (off-contract anyway)
+        // The <end> sentinel arrives as STREAMING CHUNKS ("<", "end", ">") —
+        // pushing each as a delta leaks a partial sentinel into chat (observed:
+        // "<end" rendered, the final ">" swallowed by the whole-text check
+        // above). Hold back any trailing run that could still COMPLETE into the
+        // sentinel — a proper prefix of "<end>", or full sentinel(s) plus
+        // trailing whitespace — and flush it only when later text proves it
+        // isn't one. Every other byte streams immediately, so answers still
+        // load step by step.
+        const hold = text.match(/(<end>\s*)+$|<(e(n(d)?)?)?$/)?.[0].length ?? 0;
+        const flushTo = text.length - hold;
+        if (flushTo > flushed) {
+          push({ type: "user-box.delta", text: text.slice(flushed, flushTo), boxId: box.id, harness: harness.name, model: input.selection.model, messageId: "assistant-0", messageIndex: 0 });
+          flushed = flushTo;
+        }
       }
       if (signal.aborted) return { outcome: "interrupted" as const, text };
-      const visible = text.replace(/<end>\s*$/, "").trim();
+      // Stream over: a still-held tail is either the sentinel (drop — the
+      // silent/visible logic below covers it) or a partial that never completed
+      // (crash mid-token — flush it, it's real text).
+      const rawVisible = text.replace(/(<end>\s*)+$/, "");
+      if (!sawEnd && rawVisible.length > flushed) {
+        push({ type: "user-box.delta", text: text.slice(flushed, rawVisible.length), boxId: box.id, harness: harness.name, model: input.selection.model, messageId: "assistant-0", messageIndex: 0 });
+      }
+      const visible = rawVisible.trim();
       if (sawEnd || /^\s*<end>\s*$/.test(text)) return { outcome: "silent" as const, text: "" };
       if (!visible) {
         // Rule 6 binding clause: no text and no <end> is LOUD, never silence.

@@ -177,6 +177,41 @@ test("rule 6: <end> renders nothing but settles the turn", async () => {
   engine.dispose();
 });
 
+test("rule 6 streaming: a chunked <end> never leaks a partial sentinel", async () => {
+  const box = new FakeBoxClient();
+  // Chunks exactly as a streaming model emits them: "<", "en", "d", ">".
+  const engine = makeEngine(box, harnessOf("h", {
+    box: () => (async function* () { yield "<"; yield "en"; yield "d"; yield ">"; })(),
+  }));
+  const events = await collect(engine, "u6s", "c6s", "hey there");
+  assert.ok(!events.some((e) => e.type === "user-box.delta"), "no delta emitted for a chunked sentinel");
+  assert.ok(events.some((e) => e.type === "turn.done" && e.settled === true), "silent decline still settles");
+  engine.dispose();
+});
+
+test("rule 6 streaming: text before the sentinel streams step by step; the sentinel tail never shows", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box, harnessOf("h", {
+    box: () => (async function* () { yield "4 CP"; yield "Us."; yield "<"; yield "end"; yield ">"; })(),
+  }));
+  const events = await collect(engine, "u6t", "c6t", "cpu count");
+  const visible = events.filter((e) => e.type === "user-box.delta").map((e) => e.text).join("");
+  assert.equal(visible, "4 CPUs.", "answer streamed progressively, sentinel withheld");
+  assert.ok(events.some((e) => e.type === "turn.done" && e.settled === true), "turn settles");
+  engine.dispose();
+});
+
+test("rule 6 streaming: a held partial flushes once disproven (real text ending in '<')", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box, harnessOf("h", {
+    box: () => (async function* () { yield "a <"; yield "b"; })(),
+  }));
+  const events = await collect(engine, "u6p", "c6p", "compare");
+  const visible = events.filter((e) => e.type === "user-box.delta").map((e) => e.text).join("");
+  assert.equal(visible, "a <b", "withheld prefix re-streams when it is not the sentinel");
+  engine.dispose();
+});
+
 test("rule 6 binding: no text and no <end> is a LOUD turn.blocked, never silence", async () => {
   const box = new FakeBoxClient();
   const engine = makeEngine(box, harnessOf("h", { box: () => (async function* () { /* nothing */ })() }));

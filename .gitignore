@@ -8,3 +8,4 @@ evidence/
 .DS_Store
 e2e-qa-server-*.log
 NUL
+dev-server.log

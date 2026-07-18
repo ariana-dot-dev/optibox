@@ -173,9 +173,25 @@ s=s.replace(new RegExp('^[ ]*(?:[-*]|[0-9]+[.])[ ]+(.+)$','gm'),'<span class="md
 s=s.replace(new RegExp('\\n?(<pre>)','g'),'$1').replace(new RegExp('(</pre>)\\n?','g'),'$1');
 return s;}
 // One live desktop widget per reply loop: the FIRST desktop-touching tool call
-// of a turn embeds the box's noVNC stream (view-only until clicked); later
+// of a turn embeds the box's desktop stream (view-only until clicked); later
 // desktop calls in the same turn reuse it; a new turn's widget ends the old
 // one. (Cross-origin iframes cannot be recorded client-side, so no replay.)
+// Default mode is noVNC (plain websockets — loads on networks that block
+// WebRTC/UDP, where the 60fps Moonlight stream never connects); "switch to
+// stream" upgrades to Moonlight, embedded at 480p via moonlight-web's
+// width/height URL params (verified in /opt/moonlight-web/static/stream.js).
+function capStreamRes(url,vnc){
+  if(vnc){
+    // The API's noVNC URL bakes resize=remote (ask the SERVER to resize the X
+    // session), which the box's VNC server doesn't honor — the desktop then
+    // renders 1:1 native pixels inside the 540px preview: zoomed-in AND
+    // cropped. resize=scale scales the remote framebuffer client-side to fit
+    // the iframe (letterboxed, whole desktop visible).
+    if(/[?&]resize=/.test(url)) return url.replace(/([?&])resize=[^&]*/,'$1resize=scale');
+    return url+(url.indexOf('?')>=0?'&':'?')+'resize=scale';
+  }
+  return url+(url.indexOf('?')>=0?'&':'?')+'width=854&height=480';
+}
 var desktopWidget=null;
 var DESKTOP_MARKS=['xdotool','wmctrl','xdg-open','ydotool','wtype','scrot','DISPLAY=','chromium','google-chrome','firefox','lux '];
 function isDesktopCommand(cmd){cmd=String(cmd||'');for(var i=0;i<DESKTOP_MARKS.length;i++)if(cmd.indexOf(DESKTOP_MARKS[i])>=0)return true;return false;}
@@ -195,14 +211,28 @@ async function renderDesktopRecording(ev,localId){
   const tag=el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · session recording';
   const wrap=el.querySelector('.desktopWrap');if(!wrap)return;
   wrap.innerHTML='<div class="desktopNote">loading recording…</div>';if(stick)c.scrollTop=c.scrollHeight;
-  try{
-    const res=await fetch('/api/fs/read',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,path:ev.path,apiKeys:currentApiKeys()})});
-    if(!res.ok)throw new Error('read '+res.status);
-    const url=URL.createObjectURL(new Blob([await res.arrayBuffer()],{type:'video/mp4'}));
-    const v=document.createElement('video');v.className='desktopFrame';v.src=url;v.controls=true;v.playsInline=true;v.preload='metadata';
-    wrap.innerHTML='';wrap.appendChild(v);
-    if(!el.querySelector('a.dtDownload')){const links=el.querySelector('.dtLinks')||(function(){const s=document.createElement('span');s.className='dtLinks';el.querySelector('.desktopTag').appendChild(s);return s;})();const a=document.createElement('a');a.className='dtDownload';a.textContent='download';a.href=url;a.download=String(ev.path||'desktop.mp4').split('/').pop();links.appendChild(a);}
-  }catch(e){wrap.innerHTML='<div class="desktopNote">recording unavailable</div>';}
+  // The event can land BEFORE the bytes are servable: ffmpeg may still be
+  // flushing the moov atom on a long turn, and the snapshot fallback only
+  // contains the clip once the post-turn stop completes. Retry for ~60s before
+  // declaring the recording unavailable — previously a single shot, which is
+  // why it said "recording unavailable" until a manual reload.
+  const attempt=(el.__recAttempt||0)+1;el.__recAttempt=attempt;
+  for(let i=0;i<24;i++){
+    if(el.__recAttempt!==attempt)return;
+    try{
+      const res=await fetch('/api/fs/read',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,path:ev.path,apiKeys:currentApiKeys()})});
+      if(!res.ok)throw new Error('read '+res.status);
+      const url=URL.createObjectURL(new Blob([await res.arrayBuffer()],{type:'video/mp4'}));
+      if(el.__recAttempt!==attempt)return;
+      const v=document.createElement('video');v.className='desktopFrame';v.src=url;v.controls=true;v.playsInline=true;v.preload='metadata';
+      wrap.innerHTML='';wrap.appendChild(v);
+      if(!el.querySelector('a.dtDownload')){const links=el.querySelector('.dtLinks')||(function(){const s=document.createElement('span');s.className='dtLinks';el.querySelector('.desktopTag').appendChild(s);return s;})();const a=document.createElement('a');a.className='dtDownload';a.textContent='download';a.href=url;a.download=String(ev.path||'desktop.mp4').split('/').pop();links.appendChild(a);}
+      break;
+    }catch(e){
+      if(i===23){if(el.__recAttempt===attempt)wrap.innerHTML='<div class="desktopNote">recording unavailable</div>';}
+      else await new Promise(function(r){setTimeout(r,2500);});
+    }
+  }
   if(stick)c.scrollTop=c.scrollHeight;
 }
 function ensureDesktopWidget(localId){
@@ -210,9 +240,10 @@ function ensureDesktopWidget(localId){
   endDesktopWidget();
   const c=$('chat');const stick=chatStick(c);$('empty')?.remove();
   const el=document.createElement('div');el.className='msg desktop';
-  el.innerHTML='<div class="desktopTag"><span>desktop · connecting</span><span class="dtLinks"><a href="#" class="dtVnc" style="display:none">switch to VNC</a><a href="#" class="dtOpen" target="_blank" rel="noopener" style="display:none">open in tab</a></span></div><div class="desktopWrap"><div class="desktopNote">starting desktop stream…</div></div>';
+  el.innerHTML='<div class="desktopTag"><span>desktop · connecting</span><span class="dtLinks"><a href="#" class="dtVnc" style="display:none">switch to stream</a><a href="#" class="dtOpen" target="_blank" rel="noopener" style="display:none">open in tab</a></span></div><div class="desktopWrap"><div class="desktopNote">starting desktop stream…</div></div>';
   c.appendChild(el);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;
-  desktopWidget={localId:localId,el:el,frame:null,vnc:false};
+  // VNC-first: plain websockets load where the Moonlight WebRTC stream can't.
+  desktopWidget={localId:localId,el:el,frame:null,vnc:true};
   el.querySelector('a.dtVnc').addEventListener('click',function(e){e.preventDefault();swapDesktopMode(desktopWidget);});
   attachDesktopStream(desktopWidget);
 }
@@ -238,7 +269,7 @@ async function swapDesktopMode(w){
       const j=await res.json();
       if(desktopWidget!==w)return;
       if(j.ok&&j.desktopUrl&&!j.provisioning){
-        if(w.frame)w.frame.src=j.desktopUrl;
+        if(w.frame)w.frame.src=capStreamRes(j.desktopUrl,w.vnc);
         var open=w.el.querySelector('a.dtOpen');if(open)open.href=j.desktopUrl;
         if(tag)tag.textContent='desktop · '+(w.vnc?'VNC':'live');
         return;
@@ -255,18 +286,18 @@ async function attachDesktopStream(w){
   for(var i=0;i<30;i++){
     if(desktopWidget!==w)return;
     try{
-      const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})});
+      const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,...(w.vnc?{vnc:true}:{}),apiKeys:currentApiKeys()})});
       const j=await res.json();
       if(desktopWidget!==w)return;
       if(j.ok&&j.desktopUrl&&!j.provisioning){
         const wrap=w.el.querySelector('.desktopWrap');
         const frame=document.createElement('iframe');
-        frame.className='desktopFrame';frame.setAttribute('allow','clipboard-read; clipboard-write; fullscreen; autoplay; pointer-lock; gamepad');frame.src=j.desktopUrl;
+        frame.className='desktopFrame';frame.setAttribute('allow','clipboard-read; clipboard-write; fullscreen; autoplay; pointer-lock; gamepad');frame.src=capStreamRes(j.desktopUrl,w.vnc);
         const overlay=document.createElement('div');overlay.className='desktopOverlay';overlay.innerHTML='<span>click to take over</span>';
         overlay.addEventListener('click',function(){overlay.remove();var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · interactive';});
         wrap.innerHTML='';wrap.appendChild(frame);wrap.appendChild(overlay);
         w.frame=frame;
-        var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · live';
+        var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · '+(w.vnc?'VNC':'live');
         var link=w.el.querySelector('.desktopTag a.dtOpen');if(link){link.href=j.desktopUrl;link.style.display='';}
         var vl=w.el.querySelector('.desktopTag a.dtVnc');if(vl)vl.style.display='';
         // Heartbeat: renew the server-side desktop hold while this widget's
@@ -304,11 +335,13 @@ moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;return el;}
 // it from the visible chat (even a partial one mid-stream) and parse the names.
 function stripFileDecl(s){s=String(s);const i=s.indexOf('<optibox');return (i>=0?s.slice(0,i):s).trimEnd();}
 // Rule 6: <end> is the box agent's intentional-silence sentinel — the host must
-// NEVER show it. The server only suppresses the byte-exact string, so a stray
-// trailing newline/space (<end>\n) slips through and leaks into chat. Strip a
-// trailing <end> token here regardless of surrounding whitespace, as a display
-// safety net. A bare-<end> message collapses to empty (see addMsg).
-function stripEndSentinel(s){return String(s).replace(/\s*<end>\s*$/i,'');}
+// NEVER show it. The server now withholds any trailing partial while streaming
+// ("<", "<end" — see engine.ts), so it should never arrive; strip BOTH a
+// complete trailing sentinel and a trailing partial prefix here anyway, as a
+// display safety net (also cleans replays of pre-fix journals). A bare-<end>
+// message collapses to empty (see addMsg); partials re-render correctly because
+// the raw buffer keeps every byte.
+function stripEndSentinel(s){return String(s).replace(/\s*<end>\s*$/i,'').replace(/<(e(n(d)?)?)?$/i,'');}
 function parseFileDecl(s){s=String(s);const a=s.indexOf('<optibox-files');if(a<0)return [];const b=s.indexOf('>',a);if(b<0)return [];const c=s.indexOf('</optibox-files',b);const inner=c>=0?s.slice(b+1,c):s.slice(b+1);const out=[];const seen={};inner.split(',').forEach(function(x){let t=x.trim();while(t.charAt(0)==='.'||t.charAt(0)==='/')t=t.slice(1);if(t&&!seen[t]){seen[t]=1;out.push(t);}});return out;}
 const toolChains=[];
 let currentToolChain=null;

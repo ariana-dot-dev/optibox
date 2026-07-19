@@ -51,7 +51,10 @@ function closeSettings(){if($('settingsBackdrop'))$('settingsBackdrop').classLis
 function saveSettings(){writeSettings({boxApiKey:$('settingsBoxKey').value.trim(),anthropicApiKey:$('settingsAnthropicKey').value.trim(),openaiApiKey:$('settingsOpenaiKey').value.trim(),openrouterApiKey:$('settingsOpenrouterKey').value.trim(),harness:selectedHarness,provider:selectedProvider,model:selectedModel});renderSettingsControls();updateSettingsStatus();closeSettings();}
 function clearSettings(){writeSettings({harness:selectedHarness,provider:selectedProvider,model:selectedModel});$('settingsBoxKey').value='';$('settingsAnthropicKey').value='';$('settingsOpenaiKey').value='';$('settingsOpenrouterKey').value='';renderSettingsControls();}
 const hiddenContextPattern=new RegExp('<consumer-context>[\s\S]*?</consumer-context>','g');
-function stripHidden(s){return String(s).replace(hiddenContextPattern,'').trim();}
+// Never trim the ACCUMULATED buffer: deltas arrive in pieces, and a mid-stream
+// trim eats the whitespace joint between chunks ("them." + "\n" + "Good," →
+// "them.Good,"). Trim only the display copy, recomputed from full raw anyway.
+function stripHidden(s){return String(s).replace(hiddenContextPattern,'');}
 function fmtUsd(n){return '$'+n.toFixed(6);}
 const routeState={phase:'idle',boxId:null,billing:false,finalRoute:null,done:false};
 function setRoute(route,text){const r=$('routeStatus');if(r)r.textContent=text||'';}
@@ -324,7 +327,7 @@ async function attachDesktopStream(w){
   }
   var n2=w.el.querySelector('.desktopNote');if(n2)n2.textContent='desktop stream did not start';
 }
-function addMsg(cls,tag,text,key){if(cls!=='trace')currentToolChain=null;const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');const raw=stripHidden((body.dataset.raw||'')+text);body.dataset.raw=raw;const shown=stripEndSentinel(stripFileDecl(raw));body.textContent=shown;if(cls==='assistant'||cls==='user')body.innerHTML=md(shown);
+function addMsg(cls,tag,text,key){if(cls!=='trace')currentToolChain=null;const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');const raw=stripHidden((body.dataset.raw||'')+text);body.dataset.raw=raw;const shown=stripEndSentinel(stripFileDecl(raw)).trim();body.textContent=shown;if(cls==='assistant'||cls==='user')body.innerHTML=md(shown);
 // Rule 6: a box round that emits ONLY the <end> silence sentinel must render
 // NOTHING — no empty "user machine" bubble. Collapse it; it re-shows if real
 // text streams in later (reversible per render).
@@ -645,7 +648,11 @@ function extractLinks(text){
   // Bare domain mentions ("meteofrance.com", "Windy.com (great maps)") — agents
   // list sites without schemes constantly. TLD-allowlisted to avoid matching
   // filenames; (?<!@) skips e-mail addresses; scheme added for the preview.
-  const dom=/(?<![@\w])((?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|fr|co|uk|de|app|ai|me|tv|gg|so|edu|gov|in|info|eu|es|it|nl|be|ch|at|se|no|dk|fi|pl|pt|us|ca|au|nz|jp|br|ly|to|cc|fm|sh|im|xyz|site|online|tech|live|news|store|shop|blog|cloud|wiki))(?![a-z0-9@-])((?:[/][^\s<>"')\]]*)?)/gi;
+  // The TLD alternation is matched CASE-SENSITIVELY (labels stay case-insensitive):
+  // when a model drops the space at a sentence joint ("issue.No", "version.It",
+  // "desktop.No" — all observed), the capitalized next word must NOT read as a
+  // TLD. Real prose domains are lowercase-TLD ("Windy.com" still matches).
+  const dom=/(?<![@\w])((?:[a-zA-Z0-9-]+\.)+(?:com|org|net|io|dev|fr|co|uk|de|app|ai|me|tv|gg|so|edu|gov|in|info|eu|es|it|nl|be|ch|at|se|no|dk|fi|pl|pt|us|ca|au|nz|jp|br|ly|to|cc|fm|sh|im|xyz|site|online|tech|live|news|store|shop|blog|cloud|wiki))(?![a-z0-9@-])((?:[/][^\s<>"')\]]*)?)/g;
   while((m=dom.exec(text)))push('https://'+m[1]+(m[2]||''));
   return out.slice(0,8);
 }

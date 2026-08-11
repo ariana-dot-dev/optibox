@@ -144,7 +144,13 @@ export class BoxHttpClient implements BoxClient {
     // template never built and every fresh user box paid a full in-turn
     // install). Request timeout = command window + transport headroom.
     const httpTimeoutMs = Math.max(this.requestTimeoutMs, ((timeoutSeconds ?? 30) * 1000) + 15_000);
-    const json = await this.request<{ result?: CommandResult; exitCode?: number; stdout?: string; stderr?: string }>(`/boxes/${encodeURIComponent(boxId)}/commands`, { method: "POST", body: JSON.stringify({ command, cwd: input.cwd, timeoutSeconds }) }, httpTimeoutMs);
+    // ALWAYS name a cwd. A box resumed from a snapshot hands over by detaching
+    // the FUSE overmount its agent was standing in, so the default cwd can be a
+    // deleted directory — every command then dies on bash's "The current working
+    // directory was deleted, so that command didn't work" before it runs a byte
+    // (observed on the template's warm pass, 2026-08-12). /home/user is the
+    // box's real home and outlives the handover.
+    const json = await this.request<{ result?: CommandResult; exitCode?: number; stdout?: string; stderr?: string }>(`/boxes/${encodeURIComponent(boxId)}/commands`, { method: "POST", body: JSON.stringify({ command, cwd: input.cwd ?? "/home/user", timeoutSeconds }) }, httpTimeoutMs);
     return json.result ?? { exitCode: json.exitCode ?? 0, stdout: json.stdout ?? "", stderr: json.stderr ?? "" };
   }
 

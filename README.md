@@ -48,6 +48,45 @@ for await (const event of orchestrator.stopUserBox("user-1", "chat-1")) {
 
 A harness is the developer-owned agent loop. The included adapters in `examples/*/adapter.ts` all use the same contract: the shared phase performs a restricted text-only provider call, and the user-Box phase runs the real CLI inside the private Box with provider keys injected via `providerEnv`.
 
+## The base environment every user inherits
+
+A user machine is never built during a turn. The deployment builds ONE template
+box — installs the harnesses, stops it, resumes it, launches the harnesses once
+so the restore records their access order, stops it again — and then freezes that
+verified disk as a Box **named snapshot**. Every user machine is
+`create({ from: "<that name>" })`: a deploy of the frozen artifact, not a fork of
+a live box.
+
+The distinction matters. A fork walks the template box's live chain tip, so
+anything that touches that box afterwards — a resume, an inspection, a rebuild
+that got halfway — is inherited by every machine handed out later. The artifact
+is frozen at the instant the build verified it, a rebuild keeps serving the
+previous artifact until the new one is ready, and the deploy carries none of the
+source's conversation history.
+
+Two rules the build enforces, both learned the hard way:
+
+- **Install where a resume can find it.** A box image serves node through nvm, so
+  a plain `npm i -g` lands the harness in `~/.nvm` — which a stop/resume does not
+  bring back (measured: 1.3 GB before the stop, 3.3 MB after, `node` falling back
+  to the image's system node and every global binary gone). The template plants
+  its own node under `/usr/local`, which the box's system delta does carry, and
+  installs the harnesses with that npm.
+- **Prove it on the far side of a stop.** The warm pass runs after the template
+  has been stopped and resumed, and its exit code is the build's acceptance test.
+  A template that cannot run its own harness after a resume is a failed build,
+  not a ready one.
+
+## Handing a machine to someone who is not you
+
+Every box this layer creates passes `noEnv`, which withholds the account owner's
+env vars, secret files, and GitHub/box/agents credentials from the machine. The
+box keeps its own scoped token, so `host` and the desktop still work.
+
+This is not optional hygiene for a consumer product: without it, a box created by
+your account inherits *your* environment, and the anonymous visitor whose agent
+has shell access inside it can read all of it.
+
 ## Main use case
 
 Optibox helps you build a responsive consumer agent without keeping every user's private Box running all the time.

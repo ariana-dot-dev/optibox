@@ -303,9 +303,24 @@ export class Engine {
     // frozen at the instant the build verified it, and a rebuild keeps serving
     // the previous artifact until the new one is ready.
     if (this.opts.template) {
-      const tpl = await this.db.one<{ box_id: string; status: string }>(
+      let tpl = await this.db.one<{ box_id: string; status: string }>(
         `select box_id, status from templates where instance_id=$1`, [this.opts.instanceId],
       );
+      // Our row is a cache; the ARTIFACT is the truth. A deployment that lost its
+      // database (or is being restored onto a fresh one) still owns a ready
+      // artifact under its name, and rebuilding a template we already have is a
+      // four-minute apology for a lookup we can do in one call.
+      if (tpl?.status !== "ready" && this.box.namedSnapshot) {
+        const artifact = await this.box.namedSnapshot(this.templateSnapshotName()).catch(() => undefined);
+        if (artifact?.status === "ready") {
+          await this.db.q(
+            `insert into templates(instance_id, box_id, status, built_at) values($1,$2,'ready',now())
+             on conflict(instance_id) do update set box_id=excluded.box_id, status='ready', built_at=now()`,
+            [this.opts.instanceId, artifact.sourceBoxId ?? tpl?.box_id ?? "unknown"],
+          );
+          tpl = { box_id: artifact.sourceBoxId ?? "unknown", status: "ready" };
+        }
+      }
       if (tpl?.status !== "ready") {
         if (!tpl || tpl.status === "failed") this.templateBuild ??= this.buildTemplate().catch(() => { this.templateBuild = undefined; });
         throw new Error(

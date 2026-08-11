@@ -208,9 +208,28 @@ function engineFor(credentials: DemoCredentials): Engine {
     template: {
       // Pi is the default harness; it MUST be baked into the template or every
       // fresh box would lack it — and in-turn reinstall is forbidden (crashes).
-      installCmd: "npm i -g --ignore-scripts @earendil-works/pi-coding-agent >/tmp/pi-install.log 2>&1; npm i -g opencode-ai@latest >/tmp/opencode-install.log 2>&1",
-      // Warm pass records the fork-cold harness launch order into the snapshot.
-      warmCmd: "bash -lc 'pi --version; opencode --version' >/tmp/tpl-warm.log 2>&1 || true",
+      //
+      // WHERE it is installed is the whole game. A box image ships node through
+      // nvm, so a bare `npm i -g` lands the harness in ~/.nvm — and a stop/resume
+      // does not bring ~/.nvm back (measured 2026-08-12 on a same-day box: 1.3 GB
+      // before the stop, 3.3 MB after; `node` falls back to the image's
+      // /usr/bin/node v20 and every globally-installed binary is gone). Since the
+      // template's entire job is to survive exactly that transition, it plants
+      // its own node under /usr/local — which the box's system delta does carry
+      // across a resume — and installs the harnesses with THAT npm. `set -e`
+      // makes any step's failure the build's failure.
+      installCmd: [
+        "set -e",
+        "NV=$(node -v)",
+        'curl -fsSL "https://nodejs.org/dist/$NV/node-v${NV#v}-linux-x64.tar.xz" -o /tmp/node.txz',
+        "sudo -n tar -xJf /tmp/node.txz --strip-components=1 -C /usr/local",
+        "sudo -n /usr/local/bin/npm i -g --prefix /usr/local --ignore-scripts @earendil-works/pi-coding-agent",
+        "sudo -n /usr/local/bin/npm i -g --prefix /usr/local opencode-ai@latest",
+      ].join("; "),
+      // Warm pass records the cold harness launch order into the snapshot — and
+      // its exit code is the build's acceptance test, run on the far side of a
+      // stop/resume, where a lost install shows up. No `|| true`.
+      warmCmd: "bash -lc 'pi --version && opencode --version'",
     },
   });
   engines.set(cacheKey, engine);

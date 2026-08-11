@@ -1,4 +1,4 @@
-import type { BoxClient, BoxInfo, CommandResult } from "./types.js";
+import type { BoxClient, BoxInfo, CommandResult, NamedSnapshotInfo } from "./types.js";
 
 export class BoxApiError extends Error {
   constructor(public status: number, public code: string, message: string, public details?: unknown) {
@@ -70,10 +70,22 @@ export class BoxHttpClient implements BoxClient {
     return json as T;
   }
 
-  async create(input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
+  async create(input: {
+    name?: string;
+    ttlSeconds?: number | null;
+    from?: string;
+    noEnv?: boolean;
+    environment?: string;
+  }): Promise<BoxInfo> {
     const body: Record<string, unknown> = {};
     if (input.ttlSeconds !== undefined) body.ttlSeconds = input.ttlSeconds;
-    const json = await this.request<{ box: BoxInfo }>("/boxes", { method: "POST", body: JSON.stringify(body) });
+    // `from` deploys the frozen disk behind a named snapshot; `noEnv` withholds
+    // every owner secret from the machine. The API ignores `name` on create
+    // (boxes are born "Box <date>"), so the rename below stays a second call.
+    if (input.from) body.from = input.from;
+    if (input.noEnv) body.noEnv = true;
+    if (input.environment) body.environment = input.environment;
+    const json = await this.request<{ box: BoxInfo }>("/boxes", { method: "POST", body: JSON.stringify(body) }, 120_000);
     if (input.name) {
       const update: { name?: string; ttlSeconds?: number | null } = { name: input.name };
       if (input.ttlSeconds !== undefined) update.ttlSeconds = input.ttlSeconds;
@@ -134,6 +146,31 @@ export class BoxHttpClient implements BoxClient {
     const httpTimeoutMs = Math.max(this.requestTimeoutMs, ((timeoutSeconds ?? 30) * 1000) + 15_000);
     const json = await this.request<{ result?: CommandResult; exitCode?: number; stdout?: string; stderr?: string }>(`/boxes/${encodeURIComponent(boxId)}/commands`, { method: "POST", body: JSON.stringify({ command, cwd: input.cwd, timeoutSeconds }) }, httpTimeoutMs);
     return json.result ?? { exitCode: json.exitCode ?? 0, stdout: json.stdout ?? "", stderr: json.stderr ?? "" };
+  }
+
+  /**
+   * Freeze this box's disk under `name`. The artifact outlives the box's live
+   * chain: `create({ from: name })` deploys it even after the source box is
+   * stopped, and a re-save keeps serving the previous artifact until the new one
+   * is ready — so rebuilding a template never breaks provisioning mid-flight.
+   */
+  async saveNamedSnapshot(name: string, boxId: string): Promise<NamedSnapshotInfo> {
+    const json = await this.request<{ snapshot: NamedSnapshotInfo }>("/named-snapshots", {
+      method: "POST",
+      body: JSON.stringify({ name, boxId }),
+    }, 120_000);
+    return json.snapshot;
+  }
+
+  /** State of a named snapshot; undefined when the name has never been saved. */
+  async namedSnapshot(name: string): Promise<NamedSnapshotInfo | undefined> {
+    try {
+      const json = await this.request<{ snapshot: NamedSnapshotInfo }>(`/named-snapshots/${encodeURIComponent(name)}`);
+      return json.snapshot;
+    } catch (error) {
+      if (error instanceof BoxApiError && error.status === 404) return undefined;
+      throw error;
+    }
   }
 
   /** Latest completed snapshot of a box, or undefined when none exists. */

@@ -147,6 +147,14 @@ export class Engine {
     return `${userKey}:${conversationId}`;
   }
 
+  /**
+   * The base environment every user machine inherits, as a Box NAMED SNAPSHOT:
+   * one frozen disk, owned by the account under this name, deployed from by
+   * `create({ from })`. Names are 1-63 chars of [a-z0-9-]; the instance id is
+   * hex, so this always qualifies.
+   */
+  private templateSnapshotName(): string { return `optibox-${this.opts.instanceId}-tpl`; }
+
   // ---------------------------------------------------------------- billing
 
   /** THE wake path: sets billing_since if not billing, bumps activity. */
@@ -278,13 +286,22 @@ export class Engine {
     const scenCols = role ? ", scenario_group, scenario_label" : "";
     const scenVals = role ? ", $5, $6" : "";
     const scenArgs = role ? [role.group, role.label] : [];
-    // When a template is configured (the harness needs installation), a user
-    // box is ALWAYS a fork of the warm-cycled template — installed, snapshotted,
-    // resumed once with the harness actually launched (recording the FUSE
-    // lazy-restore access order), and snapshotted again. Never a plain create
-    // with the harness missing, never an in-turn install. If the template isn't
-    // ready yet, fail LOUDLY and let the user retry once the background build
-    // lands (the shared surface has already answered — rule 1 holds).
+    // When a template is configured (the harness needs installation), a user box
+    // is ALWAYS deployed from the warm-cycled template's NAMED SNAPSHOT —
+    // installed, snapshotted, resumed once with the harness actually launched
+    // (recording the FUSE lazy-restore access order), snapshotted again, then
+    // frozen under a name the account owns. Never a plain create with the
+    // harness missing, never an in-turn install. If the template isn't ready
+    // yet, fail LOUDLY and let the user retry once the background build lands
+    // (the shared surface has already answered — rule 1 holds).
+    //
+    // Deploying from the ARTIFACT rather than forking the template box is what
+    // makes "every user inherits the same base environment" literally true: a
+    // fork walks the template box's live chain tip, so anything that touches
+    // that box later (a resume, an inspection, a half-finished rebuild) is
+    // inherited by every machine handed out afterwards. The named snapshot is
+    // frozen at the instant the build verified it, and a rebuild keeps serving
+    // the previous artifact until the new one is ready.
     if (this.opts.template) {
       const tpl = await this.db.one<{ box_id: string; status: string }>(
         `select box_id, status from templates where instance_id=$1`, [this.opts.instanceId],
@@ -297,19 +314,30 @@ export class Engine {
             : "private machine template is still being prepared (first boot of this deployment, ~2-3 minutes) — send your message again shortly",
         );
       }
-      if (!this.box.fork) throw new Error("box client cannot fork — template-based provisioning requires fork support");
-      const forked = await this.box.fork(tpl.box_id);
-      await this.box.update?.(forked.id, { name, ttlSeconds })?.catch(() => undefined);
+      const deployed = await this.box.create({ from: this.templateSnapshotName(), name, ttlSeconds, noEnv: true })
+        .catch(async (error: unknown) => {
+          // The ARTIFACT is the source of truth, not our row. If the account no
+          // longer has it (deleted, or the row predates this artifact), the row
+          // is stale: demote it and rebuild rather than 404-ing every message
+          // forever behind a row that claims 'ready'.
+          const code = String((error as { code?: string }).code ?? "");
+          if (["snapshot_not_found", "snapshot_failed", "snapshot_unavailable"].includes(code)) {
+            await this.db.q(`update templates set status='failed' where instance_id=$1`, [this.opts.instanceId]).catch(() => undefined);
+            this.templateBuild ??= this.buildTemplate().catch(() => { this.templateBuild = undefined; });
+            throw new Error(`the base environment artifact is missing (${code}) — rebuilding it now; send your message again in a few minutes`);
+          }
+          throw error;
+        });
       await this.db.q(
         `insert into boxes(id, user_key, instance_id, purpose${scenCols}) values($1,$2,$3,$4${scenVals})`,
-        [forked.id, userKey, this.opts.instanceId, purpose, ...scenArgs],
+        [deployed.id, userKey, this.opts.instanceId, purpose, ...scenArgs],
       );
-      events?.push({ type: "lifecycle", boxId: forked.id, state: "forking", note: "forking pre-installed, warm-cycled template" });
-      return await this.waitUntilReady(forked.id);
+      events?.push({ type: "lifecycle", boxId: deployed.id, state: "provisioning", note: "deploying the pre-installed, warm-cycled base environment" });
+      return await this.waitUntilReady(deployed.id);
     }
     // No template configured = the harness needs no installation (generator
     // harnesses, tests): plain create is the intended path.
-    const created = await this.box.create({ name, ttlSeconds });
+    const created = await this.box.create({ name, ttlSeconds, noEnv: true });
     await this.db.q(
       `insert into boxes(id, user_key, instance_id, purpose${scenCols}) values($1,$2,$3,$4${scenVals})`,
       [created.id, userKey, this.opts.instanceId, purpose, ...scenArgs],
@@ -452,7 +480,13 @@ export class Engine {
     const name = `optibox-${this.opts.instanceId}-template`;
     let boxId: string | undefined;
     try {
-      const created = await this.box.create({ name, ttlSeconds: 3600 });
+      // noEnv from the first byte: the artifact freezes its env policy, so a
+      // template built without owner secrets can never deploy machines that
+      // carry them (verified 2026-08-12: a plain deploy of this account's base
+      // environment landed the owner's env vars AND ~/Documents/.env inside the
+      // box; with noEnv it lands neither, while the box's own scoped token —
+      // the one `host` needs — is still there).
+      const created = await this.box.create({ name, ttlSeconds: 3600, noEnv: true });
       boxId = created.id;
       await this.db.q(
         `insert into templates(instance_id, box_id, status) values($1,$2,'building')
@@ -481,17 +515,36 @@ export class Engine {
       await this.stopWithRetry(created.id);
       await this.waitUntilParked(created.id);
       if (template.warmCmd) {
-        // MANDATORY warm pass: every user box must fork a template that has
+        // MANDATORY warm pass: every user box must inherit a template that has
         // been resumed once with the harness actually launched (recording the
         // FUSE lazy-restore access order) and snapshotted again. A template
         // whose warm cycle failed is NOT ready — no fallback to the install
         // snapshot: warm failure = build failure, rebuilt on the next demand.
+        //
+        // The warm command's EXIT CODE is the build's acceptance test, and it is
+        // the only check that runs after a stop/resume — which is precisely when
+        // an install can evaporate. Measured 2026-08-12: `npm i -g` on a fresh
+        // box installs into the image's ~/.nvm node, and a stop/resume does not
+        // bring ~/.nvm back (1.3 GB before, 3.3 MB after), so a template that
+        // installed the harness perfectly handed out machines with no harness at
+        // all. This build ran green for months because the warm pass ignored its
+        // own exit code; it does not any more.
         await this.box.resume(created.id);
         await this.waitUntilReady(created.id);
-        await this.box.command(created.id, { command: template.warmCmd, timeoutMs: 55_000 });
+        const warm = await this.box.command(created.id, { command: template.warmCmd, timeoutMs: 55_000 });
+        if (warm.exitCode !== 0) {
+          throw new Error(
+            `template warm pass FAILED (exit=${warm.exitCode}) — the harness did not survive the template's stop/resume cycle: ${(warm.stderr || warm.stdout || "").trim().slice(-300)}`,
+          );
+        }
         await this.stopWithRetry(created.id);
         await this.waitUntilParked(created.id);
       }
+      // Freeze the verified disk as the account-owned artifact every user box
+      // deploys from. Saving from the ARCHIVED box pins the snapshot that was
+      // just verified; the source box stays archived (it costs nothing parked)
+      // as the artifact's origin.
+      await this.saveTemplateSnapshot(created.id);
       await this.db.q(`update templates set status='ready', built_at=now() where instance_id=$1`, [this.opts.instanceId]);
     } catch (error) {
       if (boxId) await this.box.stop(boxId).catch(() => undefined);
@@ -499,6 +552,28 @@ export class Engine {
       console.error(`[engine] template box build failed${boxId ? ` (box ${boxId}, stop requested)` : ""}:`, error instanceof Error ? (error.stack ?? error.message) : String(error));
       throw error;
     }
+  }
+
+  /**
+   * Pin the built template's disk under the account-owned snapshot name and
+   * wait for the platform to finish freezing it. Loud on failure: a template
+   * whose artifact never became `ready` must not be marked ready here, or every
+   * later deploy 409s on an artifact that does not exist.
+   */
+  private async saveTemplateSnapshot(boxId: string): Promise<void> {
+    const name = this.templateSnapshotName();
+    if (!this.box.saveNamedSnapshot || !this.box.namedSnapshot) {
+      throw new Error("box client cannot save named snapshots — template-based provisioning requires them");
+    }
+    await this.box.saveNamedSnapshot(name, boxId);
+    const deadline = Date.now() + 15 * 60_000;
+    while (Date.now() < deadline) {
+      const info = await this.box.namedSnapshot(name);
+      if (info?.status === "ready") return;
+      if (info?.status === "failed") throw new Error(`template snapshot "${name}" failed to save: ${info.error ?? "no reason given"}`);
+      await new Promise((r) => setTimeout(r, 5_000));
+    }
+    throw new Error(`template snapshot "${name}" did not finish saving within 15 minutes`);
   }
 
   private async stopWithRetry(boxId: string): Promise<void> {

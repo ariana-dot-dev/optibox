@@ -65,6 +65,19 @@ export interface BoxInfo {
   url?: string;
 }
 
+/**
+ * A named snapshot: a box's disk frozen under a name the account owns, which
+ * new boxes can be deployed from (`create({ from })`) without the source box
+ * being alive — and without inheriting its conversation history.
+ */
+export interface NamedSnapshotInfo {
+  name: string;
+  status: "saving" | "ready" | "failed" | string;
+  sourceBoxId?: string;
+  sizeBytes?: number;
+  error?: string | null;
+}
+
 export interface CommandResult {
   exitCode: number;
   stdout: string;
@@ -78,7 +91,21 @@ export interface CommandResult {
  * external harnesses, invoked via `command`. See {@link assertNoBoxAgent}.
  */
 export interface BoxClient {
-  create(input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo>;
+  create(input: {
+    name?: string;
+    ttlSeconds?: number | null;
+    /** Deploy from a named snapshot (a frozen disk artifact) instead of a blank box. */
+    from?: string;
+    /**
+     * Withhold every owner secret from the box (Box's `noEnv`): no owner env
+     * vars, no secret files, no GitHub/box/agents credentials. The box keeps its
+     * OWN scoped token, so `host` and the desktop still work. Any box a product
+     * hands to its end users belongs behind this flag.
+     */
+    noEnv?: boolean;
+    /** Pin the box to one of the account's named environments (default: the account default). */
+    environment?: string;
+  }): Promise<BoxInfo>;
   list?(): Promise<BoxInfo[]>;
   get(boxId: string): Promise<BoxInfo>;
   update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo>;
@@ -88,6 +115,10 @@ export interface BoxClient {
   deleteBox?(boxId: string): Promise<void>;
   /** Fork a box from its latest snapshot (POST /boxes/{id}/fork). Optional: legacy clients may lack it. */
   fork?(boxId: string): Promise<BoxInfo>;
+  /** Freeze a box's disk as a reusable named artifact (POST /named-snapshots). */
+  saveNamedSnapshot?(name: string, boxId: string): Promise<NamedSnapshotInfo>;
+  /** State of a named snapshot, or undefined when the name is unused. */
+  namedSnapshot?(name: string): Promise<NamedSnapshotInfo | undefined>;
   command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number; env?: Record<string, string> }): Promise<CommandResult>;
   readFile(boxId: string, path: string): Promise<string>;
   writeFile(boxId: string, path: string, content: string): Promise<void>;

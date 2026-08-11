@@ -357,7 +357,7 @@ const VIDEO_EXT = /\.(mp4|m4v|mov|ogv)$/i;
 const AUDIO_EXT = /\.(mp3|wav|ogg|oga|m4a|aac|flac|opus|weba)$/i;
 const SHEET_EXT = /\.(xlsx|xls)$/i;
 const SQLITE_EXT = /\.(sqlite3?|db)$/i;
-const MIME_BY_EXT = { svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", m4v: "video/mp4", mov: "video/quicktime", ogv: "video/ogg", png: "image/png", gif: "image/gif", webp: "image/webp", jpg: "image/jpeg", jpeg: "image/jpeg", mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg", m4a: "audio/mp4", aac: "audio/aac", flac: "audio/flac", opus: "audio/ogg", weba: "audio/webm" };
+const MIME_BY_EXT = { svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", m4v: "video/mp4", mov: "video/quicktime", ogv: "video/ogg", png: "image/png", gif: "image/gif", webp: "image/webp", jpg: "image/jpeg", jpeg: "image/jpeg", bmp: "image/bmp", avif: "image/avif", ico: "image/x-icon", mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg", m4a: "audio/mp4", aac: "audio/aac", flac: "audio/flac", opus: "audio/ogg", weba: "audio/webm" };
 const mimeFor = (name) => MIME_BY_EXT[(name.split(".").pop() || "").toLowerCase()] || "";
 
 // Dispatch already-loaded bytes to the right renderer. path is null for bytes
@@ -780,6 +780,14 @@ async function showText(path, name, text, canSave) {
   const host = (window.__optiboxFs = window.__optiboxFs || {});
   host.openBytes = openBytes;
   host.openPath = (path) => openViewer(path);
+  // Bytes of one box file, for callers that want to RENDER it rather than open
+  // the viewer (the chat's file decks thumbnail images and videos this way).
+  host.readBytes = async (path) => (await api("/api/fs/read", { path }, true)).bytes;
+  // The MIME a name implies. A Blob built without one is served from its
+  // blob: URL with no Content-Type: <img> usually sniffs its way through,
+  // <video> just shows an empty box — which is exactly what a .mp4 or .gif
+  // thumbnail did.
+  host.mimeFor = mimeFor;
   host.uploadAttachment = async function (name, b64) {
     const dest = "attachments/" + name.replace(/[/\\]/g, "_");
     await api("/api/fs/write", { path: dest, contentB64: b64 });

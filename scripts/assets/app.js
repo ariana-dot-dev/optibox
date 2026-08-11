@@ -179,10 +179,12 @@ return s;}
 // of a turn embeds the box's desktop stream (view-only until clicked); later
 // desktop calls in the same turn reuse it; a new turn's widget ends the old
 // one. (Cross-origin iframes cannot be recorded client-side, so no replay.)
-// Default mode is noVNC (plain websockets — loads on networks that block
-// WebRTC/UDP, where the 60fps Moonlight stream never connects); "switch to
-// stream" upgrades to Moonlight, embedded at 480p via moonlight-web's
-// width/height URL params (verified in /opt/moonlight-web/static/stream.js).
+// Default mode is the box's OWN desktop stream (Moonlight, 60fps), embedded at
+// 480p via moonlight-web's width/height URL params (verified in
+// /opt/moonlight-web/static/stream.js). noVNC is the fallback behind "switch to
+// VNC" — plain websockets, for networks that block WebRTC/UDP where Moonlight
+// never connects. It was briefly the default for that reason; that traded the
+// good stream away from everyone to spare the minority a click.
 function capStreamRes(url,vnc){
   if(vnc){
     // The API's noVNC URL bakes resize=remote (ask the SERVER to resize the X
@@ -243,10 +245,11 @@ function ensureDesktopWidget(localId){
   endDesktopWidget();
   const c=$('chat');const stick=chatStick(c);$('empty')?.remove();
   const el=document.createElement('div');el.className='msg desktop';
-  el.innerHTML='<div class="desktopTag"><span>desktop · connecting</span><span class="dtLinks"><a href="#" class="dtVnc" style="display:none">switch to stream</a><a href="#" class="dtOpen" target="_blank" rel="noopener" style="display:none">open in tab</a></span></div><div class="desktopWrap"><div class="desktopNote">starting desktop stream…</div></div>';
+  el.innerHTML='<div class="desktopTag"><span>desktop · connecting</span><span class="dtLinks"><a href="#" class="dtVnc" style="display:none">switch to VNC</a><a href="#" class="dtOpen" target="_blank" rel="noopener" style="display:none">open in tab</a></span></div><div class="desktopWrap"><div class="desktopNote">starting desktop stream…</div></div>';
   c.appendChild(el);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;
-  // VNC-first: plain websockets load where the Moonlight WebRTC stream can't.
-  desktopWidget={localId:localId,el:el,frame:null,vnc:true};
+  // The box's own stream first; VNC stays one click away for networks that
+  // block WebRTC.
+  desktopWidget={localId:localId,el:el,frame:null,vnc:false};
   el.querySelector('a.dtVnc').addEventListener('click',function(e){e.preventDefault();swapDesktopMode(desktopWidget);});
   attachDesktopStream(desktopWidget);
 }
@@ -561,6 +564,33 @@ function makeCarousel(deck,side){
     return wrap;
   }catch(_){return deck;}
 }
+// A deck card shows the real picture, not its file extension. Bytes for a box
+// file are fetched through the fs panel's reader and swapped in over the
+// placeholder icon; a Blob must carry its MIME type or a blob: URL is served
+// with none, which <video> refuses to render (the empty rectangle).
+const THUMB_MAX_BYTES=25*1024*1024;
+function thumbElement(name,bytes){
+  const fs=window.__optiboxFs||{};
+  const url=URL.createObjectURL(new Blob([bytes],{type:(fs.mimeFor&&fs.mimeFor(name))||''}));
+  if(VID_RE.test(name)||/\.webm$/i.test(name)){
+    const v=document.createElement('video');v.src=url;v.muted=true;v.playsInline=true;v.preload='metadata';return v;
+  }
+  const img=document.createElement('img');img.src=url;img.alt=name;return img;
+}
+// Replace a card's extension icon with a thumbnail of the box file at `path`.
+// Silent on failure: the icon it started with is a fine fallback.
+async function thumbFromBox(card,path,name,size){
+  try{
+    if(!(IMG_RE.test(name)||VID_RE.test(name)))return;
+    if(size!==undefined&&size>THUMB_MAX_BYTES)return;
+    const fs=window.__optiboxFs;if(!fs||!fs.readBytes)return;
+    const bytes=await fs.readBytes(path);
+    if(!bytes||!bytes.length)return;
+    const media=thumbElement(name,bytes);
+    const icon=card.querySelector('.cardIcon');
+    if(icon)icon.replaceWith(media);else card.insertBefore(media,card.firstChild);
+  }catch(_){}
+}
 function renderAttachDeck(el,atts,side){
   if(!el||!el.parentNode)return;
   const deck=document.createElement('div');deck.className='attachDeck '+(side==='left'?'deckLeft':'deckRight');
@@ -568,10 +598,20 @@ function renderAttachDeck(el,atts,side){
     const card=document.createElement('div');card.className='card';card.title=a.name;
     // On REPLAY we have the filename/type but not the bytes (they aren't in the
     // journal) — fall through to the generic ext card and drop the click-open.
-    if(IMG_RE.test(a.name)&&a.bytes){const img=document.createElement('img');img.src=URL.createObjectURL(new Blob([a.bytes]));card.appendChild(img);}
-    else if(VID_RE.test(a.name)&&a.bytes){const v=document.createElement('video');v.src=URL.createObjectURL(new Blob([a.bytes]));v.muted=true;card.appendChild(v);}
+    if((IMG_RE.test(a.name)||VID_RE.test(a.name))&&a.bytes){card.appendChild(thumbElement(a.name,a.bytes));}
     else if(isAudioName(a.name)){const ic=document.createElement('div');ic.className='cardIcon cardAudio';ic.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(ic);}
-    else{const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(a.name);card.appendChild(ic);}
+    else{
+      const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(a.name);card.appendChild(ic);
+      // Replay has the name but not the bytes (the journal stores metadata
+      // only). Uploads land at a KNOWN path, so a reopened conversation can
+      // show its pictures again instead of a wall of extension cards.
+      if(IMG_RE.test(a.name)||VID_RE.test(a.name)){
+        const dest='attachments/'+a.name.replace(/[/\\]/g,'_');
+        void thumbFromBox(card,dest,a.name).then(()=>{
+          if(card.querySelector('img,video'))card.addEventListener('click',()=>{try{window.__optiboxFs.openPath(dest);}catch(_){}});
+        });
+      }
+    }
     const nm=document.createElement('div');nm.className='cardName';nm.textContent=a.name;card.appendChild(nm);
     if(a.bytes)card.addEventListener('click',()=>{try{window.__optiboxFs.openBytes(a.name,a.bytes);}catch(_){}});
     deck.appendChild(card);
@@ -615,12 +655,19 @@ async function renderAgentAttachments(el){
   }
   const hits=ordered.slice(0,8);
   if(!hits.length)return;
+  const sizeOf={};for(const e of files)if(e&&e.path!==undefined)sizeOf[e.path]=e.size;
   const deck=document.createElement('div');deck.className='attachDeck deckLeft';
   hits.forEach(path=>{
     const name=path.split('/').pop();
     const card=document.createElement('div');card.className='card';card.title=path;
     if(isAudioName(name)){const ic=document.createElement('div');ic.className='cardIcon cardAudio';ic.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(ic);}
-    else{const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(name);card.appendChild(ic);}
+    else{
+      const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(name);card.appendChild(ic);
+      // The agent's own files live in the box, so the deck has to go and get
+      // them. Without this every picture the agent made rendered as the word
+      // "PNG" in a grey rectangle.
+      void thumbFromBox(card,path,name,sizeOf[path]);
+    }
     const nm=document.createElement('div');nm.className='cardName';nm.textContent=name;card.appendChild(nm);
     card.addEventListener('click',()=>{try{if(window.__optiboxFs&&window.__optiboxFs.openPath)window.__optiboxFs.openPath(path);}catch(_){}});
     deck.appendChild(card);

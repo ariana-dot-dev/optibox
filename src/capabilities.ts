@@ -464,7 +464,27 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     // Launch detached, tee to a log so we can poll for incremental output.
     // The harness process runs in spec.cwd so AGENTS.md / other native rule
     // files written there are in the harness' real discovery path.
-    const launch = `mkdir -p ${shq(dir)} && cd ${shq(workdir)} && ${envPrefix}nohup bash -c ${shq(`${argvStr} > ${shq(log)} 2>&1; echo "__CBA_EXIT__:$?" >> ${shq(log)}`)} >/dev/null 2>&1 & echo $!`;
+    //
+    // The harness argv (which embeds the full prompt, transcript included) goes
+    // into a run script FILE, never into any wrapper's command line. The prompt
+    // text literally contains strings like `google-chrome`; when it rode in the
+    // wrapper's /proc cmdline, an agent debugging its browser with
+    // `pkill -f google-chrome` matched and killed the wrapper — the liveness
+    // sentinel — while the harness (which rewrites its process title) survived,
+    // so the turn was declared dead mid-work and the idle auto-stop froze the
+    // box under a still-running agent (ASC-382). The script travels base64'd so
+    // no quoting of arbitrary prompt bytes can break the launch command.
+    const script = `${dir}/run.sh`;
+    const scriptB64 = Buffer.from(`exec ${argvStr} > ${shq(log)} 2>&1\n`, "utf8").toString("base64");
+    // The background `&` is grouped in an explicit subshell. Bare, it binds the
+    // WHOLE `&&` chain: the backgrounded compound shell then keeps the command's
+    // stdout pipe open for the harness' entire lifetime, and the /commands API
+    // waits for output EOF — so the launch call blocked for min(run duration,
+    // command timeout) before the first poll could happen (measured 8.4s for an
+    // 8s child; grouped: 0.5s). Inside the parens, `&` detaches only the nohup
+    // wrapper (fds on /dev/null), `$!` is the wrapper's real pid, and the
+    // subshell exits immediately.
+    const launch = `mkdir -p ${shq(dir)} && printf '%s' ${shq(scriptB64)} | base64 -d > ${shq(script)} && cd ${shq(workdir)} && ( ${envPrefix}nohup bash -c ${shq(`bash ${shq(script)}; echo "__CBA_EXIT__:$?" >> ${shq(log)}`)} >/dev/null 2>&1 & echo $! )`;
     const launched = await box.command(boxId, { command: launch, timeoutMs: 30_000 });
     const pid = launched.stdout.trim().split(/\s+/).pop() ?? "";
 
@@ -492,6 +512,12 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     let offset = 0;
     // Bytes per poll must stay under the 524288 cap with room for the meta suffix.
     const READ_WINDOW = 500_000;
+    // ~10s of continuous pid-down + zero-growth (wall clock, not poll count —
+    // poll round trips are 0.5-1.5s each) before declaring the run dead without
+    // a marker: long enough to ride out a model-thinking gap when only the
+    // wrapper died, short enough that a genuine crash still fails fast.
+    const DOWN_QUIET_MS_BEFORE_DEAD = 10_000;
+    let downQuietSince = 0;
     // Consecutive poll failures = the BOX is gone, not a network blip. When a
     // box is stopped externally mid-run (another process's reaper, a manual
     // `box stop`, platform eviction), EVERY poll throws — and silently retrying
@@ -560,16 +586,26 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
         reportCompletion({ reason: "completed", exitCode: Number(exitMatch[1]) });
         return;
       }
-      if (moreToDrain) continue; // more tail than one window holds — keep reading
-      // process gone but no exit marker -> stop polling (crash/kill, not a clean end)
+      if (moreToDrain) { downQuietSince = 0; continue; } // more tail than one window holds — keep reading
+      // Process gone but no exit marker -> crash/kill, not a clean end. The pid
+      // we hold is the WRAPPER's; the wrapper can die while the harness lives
+      // (ASC-382: an agent pkill matched it). A growing log is proof of life no
+      // matter what kill -0 says, so the verdict needs BOTH: pid down AND zero
+      // new bytes for long enough to outlast a model-thinking gap between
+      // output bursts.
       if (pid && alive === "down") {
+        if (bytesThisPoll > 0) { downQuietSince = 0; continue; }
+        if (!downQuietSince) { downQuietSince = Date.now(); continue; }
+        if (Date.now() - downQuietSince < DOWN_QUIET_MS_BEFORE_DEAD) continue;
         if (parser.mode !== "raw-stdout" && parser.lineBuffer.trim()) {
           yield noteChunk({ text: parser.lineBuffer, messageId: "stdout-0", messageIndex: 0 });
           parser.lineBuffer = "";
         }
+        yield noteChunk({ text: "\n[runner lost the harness process before its exit marker — the machine may still be executing]", messageId: "stdout-0", messageIndex: 0 });
         reportCompletion({ reason: "process-exited" });
         return;
       }
+      downQuietSince = 0;
     }
     if (aborted) { reportCompletion({ reason: "aborted" }); return; }
     yield noteChunk({ text: `\n[runHarness safety timeout after ${Math.round(timeoutMs / 1000)}s]`, messageId: "stdout-0", messageIndex: 0 });

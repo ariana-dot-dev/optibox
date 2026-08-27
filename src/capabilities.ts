@@ -488,12 +488,17 @@ export function createUserBoxCapabilities(box: BoxClient, boxId: string, options
     const launched = await box.command(boxId, { command: launch, timeoutMs: 30_000 });
     const pid = launched.stdout.trim().split(/\s+/).pop() ?? "";
 
-    // Interrupt == "agent stops talking": SIGINT then SIGKILL the captured PID
-    // inside the Box. The harness' session file is already flushed for completed
-    // turns, so the conversation remains resumable by id on the next message.
+    // Interrupt == "agent stops talking": SIGINT then SIGKILL the wrapper AND
+    // its child inside the Box. The captured pid is the wrapper bash; run.sh
+    // exec's straight into the harness, so the harness is the wrapper's direct
+    // child and `pkill -P` reaches it. Killing only the wrapper (the old code)
+    // left the harness running detached — invisible before the growth-gated
+    // death verdict, guaranteed-alive after it. The harness' session file is
+    // already flushed for completed turns, so the conversation remains
+    // resumable by id on the next message.
     const interruptInBox = async (): Promise<void> => {
       if (!pid) return;
-      await box.command(boxId, { command: `kill -INT ${pid} 2>/dev/null; sleep 0.2; kill -KILL ${pid} 2>/dev/null; true`, timeoutMs: 15_000 }).catch(() => undefined);
+      await box.command(boxId, { command: `pkill -INT -P ${pid} 2>/dev/null; kill -INT ${pid} 2>/dev/null; sleep 0.2; pkill -KILL -P ${pid} 2>/dev/null; kill -KILL ${pid} 2>/dev/null; true`, timeoutMs: 15_000 }).catch(() => undefined);
     };
     if (spec.signal?.aborted) { await interruptInBox(); reportCompletion({ reason: "aborted" }); return; }
     let aborted = false;

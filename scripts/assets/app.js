@@ -133,8 +133,12 @@ let workingEl=null;
 // scrolls on every event (auto-stop ticks re-render a hidden trace bubble every
 // second) yank the user down while they are reading history.
 function chatStick(c){return (c.scrollHeight||0)-(c.scrollTop||0)-(c.clientHeight||0)<90;}
-function showWorking(){const c=$('chat');const stick=chatStick(c);$('empty')?.remove();if(!workingEl){workingEl=document.createElement('div');workingEl.className='working';workingEl.textContent='working';}c.appendChild(workingEl);if(stick)c.scrollTop=c.scrollHeight;}
-function moveWorkingToBottom(){if(workingEl)$('chat').appendChild(workingEl);}
+function showWorking(){const c=$('chat');const stick=chatStick(c);$('empty')?.remove();if(!workingEl){workingEl=document.createElement('div');workingEl.className='working';workingEl.textContent='working';}moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;}
+// The "working…" indicator lives in the FOOTER of the message currently streaming
+// (activeBoxKey), so it reads as "this message is still being written". When no
+// message is streaming — a fresh turn, or the last message is already finalized —
+// it falls back to a standalone line at the bottom of the chat.
+function moveWorkingToBottom(){if(!workingEl)return;const host=activeBoxKey?bubbles.get(activeBoxKey):null;if(host){workingEl.classList.add('inMsg');host.appendChild(workingEl);}else{workingEl.classList.remove('inMsg');$('chat').appendChild(workingEl);}}
 function clearWorking(){if(workingEl){workingEl.remove();workingEl=null;}}
 let showTraces=false;
 function syncTraceVisibility(){document.body.classList.toggle('hide-traces',!showTraces);}
@@ -330,12 +334,47 @@ async function attachDesktopStream(w){
   }
   var n2=w.el.querySelector('.desktopNote');if(n2)n2.textContent='desktop stream did not start';
 }
-function addMsg(cls,tag,text,key){if(cls!=='trace')currentToolChain=null;const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);if(!el){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}const body=el.querySelector('.body');const raw=stripHidden((body.dataset.raw||'')+text);body.dataset.raw=raw;const shown=stripEndSentinel(stripFileDecl(raw)).trim();body.textContent=shown;if(cls==='assistant'||cls==='user')body.innerHTML=md(shown);
+function addMsg(cls,tag,text,key){const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);const isNew=!el;const isBox=cls==='assistant'&&!!tag&&/machine/.test(tag);
+// Reset the running tool chain only when a genuinely NEW bubble appears. A message
+// that keeps streaming (same key) then keeps stacking its interleaved tool calls
+// into ONE chain, instead of spawning a fresh numbered chain every speak/tool loop.
+if(cls!=='trace'&&isNew)currentToolChain=null;
+if(isNew){el=document.createElement('div');el.className='msg '+cls;el.innerHTML=(tag?'<div class="tag">'+esc(tag)+'</div>':'')+'<div class="body"></div>';c.appendChild(el);bubbles.set(key,el);}
+const body=el.querySelector('.body');
+// A new speak segment landing in a bubble that already has text (a tool call ran
+// between speaks) starts a fresh paragraph, so successive speaks in one message
+// don't run together into an unreadable wall of text.
+let incoming=String(text==null?'':text);
+if(isBox&&!isNew&&boxBreakPending&&body.dataset.raw)incoming='\n\n'+incoming;
+if(isBox)boxBreakPending=false;
+const raw=stripHidden((body.dataset.raw||'')+incoming);body.dataset.raw=raw;const shown=stripEndSentinel(stripFileDecl(raw)).trim();body.textContent=shown;if(cls==='assistant'||cls==='user')body.innerHTML=md(shown);
 // Rule 6: a box round that emits ONLY the <end> silence sentinel must render
 // NOTHING — no empty "user machine" bubble. Collapse it; it re-shows if real
 // text streams in later (reversible per render).
-if(cls==='assistant'&&tag&&/machine/.test(tag)&&el.style)el.style.display=shown.trim()?'':'none';
+if(isBox&&el.style)el.style.display=shown.trim()?'':'none';
+if(cls==='assistant'||cls==='user')applyClamp(el,key);
 moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;return el;}
+// Long messages collapse to COLLAPSE_LINES with a Show more / Show less toggle,
+// so a chatty streamed message doesn't bury the rest of the conversation. The
+// bubble that is still actively streaming (activeBoxKey) is never clamped, so the
+// user always sees the live tail; it collapses once the turn moves on.
+const COLLAPSE_LINES=7;
+function applyClamp(el,key){const body=el&&el.querySelector('.body');if(!body)return;const lh=parseFloat(getComputedStyle(body).lineHeight)||20;
+// scrollHeight is the full content height even while max-height clamps the body,
+// so the line count stays accurate without un-clamping (no flicker). A message
+// clamps as soon as it passes the threshold — including while it is still
+// streaming — and the label counts the hidden lines live, so you watch it grow
+// without expanding. A manual expand (userExpanded) is respected across renders.
+const total=Math.round(body.scrollHeight/lh);let btn=el.querySelector('.msgMore');
+if(total<=COLLAPSE_LINES+0.5){el.classList.remove('clamped');if(btn)btn.remove();return;}
+el.style.setProperty('--clamp-px',Math.round(lh*COLLAPSE_LINES)+'px');el.dataset.hiddenLines=String(Math.max(1,total-COLLAPSE_LINES));
+if(!btn){btn=document.createElement('button');btn.className='msgMore';btn.type='button';btn.addEventListener('click',function(){const nowClamped=el.classList.toggle('clamped');el.dataset.userExpanded=nowClamped?'':'1';btn.textContent=nowClamped?clampMoreLabel(el):'Show less';});el.appendChild(btn);}
+if(el.dataset.userExpanded==='1'){el.classList.remove('clamped');btn.textContent='Show less';}
+else{el.classList.add('clamped');btn.textContent=clampMoreLabel(el);}}
+// The collapsed label counts the hidden lines ("Show 24 more lines") and updates
+// on every render, so a message that keeps growing while collapsed shows it is
+// still growing without the reader having to expand it.
+function clampMoreLabel(el){const n=parseInt(el.dataset.hiddenLines||'0',10)||0;return 'Show '+n+' more line'+(n===1?'':'s');}
 // The box agent declares files it created/modified in a trailing tag
 // <optibox-files>a, b</optibox-files> (see the FILE MANIFEST instruction). Strip
 // it from the visible chat (even a partial one mid-stream) and parse the names.
@@ -352,6 +391,12 @@ function parseFileDecl(s){s=String(s);const a=s.indexOf('<optibox-files');if(a<0
 const toolChains=[];
 let currentToolChain=null;
 let toolSeq=0;
+// Set when a tool call runs; the next box speak that lands in the same bubble
+// inserts a paragraph break before its text (see addMsg). activeBoxKey is the key
+// of the box message currently streaming — it is never clamped and it hosts the
+// "working…" footer.
+let boxBreakPending=false;
+let activeBoxKey=null;
 function toolLabel(count){return count+' tool call'+(count===1?'':'s');}
 function isToolFinished(call){return call.state==='finished'||call.state==='error';}
 function compactToolText(value,limit){const text=String(value||'').trim();if(!text)return '';return text.length>limit?text.slice(0,limit)+'…':text;}
@@ -362,7 +407,9 @@ function ensureToolChain(localId){const c=$('chat');const stick=chatStick(c);$('
 function toggleToolChain(chain){chain.open=!chain.open;chain.el.classList.toggle('open',chain.open);chain.summary.setAttribute('aria-expanded',String(chain.open));}
 function renderToolChain(chain){const cc=$('chat');const stick=chatStick(cc);const count=chain.calls.length;chain.label.textContent=toolLabel(count);if(count!==chain.lastCount){chain.label.classList.remove('bump');void chain.label.offsetWidth;chain.label.classList.add('bump');setTimeout(()=>chain.label.classList.remove('bump'),180);chain.lastCount=count;}const running=chain.calls.some(c=>!isToolFinished(c));chain.el.classList.toggle('running',running);chain.details.innerHTML=chain.calls.map((call,idx)=>{const status=call.state==='error'?'error':(isToolFinished(call)?'finished':'running');const bits=[];if(call.command)bits.push('command: '+compactToolText(call.command,300));if(call.description)bits.push('description: '+compactToolText(call.description,300));if(call.stderr)bits.push('stderr: '+compactToolText(call.stderr,800));const out=call.stdout?'<pre class="toolCallOutput">'+esc(compactToolText(call.stdout,2000))+'</pre>':'';return '<div class="toolCallDetail"><div class="toolCallHead">'+(idx+1)+'. '+esc(toolTitle(call))+' · '+esc(status)+'</div>'+(bits.length?'<div class="toolCallMeta">'+esc(bits.join('\n'))+'</div>':'')+out+'</div>';}).join('');if(stick)cc.scrollTop=cc.scrollHeight;}
 function addToolEvent(ev,localId){let chain=currentToolChain;if(ev.phase==='tool_result'){const running=findRunningTool();if(running){Object.assign(running,{state:toolStateFromEvent(ev),stdout:ev.stdout||running.stdout||'',stderr:ev.stderr||running.stderr||'',isError:Boolean(ev.isError),resultSeen:true});const owner=toolChains.find(ch=>ch.calls.includes(running));if(owner)renderToolChain(owner);return owner&&owner.el;}}
-chain=ensureToolChain(localId);const call={id:'tool-'+(++toolSeq),toolName:ev.toolName||'tool',command:ev.command||'',description:ev.description||'',stdout:ev.stdout||'',stderr:ev.stderr||'',isError:Boolean(ev.isError),state:toolStateFromEvent(ev),resultSeen:ev.phase==='tool_result'};chain.calls.push(call);renderToolChain(chain);return chain.el;}
+chain=ensureToolChain(localId);const call={id:'tool-'+(++toolSeq),toolName:ev.toolName||'tool',command:ev.command||'',description:ev.description||'',stdout:ev.stdout||'',stderr:ev.stderr||'',isError:Boolean(ev.isError),state:toolStateFromEvent(ev),resultSeen:ev.phase==='tool_result'};chain.calls.push(call);renderToolChain(chain);
+// A tool ran, so the next speak into the current box bubble opens a new paragraph.
+boxBreakPending=true;return chain.el;}
 function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date.now();if(!timer)timer=setInterval(renderTotals,100);}document.body.dataset.billing='1';setWarmingPulse(false);setState('private machine running · tools active · billing live');renderTotals();}
 // totalSeconds ownership: the SERVER's cumulative billedSecondsTotal is the one
 // truth (applyRuntimeStatus ASSIGNS it from every snapshot). The += here is only
@@ -950,11 +997,15 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
   else if(ev.type==='runtime.proof'){addMsg('trace','proof · no Box prompt/API','boxPromptApiUsed='+ev.boxPromptApiUsed+' · boxBuiltInAgentUsed='+ev.boxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\n',keyFor(ev,localId,'proof'));}
   else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine; stdout/SSE relays native chunks as emitted.',keyFor(ev,localId,'exec'));}
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');if(isDesktopCommand(ev.command)){if(ev.phase==='tool_use'&&localId===latestLocalId)ensureDesktopWidget(localId);}else{addToolEvent(ev,localId);}}
-  else if(ev.type==='user-box.delta'){lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,keyFor(ev,localId,'box'));}
+  else if(ev.type==='user-box.delta'){const k=keyFor(ev,localId,'box');if(activeBoxKey&&activeBoxKey!==k){const prevKey=activeBoxKey,prev=bubbles.get(prevKey);activeBoxKey=null;if(prev)applyClamp(prev,prevKey);}activeBoxKey=k;lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,k);}
   else if(ev.type==='desktop.recording'){renderDesktopRecording(ev,localId);}
   else if(ev.type==='billing.stop'){if(!replaying){stopBilling(ev.elapsedSeconds);endDesktopWidget();}}
   else if(ev.type==='autostop.timer'){if(!replaying){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('stopping…');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));if(!replaying)setState(describeAutoStop(ev));}
-  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);renderLinkPreviews(lastAgentMsgEl);lastAgentMsgEl=null;}if(lastSharedMsgEl){renderLinkPreviews(lastSharedMsgEl);lastSharedMsgEl=null;}
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;
+    // The streaming target is finalized: drop the active marker and clamp it if it
+    // grew past the collapse threshold, and detach the working footer.
+    if(activeBoxKey){const fk=activeBoxKey,fb=bubbles.get(fk);activeBoxKey=null;if(fb)applyClamp(fb,fk);}
+    if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);renderLinkPreviews(lastAgentMsgEl);lastAgentMsgEl=null;}if(lastSharedMsgEl){renderLinkPreviews(lastSharedMsgEl);lastSharedMsgEl=null;}
     // Per-turn receipt: the economic argument for per-second billing, made
     // legible per artifact — "that PDF cost you $0.0041". Only for turns that
     // actually ran the private machine, and only when a real amount accrued.

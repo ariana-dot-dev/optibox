@@ -1,132 +1,70 @@
 # Optibox
 
-Optibox is a small TypeScript orchestration layer for consumer agents on Box. It gives users an instant shared response while starting or resuming their private Box, then hands off tool work to your real harness running inside that Box.
+Optibox is a small TypeScript orchestration layer for consumer agents on Box. It gives users an instant shared response while starting or resuming their private Box, then hands the work to the agents that ship inside that Box.
 
 ## Minimal wiring
 
-This is the smallest complete shape used by the demos: choose a harness, pass the Box client, inject the provider keys that the harness needs inside the Box, stream visible deltas, and stop the private Box when the conversation should pause billing.
+Pick a Box API key, the provider keys your users' agents run on, and a model for the shared bridge. The private side needs nothing else: every Box comes with Claude Code, Codex, pi, OpenCode and Prime Agent installed, and Box keeps each conversation's memory itself.
 
 ```ts
-import {
-  BoxHttpClient,
-  ConsumerBoxAgentOrchestrator,
-  InMemorySessionStore,
-} from "@ascii-prototypes/consumer-box-agents";
-import { providerEnvForBox } from "./examples/shared.js";
-import { harness as claude } from "./examples/claude-sdk/adapter.js";
+import { BoxHttpClient, Engine, openDb } from "@ascii-prototypes/consumer-box-agents";
 
-const orchestrator = new ConsumerBoxAgentOrchestrator({
+const engine = new Engine({
+  db: await openDb(process.env.DATABASE_URL!),
   box: new BoxHttpClient({ apiKey: process.env.BOX_API_KEY! }),
-  harnesses: [claude],
-  sessions: new InMemorySessionStore(),
-  providerEnv: providerEnvForBox(),
-  sharedBoxName: "my-app-shared-prewarm",
-  userBoxName: (userId) => `my-app-user-${userId}`,
-  autoStopIdleMs: 60_000,
+  instanceId: "my-app",
+  credHash: "server",
+  providerEnv: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! }, // lands in the user's Box, nothing else does
+  sharedModel: "anthropic/claude-haiku-4-5",                            // the instant no-tools answer
+  autoStopIdleMs: 15_000,
 });
 
-for await (const event of orchestrator.runTurn({
+for await (const event of engine.runTurn({
   userId: "user-1",
   conversationId: "chat-1",
   message: "Check my CPU count.",
-  selection: {
-    harness: "claude-agent-sdk",
-    provider: "anthropic",
-    model: "claude-sonnet-4-6",
-  },
+  selection: { harness: "claude-code", provider: "anthropic", model: "claude-sonnet-5", reasoningEffort: "medium" },
 })) {
-  if (event.type === "shared.delta" || event.type === "user-box.delta") {
-    process.stdout.write(event.text);
-  }
+  if (event.type === "shared.delta" || event.type === "user-box.delta") process.stdout.write(event.text);
 }
 
 // When the user closes the chat or asks to pause, archive the private Box.
-for await (const event of orchestrator.stopUserBox("user-1", "chat-1")) {
+for await (const event of engine.stopUserBox("user-1", "chat-1")) {
   if (event.type === "billing.stop") console.log("billing paused");
 }
 ```
 
-A harness is the developer-owned agent loop. The included adapters in `examples/*/adapter.ts` all use the same contract: the shared phase performs a restricted text-only provider call, and the user-Box phase runs the real CLI inside the private Box with provider keys injected via `providerEnv`.
+`selection.harness` is a Box provider id (`claude-code`, `codex`, `pi`, `opencode`, `prime-agent`); models and reasoning levels come from `GET /api/provider-models`, which the demo server exposes as `/api/harnesses`. A user can switch harness or model on any message: the conversation continues with its memory.
 
-## The base environment every user inherits
+## What Box does for you
 
-A user machine is never built during a turn. The deployment builds ONE template
-box — installs the harnesses, stops it, resumes it, launches the harnesses once
-so the restore records their access order, stops it again — and then freezes that
-verified disk as a Box **named snapshot**. Every user machine is
-`create({ from: "<that name>" })`: a deploy of the frozen artifact, not a fork of
-a live box.
-
-The distinction matters. A fork walks the template box's live chain tip, so
-anything that touches that box afterwards — a resume, an inspection, a rebuild
-that got halfway — is inherited by every machine handed out later. The artifact
-is frozen at the instant the build verified it, a rebuild keeps serving the
-previous artifact until the new one is ready, and the deploy carries none of the
-source's conversation history.
-
-Two rules the build enforces, both learned the hard way:
-
-- **Install where a resume can find it.** A box image serves node through nvm, so
-  a plain `npm i -g` lands the harness in `~/.nvm` — which a stop/resume does not
-  bring back (measured: 1.3 GB before the stop, 3.3 MB after, `node` falling back
-  to the image's system node and every global binary gone). The template plants
-  its own node under `/usr/local`, which the box's system delta does carry, and
-  installs the harnesses with that npm.
-- **Prove it on the far side of a stop.** The warm pass runs after the template
-  has been stopped and resumed, and its exit code is the build's acceptance test.
-  A template that cannot run its own harness after a resume is a failed build,
-  not a ready one.
+| Job | Box |
+|---|---|
+| Install and update the agents on every machine | Preinstalled; nothing to build or warm-cycle |
+| Spawn the agent with the prompt, in the right directory, with the right keys | `POST /boxes/{id}/prompt` |
+| Capture its output, parse tool calls, stream to the UI | `GET /boxes/{id}/events` (text, tool calls, results) |
+| Remember the session so the next message continues the thread | A Box **conversation**: `new: true` once, then `conversationId` |
+| Explore two directions at once without sessions colliding | Parallel conversations on the same Box (`scenariosEnabled`) |
+| Stop the right process | `POST /boxes/{id}/interrupt?conversation=` |
+| Keep the memory across stop / resume | Conversations ride the snapshot |
+| Give every user their own keys | `POST /boxes {noEnv: true, env: {...}}` |
 
 ## Handing a machine to someone who is not you
 
-Every box this layer creates passes `noEnv`, which withholds the account owner's
-env vars, secret files, and GitHub/box/agents credentials from the machine. The
-box keeps its own scoped token, so `host` and the desktop still work.
+Every box this layer creates passes `noEnv` and its own `env`: the account owner's env vars, secret files and credentials never reach the machine; only the keys in `providerEnv` do. The box keeps its own scoped token, so `host` and the desktop still work.
 
-This is not optional hygiene for a consumer product: without it, a box created by
-your account inherits *your* environment, and the anonymous visitor whose agent
-has shell access inside it can read all of it.
+## The six rules
 
-## Main use case
-
-Optibox helps you build a responsive consumer agent without keeping every user's private Box running all the time.
-
-Simple chat can be answered immediately by a shared assistant. Requests that need private files, shell commands, or user-specific machine state are handed off to the user's Box, where your real harness runs with tools.
+1. Always answer something: the shared bridge streams immediately, a full answer or a short holding line (its choice).
+2. The private agent answers on top, with the shared text handed to it.
+3. The shared agent never claims it cannot act: the private machine will.
+4. The machine stops after the idle window; any activity resets it; hosting keeps it up.
+5. A warm, responsive machine is routed to directly: no bridge text.
+6. The private agent declines with exactly `<end>`; no text and no `<end>` is a loud `turn.blocked`.
 
 ## Architecture
 
-Your app provides:
-
-- a Box API key
-- one or more harness adapters
-- provider API keys for the models those harnesses use
-- session persistence so a user/conversation can resume the same Box
-
-Optibox provides:
-
-- per-user Box lifecycle management
-- shared-first routing when the private Box is not ready
-- direct-to-Box routing when the private Box is already warm
-- transcript and handoff context
-- provider environment injection for in-Box harness processes
-- streaming events for UI updates, tool telemetry, lifecycle, and billing
-- stop, archive, and resume handling
-
-The shared side is restricted and fast. The Box side has the user's private runtime and runs your harness through Box commands.
-
-## Message flow
-
-1. The user sends a message with a selected harness/provider/model.
-2. Optibox immediately requests start/resume/warm-up for that user's private Box, even for a first-turn greeting.
-3. In parallel, Optibox resolves the exact Box state for route labeling and hidden context.
-4. If the Box is already warm and no private lock is busy, Optibox routes directly to the selected in-Box harness.
-5. If the Box is not ready, the shared assistant streams a restricted answer or bridge while the private Box boot/resume continues in parallel.
-6. The shared assistant emits a hidden routing decision: continue privately, or suppress the private/tool answer if the shared answer was enough. This decision never prevents the private Box from being started for the conversation.
-7. When private work is needed and the Box is ready, the harness receives the hidden conversation context, machine state, and any shared text already shown to the user.
-8. The harness runs inside the Box with provider keys and tools, streams `user-box.delta` output, and may emit tool telemetry.
-9. After the turn, Optibox can keep the Box briefly warm for follow-ups, then stop/archive it to pause billing.
-
-## State machine
+Your app provides a Box API key, provider keys, and Postgres. Optibox provides per-user Box lifecycle, shared-first routing, the standing rules every harness reads (`AGENTS.md` / `CLAUDE.md`, written once per machine), transcript and hidden context, streaming events for the UI, billing, holds, hosting detection, stop and resume.
 
 ```mermaid
 stateDiagram-v2
@@ -142,7 +80,7 @@ stateDiagram-v2
   BoxStarting --> BoxReady
   BoxReady --> HandoffPending
   DirectBox --> BoxAnswer
-  HandoffPending --> BoxAnswer: run selected harness in Box
+  HandoffPending --> BoxAnswer: POST /prompt on the Box conversation
   BoxAnswer --> WarmIdle
   WarmIdle --> Archived: stop/idle timeout
   Archived --> SharedReady: next message can resume

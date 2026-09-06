@@ -5,25 +5,13 @@ import { URL, fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   BoxHttpClient,
-  assertNoBoxAgent,
   BOX_PRICING,
   Engine,
   openDb,
   databaseUrlFromEnv,
   type Db,
-  createRestrictedSharedCapabilities,
-  createSharedInfraCapabilities,
-  RUNTIME_FEASIBILITY,
   type ConsumerTurnEvent,
 } from "../src/index.js";
-import { realCliHarness, type RealCliHarnessSpec } from "../examples/shared.js";
-import { spec as claudeSpec } from "../examples/claude-sdk/adapter.js";
-import { spec as codebaseDaemonSpec } from "../examples/codebase-daemon/adapter.js";
-import { spec as codexSpec } from "../examples/codex-sdk/adapter.js";
-import { spec as opencodeOpenrouterSpec } from "../examples/opencode-openrouter/adapter.js";
-import { spec as openclaudeSpec } from "../examples/openclaude/adapter.js";
-import { spec as opencodeSpec } from "../examples/opencode/adapter.js";
-import { spec as piSpec } from "../examples/pi/adapter.js";
 
 const port = Number(process.env.PORT ?? 4178);
 
@@ -69,18 +57,42 @@ const allowServerKeys =
   (process.env.PRODUCT_MODE !== "agent" &&
     process.env.OPTIBOX_ALLOW_SERVER_KEYS !== "0");
 
-const allSpecs: RealCliHarnessSpec[] = [
-  // Pi first → it is the default harness/model selection (the client picks the
-  // first harness whose provider key is available). OpenRouter-backed, feature-
-  // complete, being trialled against opencode for snappiness/stability.
-  piSpec,
-  claudeSpec,
-  codebaseDaemonSpec,
-  codexSpec,
-  opencodeOpenrouterSpec,
-  openclaudeSpec,
-  opencodeSpec,
-];
+/**
+ * The harness catalog is the Box's own (GET /api/provider-models): every
+ * harness a Box ships with, its models and the reasoning levels each accepts.
+ * A model's key family (which BYOK key it bills to) comes from the credentials
+ * that unlock it; that is all the settings UI needs to grey models out.
+ */
+interface HarnessInfo { name: string; description: string; models: Array<{ provider: string; model: string; label: string; keyAvailable: boolean; requiredEnv: string; reasoningEffort?: string[] }> }
+const CREDENTIAL_ENV: Record<string, string> = { "anthropic-api-key": "ANTHROPIC_API_KEY", "openai-api-key": "OPENAI_API_KEY", "openrouter-api-key": "OPENROUTER_API_KEY" };
+const HARNESS_ENV: Record<string, string> = { "claude-code": "ANTHROPIC_API_KEY", codex: "OPENAI_API_KEY" };
+const PROVIDER_OF_ENV: Record<string, string> = { ANTHROPIC_API_KEY: "anthropic", OPENAI_API_KEY: "openai", OPENROUTER_API_KEY: "openrouter" };
+let catalogCache: { at: number; harnesses: HarnessInfo[] } | undefined;
+async function harnessCatalog(providerEnv: Record<string, string>): Promise<HarnessInfo[]> {
+  if (!catalogCache || Date.now() - catalogCache.at > 10 * 60_000) {
+    const client = new BoxHttpClient({ apiKey: serverBoxApiKey ?? "catalog" });
+    const config = await client.providerModels();
+    const harnesses: HarnessInfo[] = [];
+    for (const [name, p] of Object.entries(config)) {
+      const models = p.models.flatMap((m) => {
+        const requiredEnv = HARNESS_ENV[name] ?? CREDENTIAL_ENV[m.credentialIds?.[0] ?? ""];
+        if (!requiredEnv) return [];
+        return [{ provider: PROVIDER_OF_ENV[requiredEnv] as string, model: m.id, label: `${p.cli?.name ?? name} · ${m.label}`, keyAvailable: false, requiredEnv, ...(m.reasoningEffort ? { reasoningEffort: m.reasoningEffort.supported } : {}) }];
+      });
+      if (models.length) harnesses.push({ name, description: p.cli?.description ?? name, models });
+    }
+    harnesses.sort((a, b) => (config[a.name]?.cli?.order ?? 99) - (config[b.name]?.cli?.order ?? 99));
+    catalogCache = { at: Date.now(), harnesses };
+  }
+  return catalogCache.harnesses.map((h) => ({ ...h, models: h.models.map((m) => ({ ...m, keyAvailable: Boolean(providerEnv[m.requiredEnv]) })) }));
+}
+
+/** The shared bridge model: the fastest small model the configured keys can reach. */
+function sharedModelFor(providerEnv: Record<string, string>): string {
+  if (providerEnv.OPENROUTER_API_KEY) return "openrouter/anthropic/claude-haiku-4.5";
+  if (providerEnv.ANTHROPIC_API_KEY) return "anthropic/claude-haiku-4-5";
+  return "openai/gpt-4.1-mini";
+}
 
 interface DemoCredentials {
   boxApiKey: string | undefined;
@@ -183,69 +195,25 @@ function engineFor(credentials: DemoCredentials): Engine {
   const cached = engines.get(cacheKey);
   if (cached) return cached;
   const providerEnv = credentials.providerEnv;
-  const harnesses = allSpecs.map((spec) =>
-    realCliHarness(spec, {
-      createSharedRuntime: () => createSharedInfraCapabilities({ providerEnv }),
-    }),
-  );
   const engine = new Engine({
     db,
-    box: assertNoBoxAgent(new BoxHttpClient({ apiKey: credentials.boxApiKey })),
-    harnesses,
+    box: new BoxHttpClient({ apiKey: credentials.boxApiKey }),
     instanceId: INSTANCE_ID,
     // BYOK isolation: the credential hash is part of every user key and box
     // name, so different key sets can never see or sweep each other's boxes.
     credHash: cacheKey.slice(0, 8),
     providerEnv,
+    sharedModel: sharedModelFor(providerEnv),
     userBoxTtlSeconds: 900,
     readinessPollMs: 750,
     handoffTimeoutMs: 120_000,
     // 15s after the assistant finishes (product decision 2026-07-08).
     autoStopIdleMs: 15_000,
-    // Parallel scenarios: opt-in via env until the carousel UI ships. When off,
-    // the shared model is never even asked to fork, so behaviour is unchanged.
+    // Parallel scenarios: opt-in via env until the carousel UI ships.
     scenariosEnabled: process.env.OPTIBOX_SCENARIOS === "1",
-    template: {
-      // Pi is the default harness; it MUST be baked into the template or every
-      // fresh box would lack it — and in-turn reinstall is forbidden (crashes).
-      //
-      // WHERE it is installed is the whole game. A box image ships node through
-      // nvm, so a bare `npm i -g` lands the harness in ~/.nvm — and a stop/resume
-      // does not bring ~/.nvm back (measured 2026-08-12 on a same-day box: 1.3 GB
-      // before the stop, 3.3 MB after; `node` falls back to the image's
-      // /usr/bin/node v20 and every globally-installed binary is gone). Since the
-      // template's entire job is to survive exactly that transition, it plants
-      // its own node under /usr/local — which the box's system delta does carry
-      // across a resume — and installs the harnesses with THAT npm. `set -e`
-      // makes any step's failure the build's failure.
-      installCmd: [
-        "set -e",
-        "NV=$(node -v)",
-        'curl -fsSL "https://nodejs.org/dist/$NV/node-v${NV#v}-linux-x64.tar.xz" -o /tmp/node.txz',
-        "sudo -n tar -xJf /tmp/node.txz --strip-components=1 -C /usr/local",
-        "sudo -n /usr/local/bin/npm i -g --prefix /usr/local --ignore-scripts @earendil-works/pi-coding-agent",
-        "sudo -n /usr/local/bin/npm i -g --prefix /usr/local opencode-ai@latest",
-      ].join("; "),
-      // Warm pass records the cold harness launch order into the snapshot — and
-      // its exit code is the build's acceptance test, run on the far side of a
-      // stop/resume, where a lost install shows up. No `|| true`.
-      warmCmd: "bash -lc 'pi --version && opencode --version'",
-    },
   });
   engines.set(cacheKey, engine);
   return engine;
-}
-
-function harnessInfo(providerEnv = serverProviderEnv) {
-  return allSpecs.map((spec) => ({
-    name: spec.name,
-    description: spec.description,
-    models: spec.models.map((m) => ({
-      ...m,
-      keyAvailable: keyAvailable(m.provider, providerEnv),
-      requiredEnv: envForProvider(m.provider),
-    })),
-  }));
 }
 
 function sse(res: http.ServerResponse) {
@@ -685,7 +653,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       if (box) {
         // Wake + bill through the one shared machinery: the counter, reaper
         // and status endpoint all see this machine like a turn-started one.
-        await orch.wake(userId, "composing"); orch.prewarmBoxServe(box.id);
+        await orch.wake(userId, "composing");
         if (!live) {
           fsLog({ route: "activity", userId, note: "composing wake", boxId: box.id, state: box.state });
           void client.resume(box.id).catch(() => undefined);
@@ -701,11 +669,9 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
         coldBooting.add(userId);
         const convId = String(body.conversationId ?? "conv-1");
         fsLog({ route: "activity", userId, note: "cold boot on type", conversationId: convId });
-        // ensureUserBox wakes/bills as part of provisioning (engine.wake inside);
-        // prewarm the resident harness runtime once the box exists.
-        void orch.ensureUserBox(userId, convId).then((booted) => {
-          if (booted?.id) orch.prewarmBoxServe(booted.id);
-        }).catch((e) => fsLog({ route: "activity", userId, note: "cold boot failed", message: String(e).slice(0, 140) }))
+        // ensureUserBox wakes/bills as part of provisioning (engine.wake inside).
+        void orch.ensureUserBox(userId, convId)
+          .catch((e) => fsLog({ route: "activity", userId, note: "cold boot failed", message: String(e).slice(0, 140) }))
           .finally(() => coldBooting.delete(userId));
       }
       // Return the SAME runtime snapshot the tree poll carries: the composing
@@ -916,7 +882,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(
         JSON.stringify({
-          harnesses: harnessInfo(),
+          harnesses: await harnessCatalog(serverProviderEnv),
           env: {
             BOX_API_KEY: Boolean(serverBoxApiKey),
             ANTHROPIC_API_KEY: keyAvailable("anthropic"),
@@ -925,11 +891,18 @@ const server = http.createServer(async (req, res) => {
           },
           serverKeysAllowed: allowServerKeys,
           credentialMode: allowServerKeys ? "server-or-byok" : "byok-required",
-          runtimeFeasibility: RUNTIME_FEASIBILITY,
-          boxAgent: "disabled (assertNoBoxAgent guard)",
           pricing: BOX_PRICING,
         }),
       );
+    }
+
+    // Stop one running turn: drops its shared stream and interrupts only its
+    // Box conversation; parallel conversations on the same machine keep running.
+    if (req.method === "POST" && url.pathname === "/api/interrupt") {
+      const body = await readBody(req);
+      const stopped = engineFor(credentialsFromBody(body)).interrupt(String(body.turnId ?? ""));
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ ok: true, stopped }));
     }
 
     if (req.method === "GET" && url.pathname === "/api/diagnostics") {
@@ -952,36 +925,6 @@ const server = http.createServer(async (req, res) => {
         "content-disposition": `attachment; filename="optibox-diagnostics-${serverRunId}.json"`,
       });
       return void res.end(JSON.stringify(payload, null, 2));
-    }
-
-    // Live restricted-mode proof: exercise the shared capabilities and show denials.
-    if (req.method === "POST" && url.pathname === "/api/restricted-proof") {
-      const caps = createRestrictedSharedCapabilities();
-      const results: { action: string; denied: boolean; message: string }[] =
-        [];
-      for (const [action, call] of [
-        ["readFile(/etc/passwd)", () => caps.readFile("/etc/passwd")],
-        ["bash(id)", () => caps.bash("id")],
-        ["writeFile(proof.txt)", () => caps.writeFile("proof.txt", "x")],
-        ["controlComputer(click)", () => caps.controlComputer("click 0 0")],
-      ] as const) {
-        try {
-          await call();
-          results.push({
-            action,
-            denied: false,
-            message: "UNEXPECTEDLY ALLOWED",
-          });
-        } catch (e) {
-          results.push({
-            action,
-            denied: true,
-            message: e instanceof Error ? e.message : String(e),
-          });
-        }
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ results }));
     }
 
     if (req.method === "POST" && url.pathname === "/api/send") {
@@ -1009,6 +952,7 @@ const server = http.createServer(async (req, res) => {
         harness: String(body.harness),
         provider: String(body.provider),
         model: String(body.model),
+        ...(typeof body.reasoningEffort === "string" && body.reasoningEffort ? { reasoningEffort: String(body.reasoningEffort) } : {}),
       };
       const credentials = credentialsFromBody(body);
       try {

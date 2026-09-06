@@ -132,6 +132,7 @@ test("interactive demo client sends exactly one /api/send after page load", asyn
     location: { search: "" },
     setInterval,
     clearInterval,
+    getComputedStyle: () => ({ lineHeight: "20px" }),
     document: {
       body: new FakeElement("body"),
       getElementById: getElement,
@@ -226,6 +227,7 @@ test("interactive demo client renders distinct Box assistant messages by native 
     location: { search: "" },
     setInterval,
     clearInterval,
+    getComputedStyle: () => ({ lineHeight: "20px" }),
     document: {
       body: new FakeElement("body"),
       getElementById: getElement,
@@ -300,6 +302,7 @@ test("interactive demo client groups consecutive tool calls into minimal chains"
     setInterval,
     clearInterval,
     setTimeout,
+    getComputedStyle: () => ({ lineHeight: "20px" }),
     document: {
       body: new FakeElement("body"),
       getElementById: getElement,

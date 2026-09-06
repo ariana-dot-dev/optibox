@@ -32,12 +32,15 @@ create table if not exists boxes (
 );
 create unique index if not exists one_active_user_box on boxes(user_key)
   where purpose = 'user' and retired_at is null;
+-- box_conversations: {"<boxId>": "<Box conversation id>"} — the Box keeps the memory,
+-- we keep the pointer (a fresh machine starts a fresh conversation).
 create table if not exists conversations (
   user_key text not null,
   id text not null,
-  harness_sessions jsonb not null default '{}',
+  box_conversations jsonb not null default '{}',
   primary key (user_key, id)
 );
+alter table conversations add column if not exists box_conversations jsonb not null default '{}';
 create table if not exists transcripts (
   seq bigserial primary key,
   user_key text not null,
@@ -77,12 +80,6 @@ create table if not exists hosting (
   misses int not null default 0,
   primary key (user_key, port)
 );
-create table if not exists templates (
-  instance_id text primary key,
-  box_id text not null,
-  status text not null check (status in ('building','ready','failed')),
-  built_at timestamptz
-);
 -- UI render journal: the ordered stream of events the client rendered for a
 -- conversation, stored verbatim so reopening the app REPLAYS it through the very
 -- same handle() renderer and the chat + tool chains + attachments + desktop come
@@ -100,18 +97,9 @@ create table if not exists events (
   at timestamptz not null default now()
 );
 create index if not exists events_conv on events(user_key, conversation_id, seq);
--- Parallel scenarios: a turn can fan out into N alternative private runs, each on
--- its own box. Scenario boxes carry the group (the turn that spawned them) and a
--- human label; transcripts written by a scenario round carry scenario_id so they
--- don't pollute the main-line model context until a winner is merged. All
--- nullable/additive — the one-active-user-box unique index only constrains
--- purpose='user', so scenario boxes never touch that invariant.
-alter table boxes add column if not exists scenario_group text;
-alter table boxes add column if not exists scenario_label text;
+-- Parallel scenarios run as parallel conversations on the user's own box; their
+-- transcripts carry scenario_id so they stay out of the main-line model context.
 alter table transcripts add column if not exists scenario_id text;
--- Widen the purpose CHECK on already-created tables to admit scenario/checkpoint.
-alter table boxes drop constraint if exists boxes_purpose_check;
-alter table boxes add constraint boxes_purpose_check check (purpose in ('user','template','scenario','checkpoint'));
 `;
 
 export interface Db {

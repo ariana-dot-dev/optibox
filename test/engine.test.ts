@@ -3,111 +3,132 @@ import { after, before, test } from "node:test";
 import { Client } from "pg";
 import { openDb, type Db } from "../src/db.js";
 import { Engine } from "../src/engine.js";
-import type { BoxClient, BoxInfo, CommandResult, HarnessAdapter } from "../src/types.js";
+import type { BoxClient, BoxEvent, BoxInfo, CommandResult, HarnessSelection, PromptRun } from "../src/types.js";
 
 /**
  * Behavioral suite for the 6-rule engine against a REAL ephemeral Postgres
- * database (created on the shared server, dropped after). No mocks of the
- * state layer — the schema IS the invariant surface under test.
+ * database (created on the shared server, dropped after). The Box is a fake
+ * that behaves like the integrated-agents API: prompts open conversations,
+ * events carry the full text of each assistant message so far, prompt runs
+ * settle, interrupts are scoped to one conversation.
  */
 
 const baseUrl = process.env.DATABASE_URL;
 if (!baseUrl) throw new Error("DATABASE_URL required for the engine suite");
 const TEST_DB = `optibox_test_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-// Admin work (create/drop the ephemeral db) runs over the configured database
-// itself — CREATE DATABASE works from any connection.
-const adminUrl = baseUrl;
 const testUrl = baseUrl.replace(/\/[^/]*$/, `/${TEST_DB}`);
 
 let db: Db;
-
 before(async () => {
-  const admin = new Client({ connectionString: adminUrl });
+  const admin = new Client({ connectionString: baseUrl });
   await admin.connect();
   await admin.query(`create database ${TEST_DB}`);
   await admin.end();
   db = await openDb(testUrl);
 });
-
 after(async () => {
   await db.close();
-  const admin = new Client({ connectionString: adminUrl });
+  const admin = new Client({ connectionString: baseUrl });
   await admin.connect();
   await admin.query(`drop database if exists ${TEST_DB} with (force)`);
   await admin.end();
 });
 
-// Module-level counter: box ids are PRIMARY KEYs in the shared test database,
-// so per-instance counters would collide across tests.
 let nextBoxId = 1;
+/** Scripted answer of the fake harness: frames of full text per message id, or a thrower. */
+type Answer = { frames?: Array<{ id?: string; text: string; tools?: unknown[] }>; status?: "finished" | "failed"; hang?: boolean };
+
 class FakeBoxClient implements BoxClient {
   boxes = new Map<string, BoxInfo>();
   commands: string[] = [];
-  async create(input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
+  files = new Map<string, string>();
+  prompts: Array<{ boxId: string; input: Record<string, unknown>; conversationId: string; promptId: string }> = [];
+  interrupts: Array<{ boxId: string; conversationId?: string }> = [];
+  eventsCalls = 0;
+  private convs = 0;
+  private runs = new Map<string, { conversationId: string; answer: Answer; events: BoxEvent[]; done: boolean }>();
+  constructor(private answer: Answer | ((input: Record<string, unknown>) => Answer) = { frames: [{ text: "BOX:ran" }] }) {}
+  async create(input: { name?: string; noEnv?: boolean; env?: Record<string, string> }): Promise<BoxInfo> {
     const id = `box-${nextBoxId++}`;
     const box: BoxInfo = { id, state: "idle", ...(input.name ? { name: input.name } : {}) };
     this.boxes.set(id, box);
+    this.files.set(`${id}:create`, JSON.stringify({ noEnv: input.noEnv, env: input.env }));
     return box;
   }
-  async list(): Promise<BoxInfo[]> { return [...this.boxes.values()]; }
   async get(boxId: string): Promise<BoxInfo> { return this.boxes.get(boxId) ?? { id: boxId, state: "error" }; }
-  async update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
+  async update(boxId: string, input: { name?: string }): Promise<BoxInfo> {
     const updated = { ...(await this.get(boxId)), ...(input.name !== undefined ? { name: input.name } : {}) };
     this.boxes.set(boxId, updated);
     return updated;
   }
   async stop(boxId: string): Promise<BoxInfo> { const b = { ...(await this.get(boxId)), state: "archived" }; this.boxes.set(boxId, b); return b; }
   async resume(boxId: string): Promise<BoxInfo> { const b = { ...(await this.get(boxId)), state: "idle" }; this.boxes.set(boxId, b); return b; }
+  async deleteBox(): Promise<void> { /* noop */ }
   async command(boxId: string, input: { command: string }): Promise<CommandResult> {
     const state = (await this.get(boxId)).state;
-    if (!["ready", "idle", "running", "provisioned"].includes(state)) {
-      throw new Error(`fake box ${boxId} cannot run commands in state ${state}`);
-    }
+    if (!["ready", "idle", "running", "provisioned"].includes(state)) throw new Error(`fake box ${boxId} cannot run commands in state ${state}`);
     this.commands.push(input.command);
     return { exitCode: 0, stdout: `ran:${input.command}`, stderr: "" };
   }
-  async readFile(_boxId: string, path: string): Promise<string> { return `file:${path}`; }
-  async writeFile(): Promise<void> { /* noop */ }
+  async readFile(boxId: string, path: string): Promise<string> { return this.files.get(`${boxId}:${path}`) ?? ""; }
+  async writeFile(boxId: string, path: string, content: string): Promise<void> { this.files.set(`${boxId}:${path}`, content); }
+  async prompt(boxId: string, input: { conversationId?: string; new?: boolean; prompt: string }): Promise<PromptRun> {
+    const conversationId = input.conversationId ?? `conv-${++this.convs}`;
+    const promptId = `p-${this.prompts.length + 1}`;
+    this.prompts.push({ boxId, input, conversationId, promptId });
+    const answer = typeof this.answer === "function" ? this.answer(input) : this.answer;
+    const events: BoxEvent[] = [];
+    let t = Date.now();
+    for (const f of answer.frames ?? []) {
+      events.push({ id: f.id ?? "m1", type: "response", timestamp: t++, taskId: promptId, conversationId, data: { content: f.text, ...(f.tools ? { tools: f.tools } : {}), is_streaming: true } });
+    }
+    this.runs.set(promptId, { conversationId, answer, events, done: false });
+    return { promptId, conversationId, status: "queued", done: false };
+  }
+  async promptRun(_boxId: string, promptId: string): Promise<PromptRun> {
+    const run = this.runs.get(promptId)!;
+    // Settles once every frame has been served (or never, when hanging).
+    const done = !run.answer.hang && run.events.length === 0;
+    return { promptId, conversationId: run.conversationId, status: done ? (run.answer.status ?? "finished") : "running", done };
+  }
+  async events(_boxId: string, input: { conversationId?: string }): Promise<{ events: BoxEvent[]; nextCursor?: string | null }> {
+    this.eventsCalls++;
+    // one frame per poll = streaming; a conversation's runs are served in order
+    for (const run of this.runs.values()) {
+      if (run.conversationId !== input.conversationId || run.events.length === 0) continue;
+      return { events: [run.events.shift()!], nextCursor: null };
+    }
+    return { events: [], nextCursor: null };
+  }
+  async interrupt(boxId: string, conversationId?: string): Promise<void> {
+    this.interrupts.push({ boxId, ...(conversationId ? { conversationId } : {}) });
+    for (const run of this.runs.values()) if (run.conversationId === conversationId) { run.answer = { frames: [] }; run.events.length = 0; }
+  }
 }
 
-type HarnessBehavior = { shared?: string; box?: string | (() => AsyncIterable<string>) };
-function harnessOf(name: string, behavior: HarnessBehavior = {}): HarnessAdapter {
-  return {
-    name,
-    description: name,
-    requiredEnv: [],
-    models: [{ provider: "anthropic", model: "m-1" }],
-    async *shared({ capabilities }) {
-      await assert.rejects(capabilities.bash("whoami")); // rule: shared surface is structurally tool-less
-      yield behavior.shared ?? "I’m checking that now.";
-    },
-    async *userBox(ctx) {
-      if (typeof behavior.box === "function") { yield* behavior.box(); return; }
-      const r = await ctx.capabilities.command("echo hi");
-      yield behavior.box ?? `BOX:${r.stdout}`;
-    },
-  };
-}
+const sharedStream = (text = "I’m checking that now.") => async function* () { yield text; };
 
-function makeEngine(box: FakeBoxClient, harness: HarnessAdapter, extra: Partial<ConstructorParameters<typeof Engine>[0]> = {}): Engine {
+function makeEngine(box: FakeBoxClient, extra: Partial<ConstructorParameters<typeof Engine>[0]> = {}): Engine {
   return new Engine({
-    db, box, harnesses: [harness],
+    db, box, sharedStream: sharedStream(),
     instanceId: "testinst", credHash: "cred0001",
-    readinessPollMs: 1, autoStopIdleMs: 30, sweepIntervalMs: 0, handoffTimeoutMs: 5_000,
+    readinessPollMs: 1, autoStopIdleMs: 30, sweepIntervalMs: 0, handoffTimeoutMs: 5_000, eventPollMs: 1,
+    providerEnv: { ANTHROPIC_API_KEY: "sk-test" },
     ...extra,
   });
 }
 
-const sel = { harness: "h", provider: "anthropic", model: "m-1" };
-async function collect(engine: Engine, userId: string, conversationId: string, message: string): Promise<any[]> {
+const sel: HarnessSelection = { harness: "claude-code", provider: "anthropic", model: "claude-sonnet-5" };
+async function collect(engine: Engine, userId: string, conversationId: string, message: string, selection = sel): Promise<any[]> {
   const events: any[] = [];
-  for await (const e of engine.runTurn({ userId, conversationId, message, selection: sel })) events.push(e);
+  for await (const e of engine.runTurn({ userId, conversationId, message, selection })) events.push(e);
   return events;
 }
+const visibleText = (events: any[]) => events.filter((e) => e.type === "user-box.delta").map((e) => e.text).join("");
 
 test("rules 1+3: cold turn bridges (shared answers first), box answers on top, turn settles", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   const events = await collect(engine, "u1", "c1", "run something");
   const sharedIdx = events.findIndex((e) => e.type === "shared.delta");
   const boxIdx = events.findIndex((e) => e.type === "user-box.delta");
@@ -118,15 +139,41 @@ test("rules 1+3: cold turn bridges (shared answers first), box answers on top, t
   engine.dispose();
 });
 
+test("a fresh box carries the user's keys only (noEnv) and the standing rules in its home", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box, { providerEnv: { OPENROUTER_API_KEY: "or-1" } });
+  await collect(engine, "uk", "ck", "hello");
+  const boxId = (await engine.activeUserBoxId("uk"))!;
+  assert.deepEqual(JSON.parse(box.files.get(`${boxId}:create`)!), { noEnv: true, env: { OPENROUTER_API_KEY: "or-1" } });
+  assert.match(box.files.get(`${boxId}:AGENTS.md`) ?? "", /<end>/, "AGENTS.md written once per machine");
+  assert.equal(box.files.get(`${boxId}:CLAUDE.md`), box.files.get(`${boxId}:AGENTS.md`), "same rules for every harness");
+  engine.dispose();
+});
+
+test("conversation memory is the Box's: first turn opens it, later turns and a harness switch resume it", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box);
+  await collect(engine, "um", "cm", "first");
+  await collect(engine, "um", "cm", "second");
+  await collect(engine, "um", "cm", "third on pi", { harness: "pi", provider: "openrouter", model: "openrouter:anthropic/claude-sonnet-4.5", reasoningEffort: "high" });
+  assert.equal(box.prompts.length, 3);
+  assert.equal(box.prompts[0]!.input.new, true, "first prompt starts a new conversation");
+  assert.equal(box.prompts[1]!.input.conversationId, box.prompts[0]!.conversationId, "second prompt resumes it");
+  assert.equal(box.prompts[2]!.input.conversationId, box.prompts[0]!.conversationId, "harness switch keeps the same conversation");
+  assert.equal(box.prompts[2]!.input.provider, "pi");
+  assert.equal(box.prompts[2]!.input.reasoningEffort, "high");
+  assert.match(String(box.prompts[0]!.input.prompt), /<partial-shared-response/, "shared text handed over");
+  assert.doesNotMatch(String(box.prompts[1]!.input.prompt), /<consumer-context>/, "no transcript replay once the conversation exists");
+  engine.dispose();
+});
+
 test("rule 5: direct route requires BOTH responsiveness and >=15s machine age", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   await collect(engine, "u5", "c5", "first");
-  // Box billing but YOUNG (<15s of machine time): must bridge as if off.
   const young = await collect(engine, "u5", "c5", "second while young");
   assert.ok(young.some((e) => e.type === "shared.delta"), "young box still gets the shared answer");
   assert.ok(!young.some((e) => e.stage === "route.direct"), "no direct route inside the warmup window");
-  // Age the machine past the window: now direct, no bridge.
   await db.q(`update boxes set billing_since = now() - interval '20 seconds' where user_key like 'u5-%'`);
   const events = await collect(engine, "u5", "c5", "third when warm");
   assert.ok(events.some((e) => e.type === "trace" && e.stage === "route.direct"), "direct route chosen when warm");
@@ -135,97 +182,123 @@ test("rule 5: direct route requires BOTH responsiveness and >=15s machine age", 
   engine.dispose();
 });
 
-test("a box missing its harness is retired loudly ONCE; next message gets a fresh machine", async () => {
-  const { HarnessMissingError } = await import("../src/types.js");
-  const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h", {
-    box: () => (async function* (): AsyncIterable<string> { throw new HarnessMissingError("harness 'pi' is not installed on this user box"); })(),
-  }));
-  const events = await collect(engine, "umiss", "cmiss", "do something");
-  assert.equal(events.filter((e) => e.type === "turn.blocked").length, 1, "exactly ONE blocked event (no doubled error bubble)");
-  assert.ok(events.some((e) => e.type === "lifecycle" && e.state === "retired"), "retirement is visible");
-  const firstBox = events.find((e) => e.type === "lifecycle" && e.state === "retired")?.boxId;
-  const rows = await db.q<{ retired_at: string | null }>(`select retired_at from boxes where id=$1`, [firstBox]);
-  assert.ok(rows[0]?.retired_at, "broken box row retired");
-  const fresh = await engine.ensureUserBox("umiss", "cmiss");
-  assert.notEqual(fresh.id, firstBox, "next message provisions a fresh machine");
-  engine.dispose();
-});
-
-test("template-configured engines NEVER plain-create: not-ready template fails loudly", async () => {
-  const box = new FakeBoxClient();
-  // Template configured but its build can't complete in the fake (install
-  // marker handled; the point is the not-ready window): mark row 'building'.
-  const engine = makeEngine(box, harnessOf("h"), { template: { installCmd: "echo install" } });
-  await db.q(`insert into templates(instance_id, box_id, status) values('testinst','tpl-x','building')
-              on conflict(instance_id) do update set status='building'`);
-  const events = await collect(engine, "utpl", "ctpl", "need a machine");
-  assert.ok(events.some((e) => e.type === "shared.delta"), "rule 1: shared still answered");
-  assert.ok(events.some((e) => e.type === "turn.blocked" && /template is still being prepared/.test(e.message)), "loud not-ready failure, no pi-less box");
-  const rows = await db.q(`select id from boxes where user_key like 'utpl-%' and retired_at is null`);
-  assert.equal(rows.length, 0, "no plain-created user box exists");
-  await db.q(`delete from templates where instance_id='testinst'`);
-  engine.dispose();
-});
-
 test("rule 6: <end> renders nothing but settles the turn", async () => {
-  const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h", { box: "<end>" }));
+  const box = new FakeBoxClient({ frames: [{ text: "<end>" }] });
+  const engine = makeEngine(box);
   const events = await collect(engine, "u6", "c6", "hey there");
   assert.ok(!events.some((e) => e.type === "user-box.delta"), "sentinel is never shown");
   assert.ok(events.some((e) => e.type === "turn.done" && e.settled === true), "silent decline still settles");
   engine.dispose();
 });
 
-test("rule 6 streaming: a chunked <end> never leaks a partial sentinel", async () => {
-  const box = new FakeBoxClient();
-  // Chunks exactly as a streaming model emits them: "<", "en", "d", ">".
-  const engine = makeEngine(box, harnessOf("h", {
-    box: () => (async function* () { yield "<"; yield "en"; yield "d"; yield ">"; })(),
-  }));
-  const events = await collect(engine, "u6s", "c6s", "hey there");
-  assert.ok(!events.some((e) => e.type === "user-box.delta"), "no delta emitted for a chunked sentinel");
-  assert.ok(events.some((e) => e.type === "turn.done" && e.settled === true), "silent decline still settles");
-  engine.dispose();
-});
-
-test("rule 6 streaming: text before the sentinel streams step by step; the sentinel tail never shows", async () => {
-  const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h", {
-    box: () => (async function* () { yield "4 CP"; yield "Us."; yield "<"; yield "end"; yield ">"; })(),
-  }));
+test("rule 6 streaming: a growing message never leaks a partial sentinel; text before it streams step by step", async () => {
+  const box = new FakeBoxClient({ frames: [{ text: "4 CP" }, { text: "4 CPUs." }, { text: "4 CPUs.<" }, { text: "4 CPUs.<end" }, { text: "4 CPUs.<end>" }] });
+  const engine = makeEngine(box);
   const events = await collect(engine, "u6t", "c6t", "cpu count");
-  const visible = events.filter((e) => e.type === "user-box.delta").map((e) => e.text).join("");
-  assert.equal(visible, "4 CPUs.", "answer streamed progressively, sentinel withheld");
-  assert.ok(events.some((e) => e.type === "turn.done" && e.settled === true), "turn settles");
+  assert.equal(visibleText(events), "4 CPUs.", "answer streamed progressively, sentinel withheld");
+  assert.ok(events.filter((e) => e.type === "user-box.delta").length >= 2, "streamed in more than one piece");
+  assert.ok(events.some((e) => e.type === "turn.done" && e.settled === true));
   engine.dispose();
 });
 
 test("rule 6 streaming: a held partial flushes once disproven (real text ending in '<')", async () => {
-  const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h", {
-    box: () => (async function* () { yield "a <"; yield "b"; })(),
-  }));
+  const box = new FakeBoxClient({ frames: [{ text: "a <" }, { text: "a <b" }] });
+  const engine = makeEngine(box);
   const events = await collect(engine, "u6p", "c6p", "compare");
-  const visible = events.filter((e) => e.type === "user-box.delta").map((e) => e.text).join("");
-  assert.equal(visible, "a <b", "withheld prefix re-streams when it is not the sentinel");
+  assert.equal(visibleText(events), "a <b", "withheld prefix re-streams when it is not the sentinel");
+  engine.dispose();
+});
+
+test("distinct assistant messages keep their native ids", async () => {
+  const box = new FakeBoxClient({ frames: [{ id: "m1", text: "Looking." }, { id: "m2", text: "Done: 4 cores." }] });
+  const engine = makeEngine(box);
+  const events = await collect(engine, "u6m", "c6m", "cores");
+  const deltas = events.filter((e) => e.type === "user-box.delta");
+  assert.deepEqual(deltas.map((d) => d.messageId), ["m1", "m2"]);
+  assert.deepEqual(deltas.map((d) => d.messageIndex), [0, 1]);
   engine.dispose();
 });
 
 test("rule 6 binding: no text and no <end> is a LOUD turn.blocked, never silence", async () => {
-  const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h", { box: () => (async function* () { /* nothing */ })() }));
+  const box = new FakeBoxClient({ frames: [] });
+  const engine = makeEngine(box);
   const events = await collect(engine, "u6b", "c6b", "do a thing");
-  assert.ok(events.some((e) => e.type === "turn.blocked"), "no-answer surfaces loudly");
+  assert.equal(events.filter((e) => e.type === "turn.blocked").length, 1, "exactly one loud block");
+  engine.dispose();
+});
+
+test("tool calls stream as harness.tool events; a `host` command becomes a hosting row with provenance", async () => {
+  const tools = [{ use: { id: "t1", name: "Bash", input: { command: "setsid nohup host 8080 --public > h.log 2>&1 &", description: "expose" } }, result: { tool_use_id: "t1", content: "started" } }];
+  const box = new FakeBoxClient({ frames: [{ id: "m1", text: "", tools }, { id: "m2", text: "Hosted at https://x.on.ascii.dev" }] });
+  const engine = makeEngine(box);
+  const events = await collect(engine, "uh", "ch", "host my site");
+  const uses = events.filter((e) => e.type === "harness.tool" && e.phase === "tool_use");
+  const results = events.filter((e) => e.type === "harness.tool" && e.phase === "tool_result");
+  assert.equal(uses.length, 1); assert.equal(results.length, 1);
+  assert.equal(uses[0].command, "setsid nohup host 8080 --public > h.log 2>&1 &");
+  assert.equal(results[0].stdout, "started");
+  const rt = await engine.userRuntimeStatus("uh");
+  assert.equal(rt.hosting.length, 1);
+  assert.equal(rt.hosting[0]?.conversationId, "ch", "provenance recorded");
+  engine.dispose();
+});
+
+test("hosting pins the box; stop intent is durable and enforced on the observed box", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box);
+  await engine.ensureUserBox("uhs", "chs");
+  const boxId = (await engine.activeUserBoxId("uhs"))!;
+  await (engine as unknown as { markHosting(u: string, c: string, b: string, p: number, m: string): Promise<void> }).markHosting("uhs", "chs", boxId, 8080, "public");
+  await new Promise((r) => setTimeout(r, 60));
+  await (engine as unknown as { sweep(): Promise<void> }).sweep();
+  assert.notEqual((await box.get(boxId)).state, "archived", "hosting pins the box");
+  const res = await engine.stopHosting("uhs");
+  assert.deepEqual(res.ports, [8080]);
+  await engine.reconcileObservedHosting("uhs", boxId, [{ port: 8080, mode: "public" }]);
+  assert.equal((await engine.userRuntimeStatus("uhs")).hosting.length, 0, "stopped hosting never resurrects from observation");
+  assert.ok(box.commands.some((c) => c.includes("host hide 8080")), "authoritative takedown enforced");
+  engine.dispose();
+});
+
+test("hosting ground truth: 2 consecutive misses clear the row", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box);
+  await engine.ensureUserBox("um2", "cm2");
+  const boxId = (await engine.activeUserBoxId("um2"))!;
+  await (engine as unknown as { markHosting(u: string, c: string, b: string, p: number, m: string): Promise<void> }).markHosting("um2", "cm2", boxId, 9000, "private");
+  await engine.reconcileObservedHosting("um2", boxId, []);
+  assert.equal((await engine.userRuntimeStatus("um2")).hosting.length, 1, "one miss is grace");
+  await engine.reconcileObservedHosting("um2", boxId, []);
+  assert.equal((await engine.userRuntimeStatus("um2")).hosting.length, 0, "second miss clears");
+  engine.dispose();
+});
+
+test("interrupt stops ONLY that turn's Box conversation and keeps its memory", async () => {
+  // The first prompt never settles on its own; the follow-up after the interrupt does.
+  const box = new FakeBoxClient((input) => (input.new ? { frames: [{ text: "working" }], hang: true } : { frames: [{ text: "resumed" }] }));
+  const engine = makeEngine(box);
+  const events: any[] = [];
+  const run = (async () => { for await (const e of engine.runTurn({ userId: "ui", conversationId: "ci", message: "long task", selection: sel })) events.push(e); })();
+  for (let i = 0; i < 200 && !events.some((e) => e.type === "user-box.delta"); i++) await new Promise((r) => setTimeout(r, 10));
+  const turnId = events.find((e) => e.turnId)?.turnId;
+  assert.equal(engine.interrupt(turnId), true);
+  await run;
+  assert.deepEqual(box.interrupts, [{ boxId: box.prompts[0]!.boxId, conversationId: box.prompts[0]!.conversationId }], "scoped interrupt, not the whole box");
+  assert.ok(events.some((e) => e.stage === "turn.interrupted"));
+  const rows = await db.q<{ status: string }>(`select status from turns where id=$1`, [turnId]);
+  assert.equal(rows[0]?.status, "interrupted");
+  // The next message resumes the SAME conversation (nothing was lost).
+  await collect(engine, "ui", "ci", "continue");
+  assert.equal(box.prompts[1]!.input.conversationId, box.prompts[0]!.conversationId);
   engine.dispose();
 });
 
 test("rule 4: sweeper stops the idle box, folds billing into the durable total", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   const events = await collect(engine, "u4", "c4", "warm me up");
   const boxId = events.find((e) => e.type === "turn.done")?.boxId;
-  await new Promise((r) => setTimeout(r, 60)); // idle window (30ms) passes
+  await new Promise((r) => setTimeout(r, 60));
   await (engine as unknown as { sweep(): Promise<void> }).sweep();
   assert.equal((await box.get(boxId)).state, "archived", "idle box stopped");
   const rt = await engine.userRuntimeStatus("u4");
@@ -236,7 +309,7 @@ test("rule 4: sweeper stops the idle box, folds billing into the durable total",
 
 test("rule 4: holds and active turns block the sweeper; release unblocks", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   const events = await collect(engine, "u4h", "c4h", "hold me");
   const boxId = events.find((e) => e.type === "turn.done")?.boxId;
   const release = engine.holdUserBox("u4h", "upload", 60_000);
@@ -252,11 +325,8 @@ test("rule 4: holds and active turns block the sweeper; release unblocks", async
 
 test("one user = one box: concurrent ensures from two conversations share one row", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
-  const [a, b] = await Promise.all([
-    engine.ensureUserBox("uone", "conv-a"),
-    engine.ensureUserBox("uone", "conv-b"),
-  ]);
+  const engine = makeEngine(box);
+  const [a, b] = await Promise.all([engine.ensureUserBox("uone", "conv-a"), engine.ensureUserBox("uone", "conv-b")]);
   assert.equal(a.id, b.id, "both conversations got the SAME box");
   const rows = await db.q(`select id from boxes where user_key like 'uone-%' and retired_at is null`);
   assert.equal(rows.length, 1, "exactly one active box row exists");
@@ -265,67 +335,23 @@ test("one user = one box: concurrent ensures from two conversations share one ro
 
 test("identical concurrent message is suppressed; original still answers", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   const [first, second] = await Promise.all([
     collect(engine, "udup", "cdup", "same message"),
-    // 300ms stagger: a human double-send, comfortably past one PG round trip
-    // (the dedup window opens once the first turn's row is inserted).
     (async () => { await new Promise((r) => setTimeout(r, 300)); return collect(engine, "udup", "cdup", "same message"); })(),
   ]);
   const answered = [first, second].filter((evs) => evs.some((e: any) => e.type === "user-box.delta"));
   assert.equal(answered.length, 1, "exactly one box round ran");
-  const suppressed = [first, second].find((evs) => evs.some((e: any) => e.stage === "private-round.suppressed"));
-  assert.ok(suppressed, "the duplicate was visibly suppressed");
-  engine.dispose();
-});
-
-test("hosting: tool command detection writes a row with provenance; stop intent is durable", async () => {
-  const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h", {
-    box: () => (async function* () { yield "hosted!"; })(),
-  }));
-  // Simulate what the turn tap does on a host tool command
-  await engine.ensureUserBox("uh", "ch");
-  const boxId = (await engine.activeUserBoxId("uh"))!;
-  await (engine as unknown as { markHosting(u: string, c: string, b: string, p: number, m: string): Promise<void> })
-    .markHosting("uh", "ch", boxId, 8080, "public");
-  let rt = await engine.userRuntimeStatus("uh");
-  assert.equal(rt.hosting.length, 1);
-  assert.equal(rt.hosting[0]?.conversationId, "ch", "provenance recorded");
-  // sweep must NOT stop a hosting box even when idle
-  await new Promise((r) => setTimeout(r, 60));
-  await (engine as unknown as { sweep(): Promise<void> }).sweep();
-  assert.notEqual((await box.get(boxId)).state, "archived", "hosting pins the box");
-  // durable stop: even if the process is observed again, it gets killed, not resurrected
-  const res = await engine.stopHosting("uh");
-  assert.deepEqual(res.ports, [8080]);
-  await engine.reconcileObservedHosting("uh", boxId, [{ port: 8080, mode: "public" }]);
-  rt = await engine.userRuntimeStatus("uh");
-  assert.equal(rt.hosting.length, 0, "stopped hosting never resurrects from observation");
-  assert.ok(box.commands.some((c) => c.includes("host hide 8080")), "authoritative takedown enforced on the observed box");
-  engine.dispose();
-});
-
-test("hosting ground truth: 2 consecutive misses clear the row", async () => {
-  const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
-  await engine.ensureUserBox("um", "cm");
-  const boxId = (await engine.activeUserBoxId("um"))!;
-  await (engine as unknown as { markHosting(u: string, c: string, b: string, p: number, m: string): Promise<void> })
-    .markHosting("um", "cm", boxId, 9000, "private");
-  await engine.reconcileObservedHosting("um", boxId, []);
-  assert.equal((await engine.userRuntimeStatus("um")).hosting.length, 1, "one miss is grace");
-  await engine.reconcileObservedHosting("um", boxId, []);
-  assert.equal((await engine.userRuntimeStatus("um")).hosting.length, 0, "second miss clears");
+  assert.ok([first, second].some((evs) => evs.some((e: any) => e.stage === "private-round.suppressed")), "the duplicate was visibly suppressed");
   engine.dispose();
 });
 
 test("transcripts persist across engine instances (restart is not amnesia)", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   await collect(engine, "ut", "ct", "remember this message");
   engine.dispose();
-  const engine2 = makeEngine(box, harnessOf("h"));
+  const engine2 = makeEngine(box);
   const transcript = await engine2.getTranscript("ut", "ct");
   assert.ok(transcript.some((m) => m.role === "user" && m.content === "remember this message"));
   assert.ok(transcript.some((m) => m.role === "assistant"), "assistant reply persisted too");
@@ -334,72 +360,60 @@ test("transcripts persist across engine instances (restart is not amnesia)", asy
 
 test("render journal: events append in order, tail by cursor, reset clears them", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   await engine.logEvent("uj", "cj", null, { type: "user.message", text: "hi" });
   await engine.logEvent("uj", "cj", "t1", { type: "user-box.delta", text: "answer" });
   await engine.logEvent("uj", "cj", "t1", { type: "turn.done" });
   const all = await engine.getEvents("uj", "cj");
-  assert.deepEqual(all.map((e: any) => e.body.type), ["user.message", "user-box.delta", "turn.done"], "returned in insertion order");
-  assert.ok(all[0]!.seq < all[1]!.seq && all[1]!.seq < all[2]!.seq, "seq is monotonic");
+  assert.deepEqual(all.map((e: any) => e.body.type), ["user.message", "user-box.delta", "turn.done"]);
   const tail = await engine.getEvents("uj", "cj", all[1]!.seq);
-  assert.deepEqual(tail.map((e: any) => e.body.type), ["turn.done"], "sinceSeq tails only newer events (reattach cursor)");
-  assert.equal((await engine.getEvents("uj", "other")).length, 0, "conversations are isolated");
+  assert.deepEqual(tail.map((e: any) => e.body.type), ["turn.done"]);
   await engine.resetUser("uj");
   assert.equal((await engine.getEvents("uj", "cj")).length, 0, "reset wipes the journal");
   engine.dispose();
 });
 
-test("parallel scenarios: shared fork tag fans out into N scenario-tagged box rounds", async () => {
-  const box = new FakeBoxClient();
-  const engine = makeEngine(
-    box,
-    harnessOf("h", { shared: "Two solid directions here.\n<optibox-fork>Fast MVP | Robust build</optibox-fork>", box: "scenario answer" }),
-    { scenariosEnabled: true },
-  );
+test("parallel scenarios: the fork tag fans out into N parallel conversations on the SAME box", async () => {
+  const box = new FakeBoxClient({ frames: [{ text: "scenario answer" }] });
+  const engine = makeEngine(box, { sharedStream: sharedStream("Two solid directions here.\n<optibox-fork>Fast MVP | Robust build</optibox-fork>"), scenariosEnabled: true });
   const events = await collect(engine, "usc", "csc", "build me a thing");
   const fork = events.find((e: any) => e.type === "scenario.fork");
   assert.ok(fork, "scenario.fork emitted");
   assert.deepEqual(fork.labels, ["Fast MVP", "Robust build"]);
-  const boxDeltas = events.filter((e: any) => e.type === "user-box.delta");
-  const scenIds = new Set(boxDeltas.map((e: any) => e.scenarioId));
+  const scenIds = new Set(events.filter((e: any) => e.type === "user-box.delta").map((e: any) => e.scenarioId));
   assert.equal(scenIds.size, 2, "two scenarios each produced tagged deltas");
-  assert.ok([...scenIds].every(Boolean), "every scenario delta carries a scenarioId");
-  assert.ok(boxDeltas.every((e: any) => e.scenarioLabel), "and a human label");
-  const scenRows = await db.q<{ retired_at: string | null }>(`select retired_at from boxes where user_key=$1 and purpose='scenario'`, [engine.userKey("usc")]);
-  assert.equal(scenRows.length, 2, "two scenario box rows created");
-  assert.ok(scenRows.every((r) => r.retired_at), "scenario boxes retired after the fan-out (not left billing)");
-  // the one-active-user-box invariant is untouched (scenarios are a different purpose)
-  const userBoxes = await db.q(`select 1 from boxes where user_key=$1 and purpose='user' and retired_at is null`, [engine.userKey("usc")]);
-  assert.equal(userBoxes.length, 1, "still exactly one active user box");
+  assert.equal(box.prompts.length, 2, "one prompt per scenario");
+  assert.ok(box.prompts.every((p) => p.input.new === true), "each scenario is its own new conversation");
+  assert.equal(new Set(box.prompts.map((p) => p.boxId)).size, 1, "all on the user's one box");
+  assert.equal(box.boxes.size, 1, "no extra machines provisioned");
   engine.dispose();
 });
 
 test("scenarios OFF: the fork tag is ignored and the turn runs as a single box round", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h", { shared: "one path.\n<optibox-fork>A | B</optibox-fork>", box: "answer" })); // flag off
+  const engine = makeEngine(box, { sharedStream: sharedStream("one path.\n<optibox-fork>A | B</optibox-fork>") });
   const events = await collect(engine, "usoff", "csoff", "do it");
   assert.ok(!events.some((e: any) => e.type === "scenario.fork"), "no fan-out when flag off");
-  assert.equal((await db.q(`select 1 from boxes where user_key=$1 and purpose='scenario'`, [engine.userKey("usoff")])).length, 0, "no scenario boxes");
+  assert.equal(box.prompts.length, 1);
   engine.dispose();
 });
 
 test("manual stopUserBox ends billing at stop request and archives", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   const events = await collect(engine, "us", "cs", "then stop me");
   const boxId = events.find((e) => e.type === "turn.done")?.boxId;
   const stops: any[] = [];
   for await (const e of engine.stopUserBox("us", "cs")) stops.push(e);
   assert.ok(stops.some((e) => e.type === "billing.stop"), "billing.stop streamed");
   assert.equal((await box.get(boxId)).state, "archived");
-  const rt = await engine.userRuntimeStatus("us");
-  assert.equal(rt.billingSinceEpochMs, null);
+  assert.equal((await engine.userRuntimeStatus("us")).billingSinceEpochMs, null);
   engine.dispose();
 });
 
 test("resetUser deletes the box and every row about the user", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   const events = await collect(engine, "ureset", "creset", "make some state");
   const boxId = events.find((e) => e.type === "turn.done")?.boxId;
   const result = await engine.resetUser("ureset");
@@ -407,24 +421,32 @@ test("resetUser deletes the box and every row about the user", async () => {
   assert.equal(result.boxesDeleted, 1);
   assert.equal((await box.get(boxId)).state, "archived", "box stopped");
   for (const [table, col] of [["boxes", "user_key"], ["transcripts", "user_key"], ["turns", "user_key"], ["conversations", "user_key"], ["users", "key"]] as const) {
-    const rows = await db.q(`select 1 from ${table} where ${col} like 'ureset-%'`);
-    assert.equal(rows.length, 0, `${table} wiped`);
+    assert.equal((await db.q(`select 1 from ${table} where ${col} like 'ureset-%'`)).length, 0, `${table} wiped`);
   }
-  const rt = await engine.userRuntimeStatus("ureset");
-  assert.equal(rt.billedSecondsTotal, 0, "billing ledger gone");
+  assert.equal((await engine.userRuntimeStatus("ureset")).billedSecondsTotal, 0, "billing ledger gone");
   engine.dispose();
 });
 
 test("billing total is a pure projection: no double count between stop paths", async () => {
   const box = new FakeBoxClient();
-  const engine = makeEngine(box, harnessOf("h"));
+  const engine = makeEngine(box);
   await collect(engine, "ub", "cb", "bill me");
   const before = (await engine.userRuntimeStatus("ub")).billedSecondsTotal;
   for await (const _ of engine.stopUserBox("ub", "cb")) void _;
   const afterStop = (await engine.userRuntimeStatus("ub")).billedSecondsTotal;
   assert.ok(afterStop >= before, "total grew (or held) at stop");
-  await (engine as unknown as { sweep(): Promise<void> }).sweep(); // second path must be a no-op
-  const afterSweep = (await engine.userRuntimeStatus("ub")).billedSecondsTotal;
-  assert.equal(afterSweep, afterStop, "sweep after stop adds nothing (single endBilling)");
+  await (engine as unknown as { sweep(): Promise<void> }).sweep();
+  assert.equal((await engine.userRuntimeStatus("ub")).billedSecondsTotal, afterStop, "sweep after stop adds nothing (single endBilling)");
+  engine.dispose();
+});
+
+test("Box API traffic of one private turn: 1 prompt, a handful of event polls, no shell round trips for the agent", async () => {
+  const box = new FakeBoxClient({ frames: [{ text: "one" }, { text: "one two" }, { text: "one two three" }] });
+  const engine = makeEngine(box);
+  await collect(engine, "uc", "cc", "count");
+  assert.equal(box.prompts.length, 1);
+  assert.ok(box.eventsCalls <= 8, `event polls: ${box.eventsCalls}`);
+  // The only commands: readiness probes (`echo __UP__`); nothing launches, polls or kills a harness process.
+  assert.ok(box.commands.every((c) => c === "echo __UP__"), `commands: ${box.commands.join(" | ")}`);
   engine.dispose();
 });

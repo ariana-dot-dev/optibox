@@ -44,6 +44,8 @@ class FakeBoxClient implements BoxClient {
   files = new Map<string, string>();
   prompts: Array<{ boxId: string; input: Record<string, unknown>; conversationId: string; promptId: string }> = [];
   interrupts: Array<{ boxId: string; conversationId?: string }> = [];
+  resumes: Array<{ boxId: string; env?: Record<string, string> }> = [];
+  writes: Array<{ boxId: string; path: string }> = [];
   eventsCalls = 0;
   private convs = 0;
   private runs = new Map<string, { conversationId: string; answer: Answer; events: BoxEvent[]; done: boolean }>();
@@ -62,7 +64,15 @@ class FakeBoxClient implements BoxClient {
     return updated;
   }
   async stop(boxId: string): Promise<BoxInfo> { const b = { ...(await this.get(boxId)), state: "archived" }; this.boxes.set(boxId, b); return b; }
-  async resume(boxId: string): Promise<BoxInfo> { const b = { ...(await this.get(boxId)), state: "idle" }; this.boxes.set(boxId, b); return b; }
+  async resume(boxId: string, input: { env?: Record<string, string> } = {}): Promise<BoxInfo> {
+    // The real API REPLACES the box's env when the body carries one, and keeps
+    // the stored env when it does not — the fake records exactly that.
+    this.resumes.push({ boxId, ...(input.env ? { env: input.env } : {}) });
+    if (input.env) this.files.set(`${boxId}:create`, JSON.stringify({ noEnv: true, env: input.env }));
+    const b = { ...(await this.get(boxId)), state: "idle" };
+    this.boxes.set(boxId, b);
+    return b;
+  }
   async deleteBox(): Promise<void> { /* noop */ }
   async command(boxId: string, input: { command: string }): Promise<CommandResult> {
     const state = (await this.get(boxId)).state;
@@ -71,7 +81,7 @@ class FakeBoxClient implements BoxClient {
     return { exitCode: 0, stdout: `ran:${input.command}`, stderr: "" };
   }
   async readFile(boxId: string, path: string): Promise<string> { return this.files.get(`${boxId}:${path}`) ?? ""; }
-  async writeFile(boxId: string, path: string, content: string): Promise<void> { this.files.set(`${boxId}:${path}`, content); }
+  async writeFile(boxId: string, path: string, content: string): Promise<void> { this.writes.push({ boxId, path }); this.files.set(`${boxId}:${path}`, content); }
   async prompt(boxId: string, input: { conversationId?: string; new?: boolean; prompt: string }): Promise<PromptRun> {
     const conversationId = input.conversationId ?? `conv-${++this.convs}`;
     const promptId = `p-${this.prompts.length + 1}`;
@@ -437,6 +447,114 @@ test("billing total is a pure projection: no double count between stop paths", a
   assert.ok(afterStop >= before, "total grew (or held) at stop");
   await (engine as unknown as { sweep(): Promise<void> }).sweep();
   assert.equal((await engine.userRuntimeStatus("ub")).billedSecondsTotal, afterStop, "sweep after stop adds nothing (single endBilling)");
+  engine.dispose();
+});
+
+// ---------------------------------------------------------------- per-user Agents setup
+
+const AUTH_JSON = '{"tokens":{"access_token":"chatgpt-secret-9999"}}';
+
+test("a user's own keys become the box env at create, and their secret files are rewritten after create AND after resume", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box);
+  const saved = await engine.setUserAgents("uag", {
+    providerEnv: { ANTHROPIC_API_KEY: "sk-user-1111", CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-2222" },
+    agentFiles: { ".codex/auth.json": AUTH_JSON },
+  });
+  assert.equal(saved.applied, "next-start", "no machine yet: the keys ride the create call");
+
+  await collect(engine, "uag", "cag", "first message");
+  const boxId = (await engine.activeUserBoxId("uag"))!;
+  assert.deepEqual(JSON.parse(box.files.get(`${boxId}:create`)!), {
+    noEnv: true,
+    env: { ANTHROPIC_API_KEY: "sk-user-1111", CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-2222" },
+  }, "the box carries the USER's keys, not the server's");
+  assert.equal(box.files.get(`${boxId}:.codex/auth.json`), AUTH_JSON, "secret file written after create");
+  assert.ok(box.commands.some((c) => c.includes("mkdir -p '.codex'")), "parent dir created before the files PUT");
+
+  // A no-env box's resume scrubs owner secrets off its disk — which unlinks
+  // ~/.codex/auth.json — so the file must be written again after every wake.
+  box.files.delete(`${boxId}:.codex/auth.json`);
+  for await (const _ of engine.stopUserBox("uag", "cag")) void _;
+  await collect(engine, "uag", "cag", "second message after the wake");
+  assert.equal(box.files.get(`${boxId}:.codex/auth.json`), AUTH_JSON, "secret file rewritten after resume");
+  engine.dispose();
+});
+
+test("changing keys on a LIVE box stops it, resumes with the new env, and rewrites the files", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box);
+  await collect(engine, "ulive", "clive", "warm the machine");
+  const boxId = (await engine.activeUserBoxId("ulive"))!;
+  const billedBefore = (await engine.userRuntimeStatus("ulive")).billedSecondsTotal;
+
+  const result = await engine.setUserAgents("ulive", {
+    providerEnv: { OPENROUTER_API_KEY: "or-user-3333" },
+    agentFiles: { ".codex/auth.json": AUTH_JSON },
+  });
+  assert.equal(result.applied, "now");
+  assert.equal(result.boxId, boxId);
+  assert.deepEqual(box.resumes.at(-1), { boxId, env: { OPENROUTER_API_KEY: "or-user-3333" } }, "resume REPLACES the box env");
+  assert.equal(box.files.get(`${boxId}:.codex/auth.json`), AUTH_JSON, "files rewritten on the way back up");
+  assert.ok((await engine.userRuntimeStatus("ulive")).billedSecondsTotal >= billedBefore, "the stop ended billing like a manual pause");
+  assert.equal((await engine.getUserAgents("ulive")).envPending, false, "nothing left pending: the live box already has them");
+  engine.dispose();
+});
+
+test("changing keys on a PARKED box is pending, and the next wake resumes with the new env", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box);
+  await collect(engine, "upark", "cpark", "warm the machine");
+  const boxId = (await engine.activeUserBoxId("upark"))!;
+  for await (const _ of engine.stopUserBox("upark", "cpark")) void _;
+  const resumesBefore = box.resumes.length;
+
+  const result = await engine.setUserAgents("upark", { providerEnv: { ANTHROPIC_API_KEY: "sk-user-4444" } });
+  assert.equal(result.applied, "next-start", "a parked box is not woken just to take keys");
+  assert.equal(box.resumes.length, resumesBefore, "no resume happened at save time");
+  assert.equal((await engine.getUserAgents("upark")).envPending, true);
+
+  await collect(engine, "upark", "cpark", "next message wakes it");
+  assert.deepEqual(box.resumes.at(-1), { boxId, env: { ANTHROPIC_API_KEY: "sk-user-4444" } }, "the wake carried the new env");
+  assert.equal((await engine.getUserAgents("upark")).envPending, false, "pending flag cleared once applied");
+  engine.dispose();
+});
+
+test("the user's stored harness/model/reasoning is the default; a message's own selection still wins", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box);
+  await engine.setUserAgents("usel", { selection: { harness: "pi", provider: "openrouter", model: "glm-5.3", reasoningEffort: "high" } });
+  const events: any[] = [];
+  for await (const e of engine.runTurn({ userId: "usel", conversationId: "csel", message: "no selection in this send" })) events.push(e);
+  assert.equal(box.prompts[0]!.input.provider, "pi", "the stored harness ran the turn");
+  assert.equal(box.prompts[0]!.input.model, "glm-5.3");
+  assert.equal(box.prompts[0]!.input.reasoningEffort, "high");
+  await collect(engine, "usel", "csel", "this one overrides", { harness: "claude-code", provider: "anthropic", model: "claude-sonnet-5" });
+  assert.equal(box.prompts[1]!.input.provider, "claude-code", "the per-message selection wins");
+  assert.equal(box.prompts[1]!.input.model, "claude-sonnet-5");
+  engine.dispose();
+});
+
+test("getUserAgents reports what is connected and NEVER the secret", async () => {
+  const box = new FakeBoxClient();
+  const engine = makeEngine(box);
+  await engine.setUserAgents("usec", {
+    providerEnv: { ANTHROPIC_API_KEY: "sk-user-super-secret-5555" },
+    agentFiles: { ".codex/auth.json": AUTH_JSON },
+  });
+  const view = await engine.getUserAgents("usec");
+  const serialized = JSON.stringify(view);
+  assert.doesNotMatch(serialized, /sk-user-super-secret-5555/, "no API key leaves the server");
+  assert.doesNotMatch(serialized, /chatgpt-secret-9999/, "no auth.json content leaves the server");
+  const anthropic = view.credentials.find((c) => c.id === "anthropicApiKey")!;
+  assert.equal(anthropic.connected, true);
+  assert.equal(anthropic.last4, "5555", "only the last 4 characters are shown");
+  assert.equal(view.credentials.find((c) => c.id === "codexSubscription")!.connected, true);
+  assert.equal(view.credentials.find((c) => c.id === "openaiApiKey")!.connected, false);
+  assert.equal(view.usingOwnKeys, true);
+  // Clearing a field with "" disconnects it.
+  await engine.setUserAgents("usec", { providerEnv: { ANTHROPIC_API_KEY: "" } });
+  assert.equal((await engine.getUserAgents("usec")).credentials.find((c) => c.id === "anthropicApiKey")!.connected, false);
   engine.dispose();
 });
 

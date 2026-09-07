@@ -4,11 +4,13 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { URL, fileURLToPath } from "node:url";
 import path from "node:path";
 import {
+  AGENT_CREDENTIALS,
   BoxHttpClient,
   BOX_PRICING,
   Engine,
   openDb,
   databaseUrlFromEnv,
+  splitCredentialPatch,
   type Db,
   type ConsumerTurnEvent,
 } from "../src/index.js";
@@ -63,12 +65,16 @@ const allowServerKeys =
  * A model's key family (which BYOK key it bills to) comes from the credentials
  * that unlock it; that is all the settings UI needs to grey models out.
  */
-interface HarnessInfo { name: string; description: string; models: Array<{ provider: string; model: string; label: string; keyAvailable: boolean; requiredEnv: string; reasoningEffort?: string[] }> }
+interface HarnessInfo { name: string; description: string; models: Array<{ provider: string; model: string; label: string; keyAvailable: boolean; requiredEnv: string; unlockedBy: string[]; reasoningEffort?: string[] }> }
 const CREDENTIAL_ENV: Record<string, string> = { "anthropic-api-key": "ANTHROPIC_API_KEY", "openai-api-key": "OPENAI_API_KEY", "openrouter-api-key": "OPENROUTER_API_KEY" };
 const HARNESS_ENV: Record<string, string> = { "claude-code": "ANTHROPIC_API_KEY", codex: "OPENAI_API_KEY" };
 const PROVIDER_OF_ENV: Record<string, string> = { ANTHROPIC_API_KEY: "anthropic", OPENAI_API_KEY: "openai", OPENROUTER_API_KEY: "openrouter" };
+// A subscription unlocks the same harness its API key does: Claude Code also
+// runs on CLAUDE_CODE_OAUTH_TOKEN, codex also on a ~/.codex/auth.json file.
+const HARNESS_ALT_UNLOCKS: Record<string, string[]> = { "claude-code": ["CLAUDE_CODE_OAUTH_TOKEN"], codex: [".codex/auth.json"] };
 let catalogCache: { at: number; harnesses: HarnessInfo[] } | undefined;
-async function harnessCatalog(providerEnv: Record<string, string>): Promise<HarnessInfo[]> {
+/** `unlocks` holds every env var name and secret-file path the viewer has. */
+async function harnessCatalog(unlocks: Set<string>): Promise<HarnessInfo[]> {
   if (!catalogCache || Date.now() - catalogCache.at > 10 * 60_000) {
     const client = new BoxHttpClient({ apiKey: serverBoxApiKey ?? "catalog" });
     const config = await client.providerModels();
@@ -77,14 +83,24 @@ async function harnessCatalog(providerEnv: Record<string, string>): Promise<Harn
       const models = p.models.flatMap((m) => {
         const requiredEnv = HARNESS_ENV[name] ?? CREDENTIAL_ENV[m.credentialIds?.[0] ?? ""];
         if (!requiredEnv) return [];
-        return [{ provider: PROVIDER_OF_ENV[requiredEnv] as string, model: m.id, label: `${p.cli?.name ?? name} · ${m.label}`, keyAvailable: false, requiredEnv, ...(m.reasoningEffort ? { reasoningEffort: m.reasoningEffort.supported } : {}) }];
+        return [{ provider: PROVIDER_OF_ENV[requiredEnv] as string, model: m.id, label: `${p.cli?.name ?? name} · ${m.label}`, keyAvailable: false, requiredEnv, unlockedBy: [requiredEnv, ...(HARNESS_ALT_UNLOCKS[name] ?? [])], ...(m.reasoningEffort ? { reasoningEffort: m.reasoningEffort.supported } : {}) }];
       });
       if (models.length) harnesses.push({ name, description: p.cli?.description ?? name, models });
     }
     harnesses.sort((a, b) => (config[a.name]?.cli?.order ?? 99) - (config[b.name]?.cli?.order ?? 99));
     catalogCache = { at: Date.now(), harnesses };
   }
-  return catalogCache.harnesses.map((h) => ({ ...h, models: h.models.map((m) => ({ ...m, keyAvailable: Boolean(providerEnv[m.requiredEnv]) })) }));
+  return catalogCache.harnesses.map((h) => ({ ...h, models: h.models.map((m) => ({ ...m, keyAvailable: m.unlockedBy.some((u) => unlocks.has(u)) })) }));
+}
+
+/** Env names + secret-file paths a user can reach: their own first, the server's as fallback. */
+async function unlocksFor(userId: string | undefined): Promise<Set<string>> {
+  const unlocks = new Set(Object.keys(serverProviderEnv).filter((k) => serverProviderEnv[k]));
+  if (!userId || !serverBoxApiKey) return unlocks;
+  try {
+    for (const c of (await engine().getUserAgents(userId)).credentials) if (c.connected) unlocks.add(c.target);
+  } catch { /* no row yet: server keys only */ }
+  return unlocks;
 }
 
 /** The shared bridge model: the fastest small model the configured keys can reach. */
@@ -94,18 +110,13 @@ function sharedModelFor(providerEnv: Record<string, string>): string {
   return "openai/gpt-4.1-mini";
 }
 
-interface DemoCredentials {
-  boxApiKey: string | undefined;
-  providerEnv: Record<string, string>;
-  source: "server" | "byok";
-}
-
 const serverProviderEnv = allowServerKeys ? providerEnvFromProcess() : {};
 const serverBoxApiKey = allowServerKeys ? process.env.BOX_API_KEY : undefined;
-// ONE Postgres pool for the process; engines (one per BYOK credential set)
-// share it. All coordination state lives in the DB — see docs/redesign.md.
+// ONE Postgres pool and ONE engine for the process. Provider keys are no longer
+// part of the engine's identity: they are per USER (users.provider_env), applied
+// to that user's own box. All coordination state lives in the DB.
 const db: Db = await openDb(databaseUrlFromEnv());
-const engines = new Map<string, Engine>();
+let engineSingleton: Engine | undefined;
 const ogCache = new Map<string, { at: number; data: unknown }>();
 const serverRunId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const auditRing: unknown[] = [];
@@ -128,82 +139,46 @@ function providerEnvFromProcess(): Record<string, string> {
   return env;
 }
 
-function providerEnvFromBody(raw: any): Record<string, string> {
-  const apiKeys = raw && typeof raw === "object" ? raw.apiKeys ?? raw.keys ?? {} : {};
-  const env: Record<string, string> = {};
-  const put = (name: string, value: unknown) => {
-    if (typeof value === "string" && value.trim()) env[name] = value.trim();
-  };
-  put("ANTHROPIC_API_KEY", apiKeys.anthropicApiKey ?? apiKeys.ANTHROPIC_API_KEY);
-  const openai = apiKeys.openaiApiKey ?? apiKeys.OPENAI_API_KEY ?? apiKeys.OPENAI_API_KEY_SCOPED;
-  put("OPENAI_API_KEY", openai);
-  put("OPENAI_API_KEY_SCOPED", openai);
-  put("OPENROUTER_API_KEY", apiKeys.openrouterApiKey ?? apiKeys.OPENROUTER_API_KEY);
-  return env;
-}
-
-function boxApiKeyFromBody(raw: any): string | undefined {
-  const apiKeys = raw && typeof raw === "object" ? raw.apiKeys ?? raw.keys ?? {} : {};
-  const value = apiKeys.boxApiKey ?? apiKeys.BOX_API_KEY;
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function credentialsFromBody(raw: any): DemoCredentials {
-  const byokProviderEnv = providerEnvFromBody(raw);
-  const byokBoxApiKey = boxApiKeyFromBody(raw);
-  const useByok = Boolean(byokBoxApiKey || Object.keys(byokProviderEnv).length);
-  if (useByok) {
-    return {
-      boxApiKey: byokBoxApiKey ?? serverBoxApiKey,
-      providerEnv: { ...serverProviderEnv, ...byokProviderEnv },
-      source: "byok",
-    };
-  }
-  return { boxApiKey: serverBoxApiKey, providerEnv: serverProviderEnv, source: "server" };
-}
-
 function envForProvider(provider: string): string {
   if (provider === "anthropic") return "ANTHROPIC_API_KEY";
   if (provider === "openrouter") return "OPENROUTER_API_KEY";
   return "OPENAI_API_KEY";
 }
 
-function keyAvailable(provider: string, providerEnv = serverProviderEnv): boolean {
-  return Boolean(providerEnv[envForProvider(provider)]);
-}
-
-function credentialError(selection: { harness: string; provider: string; model: string }, credentials: DemoCredentials): string | undefined {
-  if (!credentials.boxApiKey) {
+/**
+ * Can this user run this model? Their own keys first (Agents panel), the
+ * server's as the fallback — and a subscription counts as well as an API key.
+ */
+async function credentialError(selection: { harness: string; provider: string; model: string }, userId: string): Promise<string | undefined> {
+  if (!serverBoxApiKey) {
     return allowServerKeys
-      ? "BOX_API_KEY is not configured on the private preview and no BYOK Box key was provided."
-      : "This public/dev preview requires your own Box API key. Open Settings (gear) and paste BOX_API_KEY.";
+      ? "BOX_API_KEY is not configured on this preview."
+      : "This public/dev preview has server keys disabled and no Box API key configured.";
   }
+  const unlocks = await unlocksFor(userId);
+  const alt = HARNESS_ALT_UNLOCKS[selection.harness] ?? [];
   const required = envForProvider(selection.provider);
-  if (!credentials.providerEnv[required]) {
-    return allowServerKeys
-      ? `${required} is not configured on the private preview and no BYOK provider key was provided.`
-      : `This public/dev preview requires your own ${required}. Open Settings (gear), paste the key, and retry.`;
-  }
-  return undefined;
+  if (unlocks.has(required) || alt.some((a) => unlocks.has(a))) return undefined;
+  return `${required} is not set. Open Agents (gear) and add your own ${required}${alt.length ? " or connect a subscription" : ""}, then retry.`;
 }
 
-function engineFor(credentials: DemoCredentials): Engine {
-  if (!credentials.boxApiKey) throw new Error("BOX_API_KEY is required");
-  const cacheKey = createHash("sha256")
-    .update(JSON.stringify({ box: credentials.boxApiKey, providerEnv: credentials.providerEnv }))
-    .digest("hex");
-  const cached = engines.get(cacheKey);
-  if (cached) return cached;
-  const providerEnv = credentials.providerEnv;
-  const engine = new Engine({
+/**
+ * The ONE engine. Its credHash keeps the historical spelling (a hash of the Box
+ * API key plus the SERVER provider env) so every user row, box name and billing
+ * ledger written before per-user credentials keeps working unchanged.
+ */
+function engine(): Engine {
+  if (!serverBoxApiKey) throw new Error("BOX_API_KEY is required");
+  if (engineSingleton) return engineSingleton;
+  engineSingleton = new Engine({
     db,
-    box: new BoxHttpClient({ apiKey: credentials.boxApiKey }),
+    box: new BoxHttpClient({ apiKey: serverBoxApiKey }),
     instanceId: INSTANCE_ID,
-    // BYOK isolation: the credential hash is part of every user key and box
-    // name, so different key sets can never see or sweep each other's boxes.
-    credHash: cacheKey.slice(0, 8),
-    providerEnv,
-    sharedModel: sharedModelFor(providerEnv),
+    credHash: createHash("sha256").update(JSON.stringify({ box: serverBoxApiKey, providerEnv: serverProviderEnv })).digest("hex").slice(0, 8),
+    // Fallback only: a user who set no keys of their own runs on these.
+    providerEnv: serverProviderEnv,
+    sharedModel: sharedModelFor(serverProviderEnv),
+    sharedModelForEnv: sharedModelFor,
     userBoxTtlSeconds: 900,
     readinessPollMs: 750,
     handoffTimeoutMs: 120_000,
@@ -212,8 +187,7 @@ function engineFor(credentials: DemoCredentials): Engine {
     // Parallel scenarios: opt-in via env until the carousel UI ships.
     scenariosEnabled: process.env.OPTIBOX_SCENARIOS === "1",
   });
-  engines.set(cacheKey, engine);
-  return engine;
+  return engineSingleton;
 }
 
 function sse(res: http.ServerResponse) {
@@ -299,7 +273,7 @@ function redactAuditValue(value: unknown): unknown {
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
-      if (/hidden|recap|apiKey|token|secret|authorization/i.test(key)) {
+      if (/hidden|recap|apiKey|token|secret|authorization|credentials|providerEnv|agentFiles/i.test(key)) {
         out[key] = "[redacted]";
       } else {
         out[key] = redactAuditValue(raw);
@@ -353,9 +327,9 @@ const composingHolds = new Map<string, () => void>();
 // 4s composing pings so typing spawns at most one fork, not one per ping.
 const coldBooting = new Set<string>();
 
-function fsBoxClient(credentials: DemoCredentials): BoxHttpClient {
-  if (!credentials.boxApiKey) throw new Error("BOX_API_KEY is required");
-  return new BoxHttpClient({ apiKey: credentials.boxApiKey });
+function fsBoxClient(): BoxHttpClient {
+  if (!serverBoxApiKey) throw new Error("BOX_API_KEY is required");
+  return new BoxHttpClient({ apiKey: serverBoxApiKey });
 }
 
 // Box resolution is a ROW LOOKUP, never a name guess: the engine's boxes table
@@ -411,7 +385,7 @@ async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: stri
  * Logs every attempt — uploads failing silently is how we ended up debugging
  * a browser ERR_CONNECTION_RESET with an empty server log.
  */
-async function fsWriteIntoBox(credentials: DemoCredentials, userId: string, filePath: string, bytes: Buffer): Promise<{ status: number; payload: { ok: boolean; message?: string } }> {
+async function fsWriteIntoBox(userId: string, filePath: string, bytes: Buffer): Promise<{ status: number; payload: { ok: boolean; message?: string } }> {
   const t0 = Date.now();
   let resolvedBoxId = "";
   const done = (status: number, payload: { ok: boolean; message?: string }) => {
@@ -419,18 +393,18 @@ async function fsWriteIntoBox(credentials: DemoCredentials, userId: string, file
     return { status, payload };
   };
   try {
-    const { box, live } = await fsResolveBox(credentials, userId);
-    const client = fsBoxClient(credentials);
+    const { box, live } = await fsResolveBox(userId);
+    const client = fsBoxClient();
     if (!box) return done(409, { ok: false, message: "no machine yet — send a message first" });
     resolvedBoxId = box.id;
     // Keep the box up for the duration of the upload: the hold cancels a
     // running auto-stop countdown and the reaper skips held boxes.
-    const releaseHold = engineFor(credentials).holdUserBox(userId, "upload", 300_000);
+    const releaseHold = engine().holdUserBox(userId, "upload", 300_000);
     try {
       // Machine off? Boot it and wait until it actually executes a command,
       // so a drop while parked just wakes the box and completes the upload.
       // The wake registers real billing, so every counter and reaper sees it.
-      await engineFor(credentials).wake(userId, "fs");
+      await engine().wake(userId, "fs");
       if (!live) {
         try { await client.resume(box.id); } catch { /* may already be resuming */ }
         let up = false;
@@ -449,10 +423,10 @@ async function fsWriteIntoBox(credentials: DemoCredentials, userId: string, file
   }
 }
 
-async function fsResolveBox(credentials: DemoCredentials, userId: string): Promise<{ box?: { id: string; state: string }; live: boolean }> {
-  const activeId = await engineFor(credentials).activeUserBoxId(userId);
+async function fsResolveBox(userId: string): Promise<{ box?: { id: string; state: string }; live: boolean }> {
+  const activeId = await engine().activeUserBoxId(userId);
   if (!activeId) return { live: false };
-  const active = await fsBoxClient(credentials).get(activeId).catch(() => undefined);
+  const active = await fsBoxClient().get(activeId).catch(() => undefined);
   if (!active) return { live: false };
   const state = String((active as { state?: string; status?: string }).state ?? (active as { status?: string }).status ?? "");
   // "live" means "worth TRYING the live path": the state string lags the
@@ -527,7 +501,6 @@ async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<{ entri
 
 async function handleFsRoute(pathname: string, body: any, res: http.ServerResponse): Promise<boolean> {
   if (!pathname.startsWith("/api/fs/")) return false;
-  const credentials = credentialsFromBody(body);
   const userId = String(body.userId ?? "user-a");
   const filePath = typeof body.path === "string" ? body.path.replace(/^\/+/, "") : "";
   const json = (status: number, payload: unknown) => {
@@ -535,14 +508,14 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     res.end(JSON.stringify(payload));
   };
   try {
-    const { box, live } = await fsResolveBox(credentials, userId);
-    const client = fsBoxClient(credentials);
+    const { box, live } = await fsResolveBox(userId);
+    const client = fsBoxClient();
 
     if (pathname === "/api/fs/tree") {
       // One coherent runtime snapshot rides every tree poll: the page
       // reconciles ALL counters from it, so machines woken outside a turn
       // (typing, uploads) are never invisible to the UI.
-      const orch = engineFor(credentials);
+      const orch = engine();
       const runtime = await orch.userRuntimeStatus(userId);
       if (!box) return json(200, { ok: true, live: false, state: "none", entries: [], runtime }), true;
       if (live) {
@@ -627,7 +600,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       // window), and a stream the user is about to watch shouldn't die under
       // them. Each poll renews a 45s hold; the TTL is the release.
       desktopHolds.get(userId)?.();
-      desktopHolds.set(userId, engineFor(credentials).holdUserBox(userId, "desktop-connect", 45_000));
+      desktopHolds.set(userId, engine().holdUserBox(userId, "desktop-connect", 45_000));
       // Moonlight (60fps WebRTC) by default; body.vnc=true returns the noVNC
       // stream instead — plain websockets, which load on networks where the
       // WebRTC stream never connects (the widget offers an in-place switch).
@@ -639,7 +612,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
 
     if (pathname === "/api/fs/write") {
       if (!filePath || typeof body.contentB64 !== "string") return json(400, { ok: false, message: "path and contentB64 required" }), true;
-      const r = await fsWriteIntoBox(credentials, userId, filePath, Buffer.from(body.contentB64, "base64"));
+      const r = await fsWriteIntoBox(userId, filePath, Buffer.from(body.contentB64, "base64"));
       return json(r.status, r.payload), true;
     }
 
@@ -647,7 +620,7 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     // renew a rolling hold (pauses any running countdown at full) and wake the
     // box if it's parked so it's warm by the time the message is sent.
     if (pathname === "/api/fs/activity") {
-      const orch = engineFor(credentials);
+      const orch = engine();
       composingHolds.get(userId)?.();
       composingHolds.set(userId, orch.holdUserBox(userId, "composing", 15_000));
       if (box) {
@@ -766,20 +739,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Raw-binary upload: the panel/composer sends the file bytes directly
-    // (query: userId, path; header x-fs-keys for BYOK). No base64 inflation,
-    // no giant JSON.parse — this is the path for anything big.
+    // (query: userId, path). No base64 inflation, no giant JSON.parse — this is
+    // the path for anything big.
     if (req.method === "POST" && url.pathname === "/api/fs/upload") {
       const userId = String(url.searchParams.get("userId") || "user-a");
       const filePath = String(url.searchParams.get("path") || "").replace(/^\/+/, "");
-      let keys: unknown = {};
-      try { keys = JSON.parse(String(req.headers["x-fs-keys"] || "{}")); } catch { /* optional */ }
-      const credentials = credentialsFromBody({ apiKeys: keys });
       if (!filePath) {
         res.writeHead(400, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ ok: false, message: "path query param required" }));
       }
       const bytes = await readBinaryBody(req, 400_000_000);
-      const r = await fsWriteIntoBox(credentials, userId, filePath, bytes);
+      const r = await fsWriteIntoBox(userId, filePath, bytes);
       res.writeHead(r.status, { "content-type": "application/json" });
       return void res.end(JSON.stringify(r.payload));
     }
@@ -792,18 +762,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Voice messages: transcribe recorded audio with OpenAI Whisper. The key is
-    // server-side (WHISPER_API_KEY), with a BYOK OpenAI key as fallback.
+    // server-side (WHISPER_API_KEY), with the user's own OpenAI key as fallback.
     if (req.method === "POST" && url.pathname === "/api/transcribe") {
       const body = await readBody(req, 64_000_000);
       const json = (status: number, payload: unknown) => {
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(payload));
       };
+      const userEnv = await engine().userProviderEnv(String(body.userId ?? "user-a")).catch(() => ({} as Record<string, string>));
       const key = process.env.WHISPER_API_KEY
-        || credentialsFromBody(body).providerEnv.OPENAI_API_KEY
+        || userEnv.OPENAI_API_KEY
         || process.env.OPENAI_API_KEY
         || process.env.OPENAI_API_KEY_SCOPED;
-      if (!key) return void json(400, { ok: false, message: "No transcription key (set WHISPER_API_KEY or provide an OpenAI key in Settings)." });
+      if (!key) return void json(400, { ok: false, message: "No transcription key (set WHISPER_API_KEY or add an OpenAI key in Agents)." });
       if (typeof body.audioB64 !== "string") return void json(400, { ok: false, message: "audioB64 required" });
       try {
         const bytes = Buffer.from(body.audioB64, "base64");
@@ -878,16 +849,20 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // The harness catalog, greyed out against THIS user's credentials (their own
+    // keys first, the server's as the fallback indicator).
     if (req.method === "GET" && url.pathname === "/api/harnesses") {
+      const userId = url.searchParams.get("userId") ?? undefined;
+      const unlocks = await unlocksFor(userId);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(
         JSON.stringify({
-          harnesses: await harnessCatalog(serverProviderEnv),
+          harnesses: await harnessCatalog(unlocks),
           env: {
             BOX_API_KEY: Boolean(serverBoxApiKey),
-            ANTHROPIC_API_KEY: keyAvailable("anthropic"),
-            OPENAI_API_KEY: keyAvailable("openai"),
-            OPENROUTER_API_KEY: keyAvailable("openrouter"),
+            ANTHROPIC_API_KEY: unlocks.has("ANTHROPIC_API_KEY"),
+            OPENAI_API_KEY: unlocks.has("OPENAI_API_KEY"),
+            OPENROUTER_API_KEY: unlocks.has("OPENROUTER_API_KEY"),
           },
           serverKeysAllowed: allowServerKeys,
           credentialMode: allowServerKeys ? "server-or-byok" : "byok-required",
@@ -896,11 +871,69 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // ---------------------------------------------------------------------
+    // The Agents panel: a user's own harness/model default and their own
+    // provider credentials, stored server-side and applied to THEIR box.
+    // GET  /api/agents?userId=…  -> selection + which credentials are connected
+    //                               (last 4 chars only; never a secret)
+    // POST /api/agents           -> { userId, conversationId?, selection?,
+    //                               credentials? } ; "" clears a credential.
+    // ---------------------------------------------------------------------
+    if (req.method === "GET" && url.pathname === "/api/agents") {
+      const userId = String(url.searchParams.get("userId") || "user-a");
+      const json = (status: number, payload: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      try {
+        return void json(200, { ok: true, ...(await engine().getUserAgents(userId)), catalog: AGENT_CREDENTIALS });
+      } catch (e) {
+        return void json(500, { ok: false, message: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/agents") {
+      const body = await readBody(req, 4_000_000);
+      const userId = String(body.userId ?? "user-a");
+      const json = (status: number, payload: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      try {
+        const { providerEnv, agentFiles } = splitCredentialPatch(
+          body.credentials && typeof body.credentials === "object" ? body.credentials : {},
+        );
+        const raw = body.selection && typeof body.selection === "object" ? body.selection : {};
+        const selection = {
+          harness: typeof raw.harness === "string" ? raw.harness : undefined,
+          provider: typeof raw.provider === "string" ? raw.provider : undefined,
+          model: typeof raw.model === "string" ? raw.model : undefined,
+          reasoningEffort: typeof raw.reasoningEffort === "string" ? raw.reasoningEffort : undefined,
+        };
+        // Values NEVER get logged: only which fields were touched.
+        fsLog({ route: "agents.save", userId, fields: Object.keys(body.credentials ?? {}), selection: selection.harness ? `${selection.harness}/${selection.model ?? ""}` : "unchanged" });
+        const result = await engine().setUserAgents(
+          userId,
+          { providerEnv, agentFiles, selection },
+          { ...(typeof body.conversationId === "string" && body.conversationId ? { conversationId: body.conversationId } : {}) },
+        );
+        const message = result.applied === "now"
+          ? "applied to your box now"
+          : result.applied === "next-start"
+            ? "applies when your box next starts"
+            : "saved";
+        return void json(200, { ok: true, applied: result.applied, message, ...(await engine().getUserAgents(userId)), catalog: AGENT_CREDENTIALS });
+      } catch (e) {
+        fsLog({ route: "agents.save", userId, status: 502, error: e instanceof Error ? e.message : String(e) });
+        return void json(502, { ok: false, message: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
     // Stop one running turn: drops its shared stream and interrupts only its
     // Box conversation; parallel conversations on the same machine keep running.
     if (req.method === "POST" && url.pathname === "/api/interrupt") {
       const body = await readBody(req);
-      const stopped = engineFor(credentialsFromBody(body)).interrupt(String(body.turnId ?? ""));
+      const stopped = engine().interrupt(String(body.turnId ?? ""));
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ ok: true, stopped }));
     }
@@ -948,23 +981,32 @@ const server = http.createServer(async (req, res) => {
       // Declared out here (not in the try) so the post-catch flush can await it.
       let journalChain: Promise<unknown> = Promise.resolve();
       const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      // A per-message override. Anything the composer omits falls back to the
+      // user's stored Agents default inside the engine.
+      const str = (v: unknown): string => (typeof v === "string" ? v : "");
       const selection = {
-        harness: String(body.harness),
-        provider: String(body.provider),
-        model: String(body.model),
-        ...(typeof body.reasoningEffort === "string" && body.reasoningEffort ? { reasoningEffort: String(body.reasoningEffort) } : {}),
+        harness: str(body.harness),
+        provider: str(body.provider),
+        model: str(body.model),
+        ...(str(body.reasoningEffort) ? { reasoningEffort: str(body.reasoningEffort) } : {}),
       };
-      const credentials = credentialsFromBody(body);
+      const userId = String(body.userId ?? "user-a");
       try {
-        const configError = credentialError(selection, credentials);
+        const orchestrator = engine();
+        const stored = await orchestrator.getUserAgents(userId);
+        const effective = {
+          harness: selection.harness || stored.selection.harness || "",
+          provider: selection.provider || stored.selection.provider || "",
+          model: selection.model || stored.selection.model || "",
+        };
+        const configError = await credentialError(effective, userId);
         if (configError) {
           send({ type: "error", message: configError });
           send({ type: "stream.end" });
           return void res.end();
         }
-        const orchestrator = engineFor(credentials);
         const turnInput = {
-          userId: String(body.userId ?? "user-a"),
+          userId,
           conversationId: String(body.conversationId ?? "conv-1"),
           message: String(body.message ?? ""),
           selection,
@@ -990,12 +1032,12 @@ const server = http.createServer(async (req, res) => {
           type: "trace",
           stage: "backend.request.received",
           message: "POST /api/send reached backend; SSE stream opened",
-          harness: selection.harness,
-          model: selection.model,
+          harness: effective.harness,
+          model: effective.model,
           data: {
             runId: serverRunId,
             requestId,
-            credentialSource: credentials.source,
+            credentialSource: stored.usingOwnKeys ? "user" : "server",
           },
         };
         auditEvent(receivedEvent, turnInput, requestId);
@@ -1014,13 +1056,13 @@ const server = http.createServer(async (req, res) => {
           const boxReady = typeof boxIdForDesktop === "string" &&
             (ev.type === "billing.start" || (ev.type === "trace" && (ev as any).stage === "runtime.owner.selected"));
           if (ev.type === "billing.start" && typeof boxIdForDesktop === "string") {
-            void fsBoxClient(credentials).desktopStreamUrl(boxIdForDesktop, { theme: "light", publicAccess: true }).catch(() => undefined);
+            void fsBoxClient().desktopStreamUrl(boxIdForDesktop, { theme: "light", publicAccess: true }).catch(() => undefined);
           }
           if (boxReady) {
             send(ev);
             if (attachments.length && !attachmentsUploaded) {
               attachmentsUploaded = true;
-              const client = fsBoxClient(credentials);
+              const client = fsBoxClient();
               const hold = orchestrator.holdUserBox(turnInput.userId, "upload", 300_000);
               try {
                 // The box may bill before its filesystem is mounted — a files-API
@@ -1072,8 +1114,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/history") {
       const body = await readBody(req);
       try {
-        const credentials = credentialsFromBody(body);
-        const events = await engineFor(credentials).getEvents(
+        const events = await engine().getEvents(
           String(body.userId ?? "user-a"),
           String(body.conversationId ?? "conv-1"),
           Number.isFinite(Number(body.sinceSeq)) ? Number(body.sinceSeq) : 0,
@@ -1089,8 +1130,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/reset") {
       const body = await readBody(req);
       try {
-        const credentials = credentialsFromBody(body);
-        const result = await engineFor(credentials).resetUser(String(body.userId ?? "user-a"));
+        const result = await engine().resetUser(String(body.userId ?? "user-a"));
         res.writeHead(200, { "content-type": "application/json" });
         return void res.end(JSON.stringify(result));
       } catch (e) {
@@ -1102,9 +1142,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/host/stop") {
       const body = await readBody(req);
       try {
-        const credentials = credentialsFromBody(body);
         const port = Number.isFinite(Number(body.port)) && Number(body.port) > 0 ? Number(body.port) : undefined;
-        const result = await engineFor(credentials).stopHosting(String(body.userId ?? "user-a"), port);
+        const result = await engine().stopHosting(String(body.userId ?? "user-a"), port);
         res.writeHead(200, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ ok: true, ...result }));
       } catch (e) {
@@ -1119,13 +1158,12 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const send = sse(res);
       try {
-        const credentials = credentialsFromBody(body);
-        if (!credentials.boxApiKey) {
-          send({ type: "error", message: allowServerKeys ? "BOX_API_KEY is not configured." : "Open Settings (gear) and paste BOX_API_KEY before pausing a BYOK Box." });
+        if (!serverBoxApiKey) {
+          send({ type: "error", message: "BOX_API_KEY is not configured on this preview." });
           send({ type: "stream.end" });
           return void res.end();
         }
-        const orchestrator = engineFor(credentials);
+        const orchestrator = engine();
         for await (const event of orchestrator.stopUserBox(
           String(body.userId ?? "user-a"),
           String(body.conversationId ?? "conv-1"),

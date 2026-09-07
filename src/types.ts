@@ -16,11 +16,15 @@ export interface HarnessSelection {
   reasoningEffort?: string;
 }
 
+/**
+ * A turn's selection is a PARTIAL override: any field the composer leaves out
+ * falls back to the user's stored Agents default (agent_selection).
+ */
 export interface ConsumerTurnInput {
   userId: string;
   conversationId: string;
   message: string;
-  selection: HarnessSelection;
+  selection?: Partial<HarnessSelection>;
 }
 
 /** The event contract between engine and UI — unchanged, so the client renders identically. */
@@ -102,7 +106,8 @@ export interface BoxClient {
   get(boxId: string): Promise<BoxInfo>;
   update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo>;
   stop(boxId: string): Promise<BoxInfo | { ok: boolean }>;
-  resume(boxId: string): Promise<BoxInfo | { ok: boolean }>;
+  /** `env` REPLACES the box's stored environment; omitted keeps whatever it has. */
+  resume(boxId: string, input?: { env?: Record<string, string> }): Promise<BoxInfo | { ok: boolean }>;
   deleteBox?(boxId: string): Promise<void>;
   command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number }): Promise<CommandResult>;
   readFile(boxId: string, path: string): Promise<string>;

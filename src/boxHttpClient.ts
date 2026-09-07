@@ -81,8 +81,17 @@ export class BoxHttpClient implements BoxClient {
     return json.box ?? { ok: json.ok };
   }
 
-  async resume(boxId: string): Promise<BoxInfo | { ok: boolean }> {
-    const json = await this.request<{ box?: BoxInfo; ok: boolean }>(`/boxes/${encodeURIComponent(boxId)}/resume`, { method: "POST" });
+  /**
+   * Resume a parked box. A body `env` REPLACES the box's stored environment
+   * (the API keeps that env across every later stop/resume where env is
+   * omitted) — this is how a user's new provider keys reach a no-env box.
+   */
+  async resume(boxId: string, input: { env?: Record<string, string> } = {}): Promise<BoxInfo | { ok: boolean }> {
+    const hasEnv = Boolean(input.env && Object.keys(input.env).length);
+    const json = await this.request<{ box?: BoxInfo; ok: boolean }>(
+      `/boxes/${encodeURIComponent(boxId)}/resume`,
+      { method: "POST", ...(hasEnv ? { body: JSON.stringify({ env: input.env }) } : {}) },
+    );
     return json.box ?? { ok: json.ok };
   }
 

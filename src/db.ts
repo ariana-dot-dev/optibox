@@ -15,11 +15,20 @@ create table if not exists instances (
   id text primary key,
   heartbeat_at timestamptz not null default now()
 );
+-- provider_env / agent_files / agent_selection: the user's OWN Agents setup —
+-- the provider keys their box runs on, the home-relative secret files written
+-- into it after every bring-up (a no-env box's resume scrubs them off disk), and
+-- their default harness/model. env_pending marks keys saved while the box was
+-- parked: the next resume passes them as the box's new env.
 create table if not exists users (
   key text primary key,
   billed_seconds double precision not null default 0,
   last_activity_at timestamptz not null default now()
 );
+alter table users add column if not exists provider_env jsonb not null default '{}';
+alter table users add column if not exists agent_files jsonb not null default '{}';
+alter table users add column if not exists agent_selection jsonb not null default '{}';
+alter table users add column if not exists env_pending boolean not null default false;
 create table if not exists boxes (
   id text primary key,
   user_key text not null,

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "./db.js";
+import { agentCredentialStates, applyPatch, sameMap, type UserAgentSelection, type UserAgentsView } from "./agents.js";
 import { buildHiddenContext, BOX_PRICE_USD_PER_SECOND, BOX_PRICING } from "./context.js";
 import { boxRules, boxTurnPrompt, directProviderStream, sharedPrompt, type SharedStream } from "./shared.js";
-import type { BoxClient, BoxEvent, BoxInfo, ConsumerTurnEvent, ConsumerTurnEventBody, ConsumerTurnInput, TranscriptMessage } from "./types.js";
+import type { BoxClient, BoxEvent, BoxInfo, ConsumerTurnEvent, ConsumerTurnEventBody, ConsumerTurnInput, HarnessSelection, TranscriptMessage } from "./types.js";
 
 /**
  * The engine: the 6-rule spec on Postgres, with the Box's integrated agents
@@ -26,12 +27,14 @@ export interface EngineOptions {
   db: Db;
   box: BoxClient;
   instanceId: string;
-  /** Distinguishes BYOK credential sets; part of every user key. */
+  /** Isolates one Box ACCOUNT's rows from another's; part of every user key. */
   credHash: string;
-  /** Provider keys the user's boxes run on (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY). */
+  /** FALLBACK provider keys: what a user's box runs on until that user sets their own. */
   providerEnv?: Record<string, string>;
   /** The shared bridge model, "<provider>/<model>"; or an injected stream (tests). */
   sharedModel?: string;
+  /** Picks the bridge model for a given key set (the bridge runs on the user's keys when it can). */
+  sharedModelForEnv?: (env: Record<string, string>) => string;
   sharedStream?: SharedStream;
   userBoxTtlSeconds?: number;
   autoStopIdleMs?: number;
@@ -109,11 +112,21 @@ type BoxOutcome =
   | { outcome: "interrupted"; text: string }
   | { outcome: "blocked"; text: ""; diagnostic: string; blockedEmitted: boolean };
 
+/** A turn once its selection has been resolved against the user's Agents default. */
+type ResolvedTurnInput = ConsumerTurnInput & { selection: HarnessSelection };
+
+/** The Agents row of one user: their keys, their secret files, their default model. */
+interface UserAgentsRow {
+  providerEnv: Record<string, string>;
+  agentFiles: Record<string, string>;
+  selection: UserAgentSelection;
+  envPending: boolean;
+}
+
 export class Engine {
   private readonly db: Db;
   private readonly box: BoxClient;
   private readonly opts: EngineOptions;
-  private readonly shared: SharedStream;
   private sweeper: ReturnType<typeof setInterval> | undefined;
   /** In-process abort registry: aborting drops the shared stream and interrupts the box conversation. */
   private readonly turnAborts = new Map<string, AbortController>();
@@ -122,8 +135,7 @@ export class Engine {
     this.opts = opts;
     this.db = opts.db;
     this.box = opts.box;
-    if (!opts.sharedStream && !opts.sharedModel) throw new Error("Engine requires sharedModel (\"<provider>/<model>\") or sharedStream");
-    this.shared = opts.sharedStream ?? directProviderStream(opts.providerEnv ?? {}, opts.sharedModel as string);
+    if (!opts.sharedStream && !opts.sharedModel && !opts.sharedModelForEnv) throw new Error("Engine requires sharedModel (\"<provider>/<model>\") or sharedStream");
     const ms = opts.sweepIntervalMs ?? 5_000;
     if (ms > 0) {
       this.sweeper = setInterval(() => { void this.sweep().catch((e) => console.error("[engine] sweep failed:", e)); }, ms);
@@ -135,10 +147,153 @@ export class Engine {
 
   // ---------------------------------------------------------------- identity
 
-  /** Full user key: fingerprint user + credential hash (BYOK isolation). */
+  /** Full user key: fingerprint user + the Box account hash (account isolation). */
   userKey(userId: string): string { return `${userId}-${this.opts.credHash}`; }
   private boxName(userKey: string): string { return `optibox-${this.opts.instanceId}-user-${userKey}`; }
   private convKey(userKey: string, conversationId: string): string { return `${userKey}:${conversationId}`; }
+
+  // ---------------------------------------------------------------- per-user Agents setup
+
+  /**
+   * A user's own Agents row. Every box this engine brings up for them runs on
+   * THEIR keys (`provider_env`) and carries THEIR secret files (`agent_files`);
+   * the engine's own `providerEnv` is only the fallback for a user who has set
+   * nothing. Reads never write, so this is safe on every turn.
+   */
+  private async userAgentsRow(userId: string): Promise<UserAgentsRow> {
+    const row = await this.db.one<{ provider_env: Record<string, string> | null; agent_files: Record<string, string> | null; agent_selection: UserAgentSelection | null; env_pending: boolean | null }>(
+      `select provider_env, agent_files, agent_selection, env_pending from users where key=$1`, [this.userKey(userId)],
+    );
+    return {
+      providerEnv: row?.provider_env ?? {},
+      agentFiles: row?.agent_files ?? {},
+      selection: row?.agent_selection ?? {},
+      envPending: Boolean(row?.env_pending),
+    };
+  }
+
+  /** The environment the user's box runs on: their keys when they have any, else the server's. */
+  async userProviderEnv(userId: string): Promise<Record<string, string>> {
+    const own = (await this.userAgentsRow(userId)).providerEnv;
+    return Object.keys(own).length ? { ...own } : { ...(this.opts.providerEnv ?? {}) };
+  }
+
+  /** What the settings panel shows: selection + which credentials are connected. NEVER a secret. */
+  async getUserAgents(userId: string): Promise<UserAgentsView> {
+    const row = await this.userAgentsRow(userId);
+    return {
+      selection: row.selection,
+      credentials: agentCredentialStates(row.providerEnv, row.agentFiles),
+      usingOwnKeys: Object.keys(row.providerEnv).length > 0 || Object.keys(row.agentFiles).length > 0,
+      envPending: row.envPending,
+    };
+  }
+
+  /**
+   * Save a user's Agents setup and make the box match it.
+   *
+   * Keys reach a no-env box exactly one way: as the box's `env`, at create or at
+   * resume (a resume body's env REPLACES the stored one and the box keeps it
+   * across later stop/resume). So a LIVE box is stopped — billing ends exactly
+   * as a manual stop — and resumed with the new env; a PARKED box only records
+   * `env_pending`, and the next wake in ensureUserBox carries the env.
+   *
+   * Secret FILES cannot ride the env: a no-env box's resume scrubs owner secrets
+   * off its disk, which unlinks ~/.codex/auth.json with them, so they are
+   * rewritten after every bring-up (here, and in ensureUserBox).
+   */
+  async setUserAgents(
+    userId: string,
+    patch: { providerEnv?: Record<string, string>; agentFiles?: Record<string, string>; selection?: UserAgentSelection },
+    opts: { conversationId?: string } = {},
+  ): Promise<{ applied: "now" | "next-start" | "none"; boxId?: string }> {
+    const key = this.userKey(userId);
+    await this.db.q(`insert into users(key) values($1) on conflict do nothing`, [key]);
+    const before = await this.userAgentsRow(userId);
+    const providerEnv = applyPatch(before.providerEnv, patch.providerEnv);
+    const agentFiles = applyPatch(before.agentFiles, patch.agentFiles);
+    const selection: UserAgentSelection = { ...before.selection };
+    for (const [k, v] of Object.entries(patch.selection ?? {})) {
+      if (typeof v !== "string") continue;
+      if (v) (selection as Record<string, string>)[k] = v; else delete (selection as Record<string, string>)[k];
+    }
+    const credentialsChanged = !sameMap(providerEnv, before.providerEnv) || !sameMap(agentFiles, before.agentFiles);
+    await this.db.q(
+      `update users set provider_env=$2, agent_selection=$4, agent_files=$3 where key=$1`,
+      [key, JSON.stringify(providerEnv), JSON.stringify(agentFiles), JSON.stringify(selection)],
+    );
+    if (!credentialsChanged) return { applied: "none" };
+
+    return this.db.withLock("user", key, async () => {
+      const row = await this.db.one<{ id: string }>(
+        `select id from boxes where user_key=$1 and purpose='user' and retired_at is null`, [key],
+      );
+      // No machine yet: the create call will carry the new keys as its env.
+      if (!row) { await this.db.q(`update users set env_pending=false where key=$1`, [key]); return { applied: "next-start" }; }
+      const info = await this.box.get(row.id).catch(() => undefined);
+      const state = String(info?.state ?? "error");
+      const live = Boolean(info) && !["error", "deleted", "archived", "stopped", "archiving", "stopping"].includes(state);
+      if (!live) {
+        await this.db.q(`update users set env_pending=true where key=$1`, [key]);
+        return { applied: "next-start", boxId: row.id };
+      }
+      await this.endBilling(row.id);
+      await this.box.stop(row.id).catch(() => undefined);
+      await this.waitUntilParked(row.id);
+      await this.box.resume(row.id, { env: await this.userProviderEnv(userId) });
+      const ready = await this.waitUntilReady(row.id);
+      await this.writeAgentFiles(row.id, userId);
+      await this.db.q(`update users set env_pending=false where key=$1`, [key]);
+      await this.wake(userId, "agents");
+      if (opts.conversationId) {
+        await this.logEvent(userId, opts.conversationId, null, {
+          type: "lifecycle", boxId: row.id, state: ready.state,
+          note: "your agent credentials were applied: the private machine restarted with them",
+        }).catch(() => undefined);
+      }
+      return { applied: "now", boxId: row.id };
+    });
+  }
+
+  /**
+   * Write the user's secret files into the box. Run after EVERY bring-up: a
+   * no-env box scrubs owner secrets at /start, and that scrub deletes the same
+   * paths a user's own file lands on (~/.codex/auth.json).
+   */
+  private async writeAgentFiles(boxId: string, userId: string): Promise<string[]> {
+    const files = (await this.userAgentsRow(userId)).agentFiles;
+    const paths = Object.keys(files).filter((p) => p && typeof files[p] === "string" && (files[p] as string).length);
+    if (!paths.length) return [];
+    const dirs = [...new Set(paths.map((p) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "")).filter(Boolean))];
+    // A files-API PUT into a not-yet-existing directory can answer 200 without
+    // ever hitting disk, so the parents are created with a command first.
+    if (dirs.length) {
+      await this.box.command(boxId, { command: `mkdir -p ${dirs.map((d) => `'${d.replace(/'/g, `'\\''`)}'`).join(" ")}`, timeoutMs: 20_000 }).catch(() => undefined);
+    }
+    for (const p of paths) await this.box.writeFile(boxId, p, files[p] as string);
+    return paths;
+  }
+
+  /** The composer's per-message choice wins; anything it omits falls back to the user's default. */
+  private async resolveSelection(userId: string, given: Partial<HarnessSelection> = {}): Promise<HarnessSelection> {
+    const stored = (await this.userAgentsRow(userId)).selection;
+    const pick = (a?: string, b?: string): string => (a && a.trim() ? a : b && b.trim() ? b : "");
+    const reasoningEffort = pick(given.reasoningEffort, stored.reasoningEffort);
+    return {
+      harness: pick(given.harness, stored.harness),
+      provider: pick(given.provider, stored.provider),
+      model: pick(given.model, stored.model),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    };
+  }
+
+  /** The bridge runs on the user's own keys when they have them, the server's otherwise. */
+  private async sharedStreamFor(userId: string): Promise<SharedStream> {
+    if (this.opts.sharedStream) return this.opts.sharedStream;
+    const env = { ...(this.opts.providerEnv ?? {}), ...(await this.userAgentsRow(userId)).providerEnv };
+    const model = this.opts.sharedModelForEnv?.(env) ?? (this.opts.sharedModel as string);
+    return directProviderStream(env, model);
+  }
 
   // ---------------------------------------------------------------- billing
 
@@ -206,8 +361,9 @@ export class Engine {
         if (info && !["error", "deleted"].includes(state)) {
           if (["archived", "stopped"].includes(state)) {
             events?.push({ type: "lifecycle", boxId: info.id, state: "resuming", note: "resuming private box from disk snapshot" });
-            await this.box.resume(info.id);
+            await this.resumeWithUserEnv(userId, info.id, events);
             const ready = await this.waitUntilReady(info.id);
+            await this.afterBringUp(userId, info.id, events);
             await this.wake(userId, "resume");
             events?.push({ type: "lifecycle", boxId: info.id, state: ready.state, note: "private box resumed from snapshot — no cold start" });
             return ready;
@@ -215,8 +371,9 @@ export class Engine {
           if (state === "archiving" || state === "stopping") {
             events?.push({ type: "lifecycle", boxId: info.id, state, note: "waiting out in-flight archive before resume" });
             await this.waitUntilParked(info.id);
-            await this.box.resume(info.id);
+            await this.resumeWithUserEnv(userId, info.id, events);
             const ready = await this.waitUntilReady(info.id);
+            await this.afterBringUp(userId, info.id, events);
             await this.wake(userId, "resume");
             return ready;
           }
@@ -229,15 +386,36 @@ export class Engine {
       }
       // Fresh machine: no owner secrets, only the user's provider keys; the
       // harnesses come with the Box, and read the standing rules from home.
-      const created = await this.box.create({ name: this.boxName(key), ttlSeconds: this.opts.userBoxTtlSeconds ?? 900, noEnv: true, ...(this.opts.providerEnv ? { env: this.opts.providerEnv } : {}) });
+      const env = await this.userProviderEnv(userId);
+      const created = await this.box.create({ name: this.boxName(key), ttlSeconds: this.opts.userBoxTtlSeconds ?? 900, noEnv: true, ...(Object.keys(env).length ? { env } : {}) });
       await this.db.q(`insert into boxes(id, user_key, instance_id, purpose) values($1,$2,$3,'user')`, [created.id, key, this.opts.instanceId]);
+      await this.db.q(`update users set env_pending=false where key=$1`, [key]);
       events?.push({ type: "lifecycle", boxId: created.id, state: "starting", note: "creating fresh private box" });
       const ready = await this.waitUntilReady(created.id);
       const rules = boxRules();
       await Promise.all(["AGENTS.md", "CLAUDE.md"].map((f) => this.box.writeFile(created.id, f, rules)));
+      await this.afterBringUp(userId, created.id, events);
       await this.wake(userId, "boot");
       return ready;
     });
+  }
+
+  /**
+   * Resume, carrying the user's env when they changed keys while the box was
+   * parked. Passing env REPLACES the box's stored environment; omitting it keeps
+   * what the box already has, so a normal wake stays a plain resume.
+   */
+  private async resumeWithUserEnv(userId: string, boxId: string, events?: EventQueue): Promise<void> {
+    if (!(await this.userAgentsRow(userId)).envPending) { await this.box.resume(boxId); return; }
+    events?.push({ type: "lifecycle", boxId, state: "resuming", note: "applying your saved agent credentials to this machine" });
+    await this.box.resume(boxId, { env: await this.userProviderEnv(userId) });
+    await this.db.q(`update users set env_pending=false where key=$1`, [this.userKey(userId)]);
+  }
+
+  /** Every bring-up ends the same way: the user's secret files land before any prompt. */
+  private async afterBringUp(userId: string, boxId: string, events?: EventQueue): Promise<void> {
+    const written = await this.writeAgentFiles(boxId, userId).catch(() => [] as string[]);
+    if (written.length) events?.push({ type: "lifecycle", boxId, state: "ready", note: `restored your agent credential files (${written.join(", ")})` });
   }
 
   private async waitUntilReady(boxId: string): Promise<BoxInfo> {
@@ -487,10 +665,19 @@ export class Engine {
     const turnId = randomUUID();
     const userKey = this.userKey(input.userId);
     const convKey = this.convKey(userKey, input.conversationId);
-    const { harness, model } = input.selection;
+    // The composer's choice wins per message; anything it omits is the user's
+    // own Agents default (harness / model / reasoning level).
+    const selection = await this.resolveSelection(input.userId, input.selection);
+    const turn: ResolvedTurnInput = { ...input, selection };
+    const { harness, model } = selection;
     const abort = new AbortController();
     this.turnAborts.set(turnId, abort);
     const emit = (e: EventBody): ConsumerTurnEvent => ({ ...e, turnId } as ConsumerTurnEvent);
+    if (!harness) {
+      yield emit({ type: "turn.blocked", stage: "selection.missing", message: "no harness selected: choose one in the Agents panel", retryable: false });
+      this.turnAborts.delete(turnId);
+      return;
+    }
     try {
       await this.db.q(`insert into users(key) values($1) on conflict(key) do update set last_activity_at=now()`, [userKey]);
       await this.db.q(`insert into conversations(user_key, id) values($1,$2) on conflict do nothing`, [userKey, input.conversationId]);
@@ -535,7 +722,8 @@ export class Engine {
         const hidden = buildHiddenContext({ transcript, machine: { location: "shared-box", tools: false, status: "provisioning" } });
         yield emit({ type: "context.injected", scope: "shared", machine: { location: "shared-box", tools: false, status: "provisioning" }, hidden });
         try {
-          for await (const delta of this.shared(sharedPrompt(transcript, input.message, this.opts.scenariosEnabled ? FORK_DIRECTIVE : undefined), abort.signal)) {
+          const shared = await this.sharedStreamFor(input.userId);
+          for await (const delta of shared(sharedPrompt(transcript, input.message, this.opts.scenariosEnabled ? FORK_DIRECTIVE : undefined), abort.signal)) {
             if (delta) { partialShared += delta; yield emit({ type: "shared.delta", text: delta, harness, final: false }); }
             for (const e of boot.drain()) yield emit(e);
           }
@@ -569,9 +757,9 @@ export class Engine {
 
       const forkLabels = this.opts.scenariosEnabled ? parseForkLabels(partialShared) : [];
       if (forkLabels.length >= 2) {
-        yield* this.runScenarios(input, turnId, userKey, convKey, box, partialShared, forkLabels, abort.signal);
+        yield* this.runScenarios(turn, turnId, userKey, convKey, box, partialShared, forkLabels, abort.signal);
       } else {
-        yield* this.runBoxRound(input, turnId, userKey, convKey, box, partialShared, abort.signal);
+        yield* this.runBoxRound(turn, turnId, userKey, convKey, box, partialShared, abort.signal);
       }
     } finally {
       this.turnAborts.delete(turnId);
@@ -592,7 +780,7 @@ export class Engine {
    * one (parallel conversations on the same machine).
    */
   private async *runBoxRound(
-    input: ConsumerTurnInput, turnId: string, userKey: string, convKey: string, box: BoxInfo, partialShared: string, signal: AbortSignal,
+    input: ResolvedTurnInput, turnId: string, userKey: string, convKey: string, box: BoxInfo, partialShared: string, signal: AbortSignal,
     scenario?: { scenarioId: string; label: string },
   ): AsyncIterable<ConsumerTurnEvent> {
     const { harness, model, reasoningEffort } = input.selection;
@@ -768,7 +956,7 @@ export class Engine {
    * scenario-tagged for the carousel UI. Nothing to provision, nothing to reap.
    */
   private async *runScenarios(
-    input: ConsumerTurnInput, turnId: string, userKey: string, convKey: string, box: BoxInfo, partialShared: string, labels: string[], signal: AbortSignal,
+    input: ResolvedTurnInput, turnId: string, userKey: string, convKey: string, box: BoxInfo, partialShared: string, labels: string[], signal: AbortSignal,
   ): AsyncIterable<ConsumerTurnEvent> {
     yield { type: "scenario.fork", groupId: turnId, labels, turnId } as ConsumerTurnEvent;
     try {

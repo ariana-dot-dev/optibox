@@ -121,7 +121,7 @@ function makeReadableSse(events: unknown[]) {
 
 /** Every model the catalog offers is unlocked unless a test says otherwise. */
 const DEFAULT_CATALOG = {
-  harnesses: [{ name: "claude", models: [{ provider: "anthropic", model: "claude-sonnet", keyAvailable: true }] }],
+  harnesses: [{ name: "claude", label: "Claude Code", models: [{ provider: "anthropic", model: "claude-sonnet", keyAvailable: true }] }],
   runtimeFeasibility: [],
   pricing: { ratePerSecond: 0.001 },
   serverKeysAllowed: true,
@@ -345,6 +345,31 @@ test("the Agents panel is read top to bottom: your agent, sign in, API keys fold
   assert.doesNotMatch(html, /settingsGrid/, "the old two-column grid is gone");
 });
 
+test("the harness and thinking selects read as display names, and keep the ids as their values", async () => {
+  const { getElement } = bootClient({
+    now: 10_000_000,
+    uuid: () => "turn-labels",
+    catalog: {
+      ...DEFAULT_CATALOG,
+      harnesses: [
+        { name: "claude-code", label: "Claude Code", models: [{ provider: "anthropic", model: "claude-sonnet-5", keyAvailable: true, requiredEnv: "ANTHROPIC_API_KEY", reasoningEffort: ["low", "medium", "high"] }] },
+        { name: "prime-agent", label: "Prime Agent", models: [{ provider: "openrouter", model: "glm-5", keyAvailable: true, requiredEnv: "OPENROUTER_API_KEY" }] },
+      ],
+    },
+  });
+  await settle(2);
+
+  const harness = getElement("settingsHarness").innerHTML;
+  assert.match(harness, /<option value="claude-code">Claude Code<\/option>/, "the CLI's own name, not its id");
+  assert.match(harness, /<option value="prime-agent">Prime Agent<\/option>/);
+  const thinking = getElement("settingsReasoning").innerHTML;
+  assert.match(thinking, /<option value="">Default<\/option>/);
+  assert.match(thinking, /<option value="low">Low<\/option>/);
+  assert.match(thinking, /<option value="medium">Medium<\/option>/);
+  assert.match(thinking, /<option value="high">High<\/option>/);
+  assert.equal(getElement("settingsReasoningRow").hidden, false, "the level picker only shows when the model takes levels");
+});
+
 test("Connect Claude subscription: the approval URL, then the pasted code, then the connected state", async () => {
   const { getElement, oauthCalls } = bootClient({
     now: 7_000_000,
@@ -479,7 +504,7 @@ test("API keys hold only the typed credentials, masked, and Save posts new value
 test("the composer pill names the running agent and whose credentials it runs on, and opens the panel", async () => {
   const catalog = {
     ...DEFAULT_CATALOG,
-    harnesses: [{ name: "claude-code", models: [{ provider: "anthropic", model: "claude-sonnet-5", label: "Claude Code · claude-sonnet-5", keyAvailable: true, requiredEnv: "ANTHROPIC_API_KEY" }] }],
+    harnesses: [{ name: "claude-code", label: "Claude Code", models: [{ provider: "anthropic", model: "claude-sonnet-5", label: "Claude Code · claude-sonnet-5", keyAvailable: true, requiredEnv: "ANTHROPIC_API_KEY" }] }],
   };
   const { getElement } = bootClient({
     now: 6_000_000,
@@ -537,7 +562,7 @@ test("a model the user has no key for is greyed out and the one status line says
     uuid: () => "turn-locked",
     catalog: {
       ...DEFAULT_CATALOG,
-      harnesses: [{ name: "codex", models: [{ provider: "openai", model: "gpt-5", label: "Codex · GPT-5", keyAvailable: false, requiredEnv: "OPENAI_API_KEY" }] }],
+      harnesses: [{ name: "codex", label: "Codex", models: [{ provider: "openai", model: "gpt-5", label: "Codex · GPT-5", keyAvailable: false, requiredEnv: "OPENAI_API_KEY" }] }],
     },
   });
   await settle(2);

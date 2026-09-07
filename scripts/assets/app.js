@@ -35,6 +35,9 @@ let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
 let autoStopInterval=null, autoStopDeadline=0, autoStopBoxId=null;
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+// Reasoning levels arrive as the wire ids ("low"/"medium"/"high"); the panel
+// shows them the way every other label in it reads.
+function titleCase(s){return String(s).charAt(0).toUpperCase()+String(s).slice(1);}
 // ---- Agents panel ---------------------------------------------------------
 // The user's own setup — which agent runs their private machine, and the
 // credentials it runs on — lives SERVER-side (GET/POST /api/agents) so it
@@ -84,7 +87,8 @@ function updateSettingsStatus(msg){const st=currentSettingsStatus();const el=$('
 function reasoningLevels(){const m=selectedModelOption();return (m&&m.reasoningEffort)||[];}
 function renderSettingsControls(){
   const hs=$('settingsHarness'), ms=$('settingsModel');if(!hs||!ms)return;
-  hs.innerHTML=H.map(h=>'<option value="'+esc(h.name)+'">'+esc(h.name)+'</option>').join('');
+  // Values stay the ids the routes speak; the text is the CLI's own name.
+  hs.innerHTML=H.map(h=>'<option value="'+esc(h.name)+'">'+esc(h.label||h.name)+'</option>').join('');
   hs.value=selectedHarness;
   const h=H.find(x=>x.name===selectedHarness);
   // The harness sits in the select next door, so the model names only itself.
@@ -93,7 +97,7 @@ function renderSettingsControls(){
   ms.value=selectedProvider+'|'+selectedModel;
   const levels=reasoningLevels(), row=$('settingsReasoningRow'), rs=$('settingsReasoning');
   if(row&&rs){
-    if(levels.length){row.hidden=false;rs.innerHTML=['<option value="">default</option>'].concat(levels.map(l=>'<option value="'+esc(l)+'">'+esc(l)+'</option>')).join('');rs.value=levels.indexOf(selectedReasoning)>=0?selectedReasoning:'';}
+    if(levels.length){row.hidden=false;rs.innerHTML=['<option value="">Default</option>'].concat(levels.map(l=>'<option value="'+esc(l)+'">'+esc(titleCase(l))+'</option>')).join('');rs.value=levels.indexOf(selectedReasoning)>=0?selectedReasoning:'';}
     else{row.hidden=true;rs.innerHTML='';}
   }
   renderSignin();

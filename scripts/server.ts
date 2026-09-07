@@ -67,7 +67,9 @@ const allowServerKeys =
  * A model's key family (which BYOK key it bills to) comes from the credentials
  * that unlock it; that is all the settings UI needs to grey models out.
  */
-interface HarnessInfo { name: string; description: string; models: Array<{ provider: string; model: string; label: string; keyAvailable: boolean; requiredEnv: string; unlockedBy: string[]; reasoningEffort?: string[] }> }
+// `name` is the id every route speaks; `label` is the CLI's own display name
+// (p.cli.name from GET /api/provider-models), which is what the panel shows.
+interface HarnessInfo { name: string; label: string; description: string; models: Array<{ provider: string; model: string; label: string; keyAvailable: boolean; requiredEnv: string; unlockedBy: string[]; reasoningEffort?: string[] }> }
 const CREDENTIAL_ENV: Record<string, string> = { "anthropic-api-key": "ANTHROPIC_API_KEY", "openai-api-key": "OPENAI_API_KEY", "openrouter-api-key": "OPENROUTER_API_KEY" };
 const HARNESS_ENV: Record<string, string> = { "claude-code": "ANTHROPIC_API_KEY", codex: "OPENAI_API_KEY" };
 const PROVIDER_OF_ENV: Record<string, string> = { ANTHROPIC_API_KEY: "anthropic", OPENAI_API_KEY: "openai", OPENROUTER_API_KEY: "openrouter" };
@@ -87,7 +89,7 @@ async function harnessCatalog(unlocks: Set<string>): Promise<HarnessInfo[]> {
         if (!requiredEnv) return [];
         return [{ provider: PROVIDER_OF_ENV[requiredEnv] as string, model: m.id, label: `${p.cli?.name ?? name} · ${m.label}`, keyAvailable: false, requiredEnv, unlockedBy: [requiredEnv, ...(HARNESS_ALT_UNLOCKS[name] ?? [])], ...(m.reasoningEffort ? { reasoningEffort: m.reasoningEffort.supported } : {}) }];
       });
-      if (models.length) harnesses.push({ name, description: p.cli?.description ?? name, models });
+      if (models.length) harnesses.push({ name, label: p.cli?.name ?? name, description: p.cli?.description ?? name, models });
     }
     harnesses.sort((a, b) => (config[a.name]?.cli?.order ?? 99) - (config[b.name]?.cli?.order ?? 99));
     catalogCache = { at: Date.now(), harnesses };

@@ -151,7 +151,7 @@ function bootClient(opts: {
     "composer", "msg", "send", "stopBox", "showTraces", "chat", "empty",
     "schematic", "routeStatus", "machineState", "totalSeconds", "totalCost", "autoStopTimer", "matrix",
     "settingsBackdrop", "settingsHarness", "settingsModel", "settingsReasoningRow", "settingsReasoning",
-    "agentsCreds", "settingsNote", "settingsStatus", "settingsSave", "settingsClose", "settingsOpen",
+    "agentsCreds", "settingsNote", "settingsStatus", "settingsSave", "settingsClose", "settingsOpen", "agentPill",
   ]) getElement(id);
 
   const sendRequests: any[] = [];
@@ -349,6 +349,58 @@ test("Agents panel shows connected credentials masked, and Save posts new values
   assert.equal(agentsSaves[0].selection.model, "claude-sonnet");
   assert.equal(getElement("settingsStatus").textContent, "applied to your box now");
   assert.equal(creds.querySelector('[data-cred="openaiApiKey"]')!.value, "", "typed secrets are wiped from the form after the save");
+});
+
+test("the composer pill names the running agent and whose keys it runs on, and opens the panel", async () => {
+  const catalog = {
+    ...DEFAULT_CATALOG,
+    harnesses: [{ name: "claude-code", models: [{ provider: "anthropic", model: "claude-sonnet-5", label: "Claude Code · claude-sonnet-5", keyAvailable: true, requiredEnv: "ANTHROPIC_API_KEY" }] }],
+  };
+  const { getElement } = bootClient({
+    now: 6_000_000,
+    uuid: () => "turn-pill",
+    catalog,
+    agents: {
+      ok: true,
+      selection: { harness: "claude-code", provider: "anthropic", model: "claude-sonnet-5" },
+      usingOwnKeys: false,
+      envPending: false,
+      credentials: [{ id: "anthropicApiKey", label: "Anthropic API key", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", multiline: false, connected: false, last4: "" }],
+    },
+    onAgentsSave: (body: any) => ({
+      ok: true, applied: "now", message: "applied to your box now", selection: body.selection, usingOwnKeys: true, envPending: false,
+      credentials: [{ id: "anthropicApiKey", label: "Anthropic API key", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", multiline: false, connected: true, last4: "hro1" }],
+    }),
+  });
+  await settle(2);
+
+  const pill = getElement("agentPill");
+  assert.equal(pill.textContent, "Claude Code · claude-sonnet-5 · server keys",
+    "the pill mirrors the selection GET /api/agents returned");
+
+  // It is the same entry point as the gear.
+  pill.dispatch("click");
+  assert.ok(getElement("settingsBackdrop").classList.names.has("open"));
+
+  getElement("agentsCreds").querySelector('[data-cred="anthropicApiKey"]')!.value = "sk-ant-hro1";
+  getElement("settingsSave").dispatch("click");
+  await settle(4);
+  assert.equal(pill.textContent, "Claude Code · claude-sonnet-5 · your keys",
+    "saving a key of your own flips the pill to 'your keys'");
+});
+
+test("the 'Show N more lines' toggle is a text row, so a collapsed bubble ends with the same padding as any other", () => {
+  const css = readFileSync("scripts/assets/app.css", "utf8");
+  // The global reset gives every button a 42px box; inside a bubble that box
+  // would sit below the toggle as dead space a normal message does not have.
+  assert.match(css, /(^|\})button\{[^}]*min-height:42px/m, "the global button box is what the toggle must opt out of");
+  const rule = css.match(/\.msgMore\{([^}]*)\}/);
+  assert.ok(rule, ".msgMore must be styled");
+  assert.match(rule![1]!, /min-height:0/, "the toggle takes no minimum control height");
+  assert.match(rule![1]!, /padding:0(;|$)/, "the toggle adds no vertical padding of its own");
+  // Only the bubble's own padding separates the last row from the bubble edge,
+  // whichever row that is.
+  assert.doesNotMatch(rule![1]!, /margin-bottom/, "nothing extra below the toggle");
 });
 
 test("a model the user has no key for is greyed out and the panel says which key to add", async () => {

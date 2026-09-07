@@ -76,7 +76,17 @@ function renderSettingsControls(){
     else{row.hidden=true;rs.innerHTML='';}
   }
   renderCredentialFields();
+  renderAgentPill();
   updateSettingsStatus();
+}
+// The composer's own entry point to this panel: what runs the next message,
+// and whose keys it runs on. The model's catalog label already reads
+// "Claude Code · claude-sonnet-5"; the ids are the fallback for a bare catalog.
+function renderAgentPill(){
+  const el=$('agentPill');if(!el)return;
+  const m=selectedModelOption();
+  const head=(m&&m.label)||((selectedHarness||'no harness')+' · '+(selectedModel||'no model'));
+  el.textContent=head+' · '+(AGENTS.usingOwnKeys?'your keys':'server keys');
 }
 function renderCredentialFields(){
   const wrap=$('agentsCreds');if(!wrap)return;
@@ -652,7 +662,7 @@ const stopBtn=$('stopBox');
 const diagnosticsBtn=$('downloadDiagnostics');
 const showTracesEl=$('showTraces');
 if(showTracesEl){showTracesEl.checked=false;showTracesEl.addEventListener('change',()=>{showTraces=Boolean(showTracesEl.checked);syncTraceVisibility();});}
-$('settingsOpen')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});$('settingsHarness')?.addEventListener('change',e=>{selectedHarness=e.target.value;const h=H.find(x=>x.name===selectedHarness);const m=(h&&h.models.find(modelUnlocked))||(h&&h.models[0]);if(m){selectedProvider=m.provider;selectedModel=m.model;}selectedReasoning='';renderSettingsControls();});$('settingsModel')?.addEventListener('change',e=>{const [provider,model]=String(e.target.value).split('|');selectedProvider=provider;selectedModel=model;selectedReasoning='';renderSettingsControls();});$('settingsReasoning')?.addEventListener('change',e=>{selectedReasoning=String(e.target.value||'');});
+$('settingsOpen')?.addEventListener('click',openSettings);$('agentPill')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});$('settingsHarness')?.addEventListener('change',e=>{selectedHarness=e.target.value;const h=H.find(x=>x.name===selectedHarness);const m=(h&&h.models.find(modelUnlocked))||(h&&h.models[0]);if(m){selectedProvider=m.provider;selectedModel=m.model;}selectedReasoning='';renderSettingsControls();});$('settingsModel')?.addEventListener('change',e=>{const [provider,model]=String(e.target.value).split('|');selectedProvider=provider;selectedModel=model;selectedReasoning='';renderSettingsControls();});$('settingsReasoning')?.addEventListener('change',e=>{selectedReasoning=String(e.target.value||'');});
 syncTraceVisibility();
 let lastSubmitAt=0;
 // ---- attachments ----------------------------------------------------------

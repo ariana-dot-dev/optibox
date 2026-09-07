@@ -38,6 +38,114 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>
 // Reasoning levels arrive as the wire ids ("low"/"medium"/"high"); the panel
 // shows them the way every other label in it reads.
 function titleCase(s){return String(s).charAt(0).toUpperCase()+String(s).slice(1);}
+// ---- dropdown -------------------------------------------------------------
+// The app's ONE picker. A native <select> is unstylable past its own box (the
+// menu is the operating system's), so every picker is a trigger plus a floating
+// panel drawn in the app's language. State lives on the element, so the single
+// call `dropdown(el, options, value, onChange)` both creates and updates one.
+// An option is {value, label, disabled?, reason?}; the reason is the second
+// line a greyed option carries.
+const DD_CHEVRON='<svg class="ddChevron" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z"/></svg>';
+const DD_ITEM_PX=38;
+let ddOpenEl=null;
+function dropdown(el,options,value,onChange){
+  if(!el)return;
+  // Whatever class the caller styled the host with survives every redraw.
+  el.ddClass=String(el.className||'').split(/\s+/).filter(c=>c&&c!=='dd'&&c!=='open').join(' ');
+  el.dd={options:options||[],value:value,onChange:onChange,open:false,active:-1,up:false};
+  drawDropdown(el);
+}
+function drawDropdown(el){
+  const d=el&&el.dd;if(!d)return;
+  const cur=d.options.find(o=>o.value===d.value)||d.options[0];
+  el.className=('dd'+(d.open?' open':'')+' '+(el.ddClass||'')).trim();
+  el.innerHTML='<button type="button" class="ddTrigger" data-ddtrigger="1" aria-haspopup="listbox" aria-expanded="'+(d.open?'true':'false')+'"><span class="ddValue">'+esc(cur?cur.label:'')+'</span>'+DD_CHEVRON+'</button>'
+    +'<div class="ddMenu'+(d.up?' up':'')+'" role="listbox"'+(d.open?'':' hidden')+'>'
+    +d.options.map(function(o,i){
+      return '<button type="button" class="ddItem'+(o.value===d.value?' on':'')+(i===d.active?' active':'')+'" role="option" data-ddvalue="'+esc(o.value)+'"'
+        +(o.disabled?' disabled aria-disabled="true"':'')+' aria-selected="'+(o.value===d.value?'true':'false')+'">'
+        +'<span class="ddLabel">'+esc(o.label)+'</span>'+(o.reason?'<span class="ddWhy">'+esc(o.reason)+'</span>':'')+'</button>';
+    }).join('')
+    +'</div>';
+  if(!el.querySelectorAll)return;
+  el.querySelectorAll('[data-ddtrigger]').forEach(function(b){
+    b.addEventListener('click',function(e){if(e&&e.stopPropagation)e.stopPropagation();if(d.open)closeDropdown(el,true);else openDropdown(el);});
+    b.addEventListener('keydown',function(e){dropdownKey(el,e);});
+  });
+  el.querySelectorAll('[data-ddvalue]').forEach(function(b){
+    b.addEventListener('click',function(e){if(e&&e.stopPropagation)e.stopPropagation();pickDropdown(el,b.getAttribute('data-ddvalue'));});
+  });
+}
+function ddTrigger(el){return el&&el.querySelector?el.querySelector('[data-ddtrigger="1"]'):undefined;}
+function focusDropdown(el){const t=ddTrigger(el);if(t&&t.focus)t.focus();}
+/** Flip upward only when the menu genuinely does not fit below but does above. */
+function dropdownOpensUp(el){
+  try{
+    const t=ddTrigger(el);
+    if(!t||!t.getBoundingClientRect||typeof window==='undefined')return false;
+    const r=t.getBoundingClientRect(), need=Math.min(240,el.dd.options.length*DD_ITEM_PX+8)+8;
+    return (window.innerHeight-r.bottom)<need&&r.top>need;
+  }catch(_){return false;}
+}
+function openDropdown(el){
+  const d=el&&el.dd;if(!d)return;
+  closeOtherDropdowns(el);
+  d.open=true;
+  d.active=Math.max(0,d.options.findIndex(o=>o.value===d.value));
+  d.up=dropdownOpensUp(el);
+  ddOpenEl=el;drawDropdown(el);focusDropdown(el);
+}
+function closeDropdown(el,refocus){
+  const d=el&&el.dd;if(!d)return;
+  d.open=false;d.active=-1;drawDropdown(el);
+  if(ddOpenEl===el)ddOpenEl=null;
+  if(refocus)focusDropdown(el);
+}
+function closeOtherDropdowns(keep){if(ddOpenEl&&ddOpenEl!==keep)closeDropdown(ddOpenEl,false);}
+function pickDropdown(el,value){
+  const d=el&&el.dd;if(!d)return;
+  const opt=d.options.find(o=>String(o.value)===String(value));
+  if(!opt||opt.disabled)return;
+  d.value=opt.value;d.open=false;d.active=-1;
+  if(ddOpenEl===el)ddOpenEl=null;
+  drawDropdown(el);focusDropdown(el);
+  if(d.onChange)d.onChange(opt.value);
+}
+function ddNextEnabled(d,from,step){
+  const n=d.options.length;if(!n)return -1;
+  let i=from;
+  for(let k=0;k<n;k++){i=(i+step+n)%n;if(!d.options[i].disabled)return i;}
+  return from;
+}
+function dropdownKey(el,e){
+  const d=el&&el.dd;if(!d)return;
+  const key=String((e&&e.key)||''), stop=function(){if(e&&e.preventDefault)e.preventDefault();};
+  if(key==='Escape'){if(d.open){stop();closeDropdown(el,true);}return;}
+  if(key==='ArrowDown'||key==='ArrowUp'){
+    stop();
+    if(!d.open)return void openDropdown(el);
+    d.active=ddNextEnabled(d,d.active,key==='ArrowDown'?1:-1);drawDropdown(el);focusDropdown(el);return;
+  }
+  if(key==='Enter'||key===' '||key==='Spacebar'){
+    stop();
+    if(!d.open)return void openDropdown(el);
+    const opt=d.options[d.active];if(opt)pickDropdown(el,opt.value);return;
+  }
+  // Type-ahead on the first letter, exactly like the native control.
+  if(key.length===1&&key.trim()){
+    const i=d.options.findIndex(o=>!o.disabled&&String(o.label).toLowerCase().indexOf(key.toLowerCase())===0);
+    if(i<0)return;
+    stop();
+    if(d.open){d.active=i;drawDropdown(el);focusDropdown(el);return;}
+    pickDropdown(el,d.options[i].value);
+  }
+}
+// A click anywhere else closes the open menu; the trigger and the items stop
+// their own clicks from reaching here.
+if(typeof document!=='undefined'&&document.addEventListener)document.addEventListener('click',function(){closeOtherDropdowns(null);});
+// fs-panel.js is a module and cannot see this scope, so the component is handed
+// over explicitly. It is the only picker in the app either way.
+if(typeof window!=='undefined')window.optiboxDropdown=dropdown;
 // ---- Agents panel ---------------------------------------------------------
 // The user's own setup — which agent runs their private machine, and the
 // credentials it runs on — lives SERVER-side (GET/POST /api/agents) so it
@@ -88,31 +196,29 @@ function reasoningLevels(){const m=selectedModelOption();return (m&&m.reasoningE
 function renderSettingsControls(){
   const hs=$('settingsHarness'), ms=$('settingsModel');if(!hs||!ms)return;
   // Values stay the ids the routes speak; the text is the CLI's own name.
-  hs.innerHTML=H.map(h=>'<option value="'+esc(h.name)+'">'+esc(h.label||h.name)+'</option>').join('');
-  hs.value=selectedHarness;
+  dropdown(hs,H.map(h=>({value:h.name,label:h.label||h.name})),selectedHarness,function(v){
+    selectedHarness=v;
+    const picked=H.find(x=>x.name===selectedHarness);
+    const m=(picked&&picked.models.find(modelUnlocked))||(picked&&picked.models[0]);
+    if(m){selectedProvider=m.provider;selectedModel=m.model;}
+    selectedReasoning='';renderSettingsControls();
+  });
   const h=H.find(x=>x.name===selectedHarness);
-  // The harness sits in the select next door, so the model names only itself.
-  // A model the user cannot reach is greyed, and carries its own one-line reason.
-  ms.innerHTML=(h?h.models:[]).map(m=>'<option value="'+esc(m.provider+'|'+m.model)+'"'+(modelUnlocked(m)?'':' disabled')+'>'+esc(m.model+(modelUnlocked(m)?'':' · needs '+m.requiredEnv))+'</option>').join('');
-  ms.value=selectedProvider+'|'+selectedModel;
+  // The harness sits in the picker next door, so the model names only itself.
+  // A model the user cannot reach is greyed, with its reason on a second line.
+  dropdown(ms,(h?h.models:[]).map(m=>({value:m.provider+'|'+m.model,label:m.model,disabled:!modelUnlocked(m),reason:modelUnlocked(m)?'':'needs '+m.requiredEnv})),selectedProvider+'|'+selectedModel,function(v){
+    const parts=String(v).split('|');
+    selectedProvider=parts[0];selectedModel=parts[1];selectedReasoning='';renderSettingsControls();
+  });
   const levels=reasoningLevels(), row=$('settingsReasoningRow'), rs=$('settingsReasoning');
   if(row&&rs){
-    if(levels.length){row.hidden=false;rs.innerHTML=['<option value="">Default</option>'].concat(levels.map(l=>'<option value="'+esc(l)+'">'+esc(titleCase(l))+'</option>')).join('');rs.value=levels.indexOf(selectedReasoning)>=0?selectedReasoning:'';}
-    else{row.hidden=true;rs.innerHTML='';}
+    row.hidden=!levels.length;
+    if(levels.length)dropdown(rs,[{value:'',label:'Default'}].concat(levels.map(l=>({value:l,label:titleCase(l)}))),levels.indexOf(selectedReasoning)>=0?selectedReasoning:'',function(v){selectedReasoning=v;renderSettingsControls();});
+    else rs.innerHTML='';
   }
   renderSignin();
   renderCredentialFields();
-  renderAgentPill();
   updateSettingsStatus();
-}
-// The composer's own entry point to this panel: what runs the next message,
-// and whose keys it runs on. The model's catalog label already reads
-// "Claude Code · claude-sonnet-5"; the ids are the fallback for a bare catalog.
-function renderAgentPill(){
-  const el=$('agentPill');if(!el)return;
-  const m=selectedModelOption();
-  const head=(m&&m.label)||((selectedHarness||'no harness')+' · '+(selectedModel||'no model'));
-  el.textContent=head+' · '+runsOn();
 }
 // ---- Sign in: the two subscriptions, connected the way the Box dashboard does
 // it. Claude prints a code the user pastes back; ChatGPT shows a short code the
@@ -235,7 +341,7 @@ function renderCredentialFields(){
     b.addEventListener('click',function(){clearedCreds[b.getAttribute('data-clear')]=true;renderCredentialFields();});
   });
 }
-function openSettings(){if(!$('settingsBackdrop'))return;renderSettingsControls();$('settingsBackdrop').classList.add('open');$('settingsHarness').focus();}
+function openSettings(){if(!$('settingsBackdrop'))return;renderSettingsControls();$('settingsBackdrop').classList.add('open');focusDropdown($('settingsHarness'));}
 function closeSettings(){if($('settingsBackdrop'))$('settingsBackdrop').classList.remove('open');}
 /** Read the panel's key fields: a typed value sets it, Clear sends "". */
 function credentialPatch(){
@@ -783,7 +889,15 @@ const stopBtn=$('stopBox');
 const diagnosticsBtn=$('downloadDiagnostics');
 const showTracesEl=$('showTraces');
 if(showTracesEl){showTracesEl.checked=false;showTracesEl.addEventListener('change',()=>{showTraces=Boolean(showTracesEl.checked);syncTraceVisibility();});}
-$('settingsOpen')?.addEventListener('click',openSettings);$('agentPill')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});$('settingsHarness')?.addEventListener('change',e=>{selectedHarness=e.target.value;const h=H.find(x=>x.name===selectedHarness);const m=(h&&h.models.find(modelUnlocked))||(h&&h.models[0]);if(m){selectedProvider=m.provider;selectedModel=m.model;}selectedReasoning='';renderSettingsControls();});$('settingsModel')?.addEventListener('change',e=>{const [provider,model]=String(e.target.value).split('|');selectedProvider=provider;selectedModel=model;selectedReasoning='';renderSettingsControls();});$('settingsReasoning')?.addEventListener('change',e=>{selectedReasoning=String(e.target.value||'');});
+// ONE entry point to the Agents panel: the sliders button in the prompt box.
+// The pickers report through their own onChange, so nothing listens for
+// 'change' here any more.
+$('agentsOpen')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});
+$('agentsKeysToggle')?.addEventListener('click',function(){
+  const box=$('agentsKeysBox');if(!box)return;
+  const open=box.classList.toggle('open');
+  $('agentsKeysToggle').setAttribute('aria-expanded',open?'true':'false');
+});
 syncTraceVisibility();
 let lastSubmitAt=0;
 // ---- attachments ----------------------------------------------------------

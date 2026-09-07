@@ -57,10 +57,9 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .settingsHead .iconButton{min-height:28px;width:28px;background:none;color:var(--ink3)}.settingsHead .iconButton:hover{color:var(--ink)}
 .agentsSection{display:grid;gap:8px;min-width:0}.agentsSection>h3{margin:0;font-size:12px;font-weight:400;color:var(--ink2)}
 .agentsPicks{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:8px}
-.agentsPicks label{display:grid;gap:4px;min-width:0;font-size:11px;color:var(--ink3)}.agentsPicks label[hidden]{display:none}
-.settingsDialog select,.settingsDialog input{width:100%;min-width:0;border:0;background:var(--fill);color:var(--ink);min-height:38px;padding:0 10px;font:inherit;font-size:13px;border-radius:var(--r-ctl)}
-.settingsDialog select:focus,.settingsDialog input:focus{outline:2px solid var(--line2);outline-offset:-2px}
-.settingsDialog select:disabled,.settingsDialog option:disabled{color:var(--ink3)}
+.agentsPicks .pick{display:grid;gap:4px;min-width:0;font-size:11px;color:var(--ink3)}.agentsPicks .pick[hidden]{display:none}
+.settingsDialog input{width:100%;min-width:0;border:0;background:var(--fill);color:var(--ink);min-height:38px;padding:0 10px;font:inherit;font-size:13px;border-radius:var(--r-ctl)}
+.settingsDialog input:focus{outline:2px solid var(--line2);outline-offset:-2px}
 /* Sign in: two primary buttons, each replaced in place by its own flow. */
 .agentsSignin{display:grid;gap:8px}
 .signBtn{width:100%;min-height:38px;font-size:13px;padding:0 12px;border-radius:var(--r-ctl)}
@@ -77,11 +76,15 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .signRow.done .linkBtn{grid-column:2;grid-row:1/span 2}
 .linkBtn{min-height:0;background:none;border:0;padding:0;color:var(--ink2);font:inherit;font-size:11px;text-decoration:underline;cursor:pointer;justify-self:start}
 .linkBtn:hover{color:var(--ink)}
-/* API keys: folded away, one row each, a masked input or a connected line. */
+/* API keys: folded away, one row each, a masked input or a connected line. The
+   0fr -> 1fr grid row is what makes a disclosure animate without a fixed
+   height; visibility keeps the folded fields out of the tab order. */
 .agentsKeys{background:var(--fill);border-radius:var(--r-obj);padding:0 12px}
-.agentsKeys>summary{list-style:none;cursor:pointer;padding:12px 0;font-size:12px;color:var(--ink2);display:flex;justify-content:space-between}
-.agentsKeys>summary::-webkit-details-marker{display:none}
-.agentsKeys>summary:after{content:"+";color:var(--ink3)}.agentsKeys[open]>summary:after{content:"–"}
+.agentsKeysHead{width:100%;min-height:0;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 0;background:none;border:0;border-radius:0;color:var(--ink2);font:inherit;font-size:12px;text-align:left;cursor:pointer}
+.agentsKeysHead:hover{color:var(--ink)}
+.agentsKeysBody{display:grid;grid-template-rows:0fr;opacity:0;visibility:hidden;transition:grid-template-rows .15s ease,opacity .15s ease,visibility 0s linear .15s}
+.agentsKeysBody>div{overflow:hidden}
+.agentsKeys.open .agentsKeysBody{grid-template-rows:1fr;opacity:1;visibility:visible;transition:grid-template-rows .15s ease,opacity .15s ease,visibility 0s}
 .agentsCreds{display:grid;gap:8px;padding-bottom:12px}
 .credRow{display:grid;grid-template-columns:1fr auto;align-items:center;gap:4px 8px;min-width:0}
 .credName{grid-column:1/-1;font-size:11px;color:var(--ink3)}
@@ -91,6 +94,29 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .settingsActions{display:flex;justify-content:flex-end}
 .settingsActions button{min-height:38px;font-size:13px;padding:0 16px;border-radius:var(--r-ctl);background:var(--fill);color:var(--ink)}.settingsActions button:hover{background:var(--fill2)}
 .dangerText{color:var(--red)}.okText{color:var(--green)}
+
+/* ---- dropdown: the app's ONE picker ---------------------------------------
+   A native <select> cannot be styled past its box (the menu belongs to the OS),
+   so every picker in the app is this instead: a trigger that looks exactly like
+   the dialog's other controls, and a floating panel in the app's own language
+   (shadow because it floats, tint for hover/selected, never a border). The
+   chevron sits inside the trigger's own padding and turns on open. */
+.dd{position:relative;min-width:0}
+.ddTrigger{display:flex;align-items:center;gap:8px;width:100%;min-height:38px;padding:0 10px;background:var(--fill);color:var(--ink);border:0;border-radius:var(--r-ctl);font:inherit;font-size:13px;text-align:left;cursor:pointer;transition:background .15s ease}
+.ddTrigger:hover{background:var(--fill2)}
+.ddTrigger:focus-visible{outline:2px solid var(--line2);outline-offset:-2px}
+.ddValue{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ddChevron{width:16px;height:16px;flex:0 0 auto;color:var(--ink3);transition:transform .15s ease}
+.dd.open .ddChevron,.agentsKeys.open .ddChevron{transform:rotate(180deg)}
+.ddMenu{position:absolute;left:0;top:calc(100% + 4px);z-index:30;width:100%;max-height:240px;overflow:auto;padding:4px;display:grid;gap:2px;align-content:start;background:#fff;border-radius:var(--r-obj);box-shadow:var(--shadow)}
+.ddMenu.up{top:auto;bottom:calc(100% + 4px)}
+.ddMenu[hidden]{display:none}
+.ddItem{display:grid;gap:2px;width:100%;min-height:32px;padding:6px 8px;background:none;color:var(--ink);border:0;border-radius:var(--r-ctl);font:inherit;font-size:13px;text-align:left;cursor:pointer}
+.ddItem:hover,.ddItem.active{background:var(--fill)}
+.ddItem.on{background:var(--fill2)}
+.ddItem:disabled{color:var(--ink3);background:none;cursor:not-allowed}
+.ddLabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ddWhy{font-size:11px;color:var(--ink3)}
 
 /* ---- chat ------------------------------------------------------------------
    Voice hierarchy inside the stream, loudest to quietest:
@@ -185,11 +211,20 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 .receipt{align-self:flex-start;max-width:92%;font-size:13px;color:var(--ink2);margin:0;padding:0}
 
 /* ---- composer -------------------------------------------------------------- */
-.composer{position:relative;display:block;padding:16px;border-top:1px solid var(--line);background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}.composer.attachDrop textarea{background:var(--fill2);outline:2px dashed var(--red);outline-offset:-2px}textarea{width:100%;min-height:58px;max-height:140px;resize:none;border:0;background:var(--fill);color:var(--ink);padding:13px 84px 13px 15px;font:inherit;font-weight:400;outline:none;display:block;border-radius:var(--r-surf)}textarea:focus{background:var(--fill2)}
-#attach{position:absolute;right:51px;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:var(--ink3);border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}#attach:hover{background:var(--fill2);color:var(--ink)}#attach svg{width:16px;height:16px;display:block}
-#mic{position:absolute;right:19px;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:var(--ink3);border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}#mic:hover{background:var(--red);color:#fff}#mic svg{width:16px;height:16px;display:block}
+.composer{position:relative;display:block;padding:16px;border-top:1px solid var(--line);background:rgba(255,255,255,.97);backdrop-filter:blur(12px)}.composer.attachDrop textarea{background:var(--fill2);outline:2px dashed var(--red);outline-offset:-2px}/* The prompt box is two lines tall before you type a word, and reserves a
+   generous bottom band (3x the text's own inset) that the icon row lives in, so
+   text and buttons can never meet. The right inset is 3x the left one; the
+   buttons no longer need a wide right gutter now that they sit in that band. */
+textarea{width:100%;min-height:116px;max-height:240px;resize:none;border:0;background:var(--fill);color:var(--ink);padding:13px 45px 39px 15px;font:inherit;font-weight:400;outline:none;display:block;border-radius:var(--r-surf)}textarea:focus{background:var(--fill2)}
+/* One row of icon buttons in the box's bottom-right: Agents, attach, mic/send.
+   Same size, same quiet ink3, same hover tint; only the accent differs. */
+#agentsOpen,#attach,#mic{position:absolute;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:var(--ink3);border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}
+#agentsOpen svg,#attach svg,#mic svg{width:16px;height:16px;display:block}
+#agentsOpen:hover,#attach:hover{background:var(--fill2);color:var(--ink)}
+#agentsOpen{right:83px}#attach{right:51px}
+#mic{right:19px}#mic:hover{background:var(--red);color:#fff}
 /* When there's text/attachments to send, swap mic->send; else show mic. */
-.composer.hasText #mic,.composer.recording #mic,.composer.recording #attach,.composer.recording #send,.composer.recording textarea,.composer.recording #agentPill{display:none}
+.composer.hasText #mic,.composer.recording #mic,.composer.recording #attach,.composer.recording #send,.composer.recording textarea,.composer.recording #agentsOpen{display:none}
 .composer:not(.hasText) #send{display:none}
 /* Telegram-style recording bar overlaying the input row. */
 .recBar{display:none;position:absolute;left:16px;right:16px;bottom:16px;height:58px;align-items:center;gap:8px;padding:0 8px 0 6px;background:var(--fill);border-radius:var(--r-surf)}
@@ -214,7 +249,6 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 /* The Agents entry point that lives WITH the chat: the gear is a third-page
    control on a phone, so the current setup rides above the textarea, in the
    same quiet grammar as the footer controls. */
-.agentPill{display:inline-flex;align-items:center;max-width:100%;margin:0 0 8px;min-height:26px;padding:0 10px;background:#fff;color:var(--ink2);border:1px solid var(--line);border-radius:var(--r-ctl);font:inherit;font-size:11px;font-weight:400;letter-spacing:.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;transition:border-color .15s ease,color .15s ease}.agentPill:hover{border-color:var(--line2);color:var(--ink)}
 .pendingAttach{margin:0 0 8px}.pendingAttach:empty{display:none}
 .pendingAttach .cardRemove{position:absolute;top:3px;right:3px;width:17px;height:17px;min-height:0;box-sizing:border-box;border-radius:50%;background:rgba(17,17,17,.7);color:#fff;font-size:12px;line-height:1;cursor:pointer;opacity:0;transition:opacity .12s ease;z-index:3;padding:0;display:flex;align-items:center;justify-content:center}
 .pendingAttach .card:hover .cardRemove{opacity:1}.pendingAttach .cardRemove:hover{background:var(--red)}.pendingAttach .cardRemove svg{width:10px;height:10px;display:block}
@@ -292,7 +326,7 @@ body{overflow:hidden;overscroll-behavior:none}
 .empty{font-size:13px}
 .msg .body pre{max-width:100%}
 .composer{padding:12px 12px calc(12px + env(safe-area-inset-bottom))}
-textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px input font stops iOS zoom-on-focus */
+textarea{min-height:104px;font-size:16px;padding:12px 39px 36px 13px}/* 16px input font stops iOS zoom-on-focus */
 /* The desktop #attach/#mic/#send bottom:19px/right:19px offsets were solved for
    the desktop composer's 16px padding and assume NO safe-area inset. Mobile's
    composer padding-bottom adds env(safe-area-inset-bottom) on top of its own
@@ -303,6 +337,7 @@ textarea{min-height:52px;font-size:16px;padding:12px 76px 12px 13px}/* 16px inpu
    GROWS by the same safe-area amount the padding grew by, so the button's
    position relative to the textarea stays constant regardless of the device's
    home-indicator height. */
+#agentsOpen{right:calc(79px + env(safe-area-inset-right));bottom:calc(15px + env(safe-area-inset-bottom))}
 #attach{right:calc(47px + env(safe-area-inset-right));bottom:calc(15px + env(safe-area-inset-bottom))}
 #mic,#send{right:calc(15px + env(safe-area-inset-right));bottom:calc(15px + env(safe-area-inset-bottom))}
 .schematic h2{font-size:18px;margin-bottom:12px}

@@ -152,7 +152,8 @@ function bootClient(opts: {
     "composer", "msg", "send", "stopBox", "showTraces", "chat", "empty",
     "schematic", "routeStatus", "machineState", "totalSeconds", "totalCost", "autoStopTimer", "matrix",
     "settingsBackdrop", "settingsHarness", "settingsModel", "settingsReasoningRow", "settingsReasoning",
-    "agentsSignin", "agentsCreds", "settingsStatus", "settingsSave", "settingsClose", "settingsOpen", "agentPill",
+    "agentsSignin", "agentsCreds", "settingsStatus", "settingsSave", "settingsClose",
+    "agentsOpen", "agentsKeysBox", "agentsKeysToggle",
   ]) getElement(id);
 
   const sendRequests: any[] = [];
@@ -223,6 +224,12 @@ const NOTHING_CONNECTED = [
 ];
 const withConnected = (id: string, extra: Record<string, unknown> = {}) =>
   NOTHING_CONNECTED.map((c) => (c.id === id ? { ...c, connected: true, ...extra } : c));
+
+// The app has one dropdown component; these drive it the way a person does.
+// Every interaction redraws the host, so the trigger is re-read each time.
+const ddTriggerOf = (el: any) => el.querySelector('[data-ddtrigger="1"]')!;
+const ddValueOf = (el: any): string => (String(el.innerHTML).match(/<span class="ddValue">([^<]*)<\/span>/) ?? ["", ""])[1] as string;
+const ddKey = (el: any, key: string) => ddTriggerOf(el).dispatch("keydown", { key });
 
 test("interactive demo client sends exactly one /api/send after page load", async () => {
   let n = 0;
@@ -334,40 +341,129 @@ test("the Agents panel is read top to bottom: your agent, sign in, API keys fold
     at('id="settingsTitle"'),
     at(">Your agent<"), at('id="settingsHarness"'), at('id="settingsModel"'), at('id="settingsReasoning"'),
     at(">Sign in<"), at('id="agentsSignin"'),
-    at('<details class="agentsKeys"'),
+    at('class="agentsKeys"'),
     at('id="settingsStatus"'),
     at('id="settingsSave"'),
   ];
   assert.deepEqual(order, [...order].sort((a, b) => a - b), "markup order IS the reading order");
-  assert.match(html, /<summary>API keys<\/summary>/);
-  assert.doesNotMatch(html, /<details[^>]*\sopen/, "API keys start folded");
+  assert.match(html, /<span>API keys<\/span><svg class="ddChevron"/, "the disclosure carries the dropdown's own chevron");
+  assert.doesNotMatch(html, /class="agentsKeys open"/, "API keys start folded");
+  assert.doesNotMatch(html, /<select/, "not one native select is left in the page");
   assert.doesNotMatch(html, /settingsNote/, "the old explanatory note is gone");
   assert.doesNotMatch(html, /settingsGrid/, "the old two-column grid is gone");
 });
 
-test("the harness and thinking selects read as display names, and keep the ids as their values", async () => {
-  const { getElement } = bootClient({
-    now: 10_000_000,
-    uuid: () => "turn-labels",
-    catalog: {
-      ...DEFAULT_CATALOG,
-      harnesses: [
-        { name: "claude-code", label: "Claude Code", models: [{ provider: "anthropic", model: "claude-sonnet-5", keyAvailable: true, requiredEnv: "ANTHROPIC_API_KEY", reasoningEffort: ["low", "medium", "high"] }] },
-        { name: "prime-agent", label: "Prime Agent", models: [{ provider: "openrouter", model: "glm-5", keyAvailable: true, requiredEnv: "OPENROUTER_API_KEY" }] },
-      ],
-    },
-  });
+test("one entry point: the Agents button lives in the prompt box, immediately left of attach", () => {
+  const html = readFileSync("scripts/assets/app.html", "utf8");
+  const css = readFileSync("scripts/assets/app.css", "utf8");
+  assert.ok(html.indexOf('id="msg"') < html.indexOf('id="agentsOpen"'), "it is inside the composer");
+  assert.ok(html.indexOf('id="agentsOpen"') < html.indexOf('id="attach"'), "and comes just before the paperclip");
+  assert.match(html, /id="agentsOpen"[^>]*aria-label="Agents"/);
+  assert.doesNotMatch(html, /agentPill/, "the pill above the box is gone");
+  assert.doesNotMatch(html, /settingsOpen/, "and so is the gear in the footer");
+  // Size, colour and hover come from ONE declaration shared with its neighbours.
+  assert.match(css, /#agentsOpen,#attach,#mic\{[^}]*width:26px;height:26px[^}]*color:var\(--ink3\)/);
+  assert.match(css, /#agentsOpen\{right:83px\}#attach\{right:51px\}/, "32px apart, the same step as attach to mic");
+  assert.match(css, /#agentsOpen\{right:calc\(79px \+ env\(safe-area-inset-right\)\)/, "same step again on the mobile safe-area offset");
+});
+
+test("the prompt box is twice as tall and reserves 3x insets on its right and bottom", () => {
+  const css = readFileSync("scripts/assets/app.css", "utf8");
+  const desktop = css.match(/(?:^|[\n},])textarea\{([^}]*)\}/)![1]!;
+  assert.match(desktop, /min-height:116px/, "twice the old 58px");
+  assert.match(desktop, /padding:13px 45px 39px 15px/, "right 3x the left inset, bottom 3x the top one");
+  const mobile = css.slice(css.indexOf("@media(max-width:900px)")).match(/textarea\{([^}]*)\}/)![1]!;
+  assert.match(mobile, /min-height:104px/, "twice the old 52px");
+  assert.match(mobile, /padding:12px 39px 36px 13px/);
+  // The icon row sits 3px above the box's bottom edge and is 26px tall, so the
+  // 39px bottom band clears it: text and buttons can never overlap.
+  assert.match(css, /#agentsOpen,#attach,#mic\{position:absolute;bottom:19px/);
+});
+
+const TWO_HARNESSES = {
+  ...DEFAULT_CATALOG,
+  harnesses: [
+    { name: "claude-code", label: "Claude Code", models: [{ provider: "anthropic", model: "claude-sonnet-5", keyAvailable: true, requiredEnv: "ANTHROPIC_API_KEY", reasoningEffort: ["low", "medium", "high"] }] },
+    { name: "prime-agent", label: "Prime Agent", models: [{ provider: "openrouter", model: "glm-5", keyAvailable: true, requiredEnv: "OPENROUTER_API_KEY" }] },
+  ],
+};
+
+test("the pickers read as display names, and keep the ids as their values", async () => {
+  const { getElement } = bootClient({ now: 10_000_000, uuid: () => "turn-labels", catalog: TWO_HARNESSES });
   await settle(2);
 
   const harness = getElement("settingsHarness").innerHTML;
-  assert.match(harness, /<option value="claude-code">Claude Code<\/option>/, "the CLI's own name, not its id");
-  assert.match(harness, /<option value="prime-agent">Prime Agent<\/option>/);
+  assert.match(harness, /data-ddvalue="claude-code"[^>]*><span class="ddLabel">Claude Code<\/span>/, "the CLI's own name, not its id");
+  assert.match(harness, /data-ddvalue="prime-agent"[^>]*><span class="ddLabel">Prime Agent<\/span>/);
   const thinking = getElement("settingsReasoning").innerHTML;
-  assert.match(thinking, /<option value="">Default<\/option>/);
-  assert.match(thinking, /<option value="low">Low<\/option>/);
-  assert.match(thinking, /<option value="medium">Medium<\/option>/);
-  assert.match(thinking, /<option value="high">High<\/option>/);
+  assert.match(thinking, /data-ddvalue=""[^>]*><span class="ddLabel">Default<\/span>/);
+  assert.match(thinking, /data-ddvalue="low"[^>]*><span class="ddLabel">Low<\/span>/);
+  assert.match(thinking, /data-ddvalue="medium"[^>]*><span class="ddLabel">Medium<\/span>/);
+  assert.match(thinking, /data-ddvalue="high"[^>]*><span class="ddLabel">High<\/span>/);
   assert.equal(getElement("settingsReasoningRow").hidden, false, "the level picker only shows when the model takes levels");
+});
+
+test("the dropdown is the app's own: a trigger with a chevron, a menu that opens, picks and closes", async () => {
+  const { getElement } = bootClient({ now: 11_000_000, uuid: () => "turn-dd", catalog: TWO_HARNESSES });
+  await settle(2);
+
+  const harness = getElement("settingsHarness");
+  assert.match(harness.innerHTML, /<button type="button" class="ddTrigger"/);
+  assert.equal(ddValueOf(harness), "Claude Code", "the trigger shows the current choice");
+  assert.match(harness.innerHTML, /<svg class="ddChevron"/, "with the chevron inside the trigger, not glued to a border");
+  assert.match(harness.innerHTML, /<div class="ddMenu" role="listbox" hidden>/, "the menu starts closed");
+
+  ddTriggerOf(harness).dispatch("click");
+  assert.equal(harness.className, "dd open", "open tints the host, which is what turns the chevron");
+  assert.doesNotMatch(harness.innerHTML, /role="listbox" hidden/);
+
+  harness.querySelector('[data-ddvalue="prime-agent"]')!.dispatch("click");
+  assert.equal(ddValueOf(harness), "Prime Agent", "picking sets the value");
+  assert.equal(harness.className, "dd", "and closes the menu");
+  assert.equal(ddValueOf(getElement("settingsModel")), "glm-5", "the model picker follows the harness");
+  assert.equal(getElement("settingsReasoningRow").hidden, true, "and the level picker hides when the model takes none");
+});
+
+test("the dropdown works from the keyboard: arrows, Enter, Escape, type-ahead", async () => {
+  const { getElement } = bootClient({ now: 12_000_000, uuid: () => "turn-dd-keys", catalog: TWO_HARNESSES });
+  await settle(2);
+
+  const harness = getElement("settingsHarness");
+  ddKey(harness, "ArrowDown");
+  assert.equal(harness.className, "dd open", "an arrow opens a closed menu");
+  ddKey(harness, "Escape");
+  assert.equal(harness.className, "dd", "Escape closes it and changes nothing");
+  assert.equal(ddValueOf(harness), "Claude Code");
+
+  ddKey(harness, "ArrowDown");
+  ddKey(harness, "ArrowDown");
+  ddKey(harness, "Enter");
+  assert.equal(ddValueOf(harness), "Prime Agent", "arrow to the next item, Enter takes it");
+  assert.equal(harness.className, "dd");
+
+  ddKey(harness, "c");
+  assert.equal(ddValueOf(harness), "Claude Code", "type-ahead on the first letter, exactly like the native control");
+});
+
+test("the API keys disclosure is the same chevron, and the section animates open", async () => {
+  const { getElement } = bootClient({ now: 13_000_000, uuid: () => "turn-disclosure" });
+  await settle(2);
+
+  const box = getElement("agentsKeysBox"), toggle = getElement("agentsKeysToggle");
+  assert.ok(!box.classList.names.has("open"), "folded by default");
+  toggle.dispatch("click");
+  assert.ok(box.classList.names.has("open"));
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  toggle.dispatch("click");
+  assert.ok(!box.classList.names.has("open"));
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+
+  const css = readFileSync("scripts/assets/app.css", "utf8");
+  // 0fr -> 1fr is what lets a disclosure animate without hard-coding a height.
+  assert.match(css, /\.agentsKeysBody\{[^}]*grid-template-rows:0fr[^}]*opacity:0[^}]*transition:grid-template-rows \.15s ease,opacity \.15s ease/);
+  assert.match(css, /\.agentsKeys\.open \.agentsKeysBody\{[^}]*grid-template-rows:1fr/);
+  assert.match(css, /\.ddChevron\{[^}]*width:16px;height:16px[^}]*transition:transform \.15s ease\}/, "one chevron, 16px, animated");
+  assert.match(css, /\.dd\.open \.ddChevron,\.agentsKeys\.open \.ddChevron\{transform:rotate\(180deg\)\}/, "and both turn the same way");
 });
 
 test("Connect Claude subscription: the approval URL, then the pasted code, then the connected state", async () => {
@@ -403,7 +499,6 @@ test("Connect Claude subscription: the approval URL, then the pasted code, then 
   assert.match(signin.innerHTML, /data-disconnect="claude"/, "a connected subscription offers Disconnect");
   assert.ok(!signin.innerHTML.includes('data-connect="claude"'), "and no longer offers Connect");
   assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applied now");
-  assert.equal(getElement("agentPill").textContent, "claude · claude-sonnet · your subscription");
 });
 
 test("Connect ChatGPT subscription: a user code to type, polled until the box has it", async () => {
@@ -501,14 +596,14 @@ test("API keys hold only the typed credentials, masked, and Save posts new value
   assert.ok(!creds.innerHTML.includes('data-cred="openaiApiKey"'), "the typed secret leaves the form once it is stored");
 });
 
-test("the composer pill names the running agent and whose credentials it runs on, and opens the panel", async () => {
+test("the Agents button is the way in, and the status line carries the state the pill used to", async () => {
   const catalog = {
     ...DEFAULT_CATALOG,
     harnesses: [{ name: "claude-code", label: "Claude Code", models: [{ provider: "anthropic", model: "claude-sonnet-5", label: "Claude Code · claude-sonnet-5", keyAvailable: true, requiredEnv: "ANTHROPIC_API_KEY" }] }],
   };
   const { getElement } = bootClient({
     now: 6_000_000,
-    uuid: () => "turn-pill",
+    uuid: () => "turn-entry",
     catalog,
     agents: {
       ok: true,
@@ -522,13 +617,15 @@ test("the composer pill names the running agent and whose credentials it runs on
   });
   await settle(2);
 
-  const pill = getElement("agentPill");
-  assert.equal(pill.textContent, "Claude Code · claude-sonnet-5 · the app's keys",
-    "the pill mirrors the selection GET /api/agents returned");
+  assert.ok(!getElement("settingsBackdrop").classList.names.has("open"), "nothing is blocking, so the panel stays shut");
+  getElement("agentsOpen").dispatch("click");
+  assert.ok(getElement("settingsBackdrop").classList.names.has("open"), "the button in the prompt box opens it");
 
-  // It is the same entry point as the gear.
-  pill.dispatch("click");
-  assert.ok(getElement("settingsBackdrop").classList.names.has("open"));
+  // What the pill used to say now lives in the panel: the two pickers name the
+  // agent, the one status line names whose credentials it runs on.
+  assert.equal(ddValueOf(getElement("settingsHarness")), "Claude Code");
+  assert.equal(ddValueOf(getElement("settingsModel")), "claude-sonnet-5");
+  assert.equal(getElement("settingsStatus").textContent, "Runs on the app's keys · applied now");
 
   const signin = getElement("agentsSignin");
   signin.querySelector('[data-connect="claude"]')!.dispatch("click");
@@ -536,8 +633,8 @@ test("the composer pill names the running agent and whose credentials it runs on
   signin.querySelector('[data-code="claude"]')!.value = "pasted";
   signin.querySelector('[data-submit="claude"]')!.dispatch("click");
   await settle(4);
-  assert.equal(pill.textContent, "Claude Code · claude-sonnet-5 · your subscription",
-    "connecting a subscription flips the pill to it");
+  assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applied now",
+    "connecting a subscription moves the same line");
 });
 
 test("every message bubble is inset by the same amount on all four sides, collapsed or not", () => {
@@ -567,8 +664,9 @@ test("a model the user has no key for is greyed out and the one status line says
   });
   await settle(2);
 
-  assert.match(getElement("settingsModel").innerHTML, /disabled/, "a model without a key cannot be picked");
-  assert.match(getElement("settingsModel").innerHTML, /gpt-5 · needs OPENAI_API_KEY/, "greyed, with its one-line reason");
+  const model = getElement("settingsModel").innerHTML;
+  assert.match(model, /data-ddvalue="openai\|gpt-5" disabled aria-disabled="true"/, "a model without a key cannot be picked");
+  assert.match(model, /<span class="ddLabel">gpt-5<\/span><span class="ddWhy">needs OPENAI_API_KEY<\/span>/, "greyed, with its reason on a second line");
   assert.equal(getElement("settingsStatus").textContent, "Add your OPENAI_API_KEY below to use Codex · GPT-5.");
   assert.ok(getElement("settingsBackdrop").classList.names.has("open"), "the panel opens itself when nothing can run");
 });

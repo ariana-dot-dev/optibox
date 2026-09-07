@@ -5,6 +5,18 @@
 const $ = (id) => document.getElementById(id);
 const panel = $("fsPanel");
 
+/**
+ * Sheet / table picker. The app has exactly ONE dropdown, defined in app.js
+ * (a classic script, so it runs before this module and hands the component over
+ * on window); a native <select> would be the only OS-styled control left.
+ */
+function picker(values, current, onPick) {
+  const el = document.createElement("div");
+  el.className = "dd fsSheetPick";
+  window.optiboxDropdown(el, values.map((v) => ({ value: v, label: v })), current, onPick);
+  return el;
+}
+
 let FileTree = null;
 let tree = null;
 let serverPaths = [];    // last server-confirmed tree paths (unfiltered)
@@ -625,11 +637,7 @@ async function showSheet(path, name, bytes, canSave) {
   const renderSheet = () => {
     body.innerHTML = "";
     if (wb.SheetNames.length > 1) {
-      const sel = document.createElement("select");
-      sel.className = "fsSheetPick";
-      for (const s of wb.SheetNames) { const o = document.createElement("option"); o.value = s; o.textContent = s; if (s === sheetName) o.selected = true; sel.appendChild(o); }
-      sel.addEventListener("change", () => { sheetName = sel.value; renderSheet(); });
-      body.appendChild(sel);
+      body.appendChild(picker(wb.SheetNames, sheetName, (s) => { sheetName = s; renderSheet(); }));
     }
     tableEditor(body, getRows(sheetName), null, canSave);
   };
@@ -669,11 +677,7 @@ async function showSqlite(path, name, bytes, canSave) {
   const render = () => {
     body.innerHTML = "";
     if (tables.length > 1) {
-      const sel = document.createElement("select");
-      sel.className = "fsSheetPick";
-      for (const t of tables) { const o = document.createElement("option"); o.value = t; o.textContent = t; if (t === table) o.selected = true; sel.appendChild(o); }
-      sel.addEventListener("change", () => { table = sel.value; render(); });
-      body.appendChild(sel);
+      body.appendChild(picker(tables, table, (t) => { table = t; render(); }));
     }
     const q = db.exec(`SELECT rowid AS __rid, * FROM "${table.replace(/"/g, '""')}" LIMIT 5000`)[0];
     if (!q) { body.appendChild(bigNotice("Table is empty.", null)); return; }

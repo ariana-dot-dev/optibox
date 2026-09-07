@@ -27,8 +27,8 @@
   <section class="chat" id="chat" aria-live="polite"><div class="empty" id="empty">Send a message to start the demo.</div></section>
   <form class="composer" id="composer">
     <div class="pendingAttach" id="pendingAttach"></div>
-    <button class="agentPill" id="agentPill" type="button" aria-label="Agents setup" title="Change the harness, the model and your own keys">…</button>
     <textarea id="msg" placeholder="Message…" aria-label="Message"></textarea>
+    <button id="agentsOpen" type="button" aria-label="Agents" title="Agents: harness, model, credentials"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M40,88H216a8,8,0,0,0,0-16H40a8,8,0,0,0,0,16Zm176,80H40a8,8,0,0,0,0,16H216a8,8,0,0,0,0-16Z"/><circle cx="96" cy="80" r="22"/><circle cx="168" cy="176" r="22"/></svg></button>
     <button id="attach" type="button" aria-label="Attach files" title="Attach files"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M209.66,122.34a8,8,0,0,1,0,11.32l-82.05,82a56,56,0,0,1-79.2-79.21L147.67,35.73a40,40,0,1,1,56.61,56.55L105,193A24,24,0,1,1,71,159L154.3,74.38A8,8,0,1,1,165.7,85.6L82.39,170.31a8,8,0,1,0,11.27,11.36L192.93,81A24,24,0,1,0,159,47L59.76,147.68a40,40,0,1,0,56.53,56.62l82.06-82A8,8,0,0,1,209.66,122.34Z"/></svg></button>
     <input id="fileInput" type="file" multiple hidden aria-hidden="true"/>
     <button id="mic" type="button" aria-label="Record voice message" title="Record voice message"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M80,128V64a48,48,0,0,1,96,0v64a48,48,0,0,1-96,0Zm128,0a8,8,0,0,0-16,0,64,64,0,0,1-128,0,8,8,0,0,0-16,0,80.11,80.11,0,0,0,72,79.6V240a8,8,0,0,0,16,0V207.6A80.11,80.11,0,0,0,208,128Z"/></svg></button>
@@ -48,7 +48,6 @@
     <button id="stopBox" type="button">Pause Box now</button>
     <button id="downloadDiagnostics" type="button">Download diagnostics</button>
     <label class="traceToggle"><input id="showTraces" type="checkbox"/> Show traces</label>
-    <button id="settingsOpen" class="iconButton" type="button" aria-label="Settings" title="Settings"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M237.94,107.21a8,8,0,0,0-3.89-5.4l-29.83-17-.12-33.62a8,8,0,0,0-2.83-6.08,111.91,111.91,0,0,0-36.72-20.67,8,8,0,0,0-6.46.59L128,41.85,97.88,25a8,8,0,0,0-6.47-.6A111.92,111.92,0,0,0,54.73,45.15a8,8,0,0,0-2.83,6.07l-.15,33.65-29.83,17a8,8,0,0,0-3.89,5.4,106.47,106.47,0,0,0,0,41.56,8,8,0,0,0,3.89,5.4l29.83,17,.12,33.63a8,8,0,0,0,2.83,6.08,111.91,111.91,0,0,0,36.72,20.67,8,8,0,0,0,6.46-.59L128,214.15,158.12,231a7.91,7.91,0,0,0,3.9,1,8.09,8.09,0,0,0,2.57-.42,112.1,112.1,0,0,0,36.68-20.73,8,8,0,0,0,2.83-6.07l.15-33.65,29.83-17a8,8,0,0,0,3.89-5.4A106.47,106.47,0,0,0,237.94,107.21ZM128,168a40,40,0,1,1,40-40A40,40,0,0,1,128,168Z"/></svg></button>
   </footer>
 </main>
 <aside class="schematic" id="schematic" data-route="idle" aria-label="backend flow diagram">
@@ -73,19 +72,19 @@
     <section class="agentsSection" aria-labelledby="agentsPickHead">
       <h3 id="agentsPickHead">Your agent</h3>
       <div class="agentsPicks">
-        <label>Harness<select id="settingsHarness"></select></label>
-        <label>Model<select id="settingsModel"></select></label>
-        <label id="settingsReasoningRow" hidden>Thinking<select id="settingsReasoning"></select></label>
+        <div class="pick"><span>Harness</span><div class="dd" id="settingsHarness"></div></div>
+        <div class="pick"><span>Model</span><div class="dd" id="settingsModel"></div></div>
+        <div class="pick" id="settingsReasoningRow" hidden><span>Thinking</span><div class="dd" id="settingsReasoning"></div></div>
       </div>
     </section>
     <section class="agentsSection" aria-labelledby="agentsSigninHead">
       <h3 id="agentsSigninHead">Sign in</h3>
       <div class="agentsSignin" id="agentsSignin"></div>
     </section>
-    <details class="agentsKeys" id="agentsKeysBox">
-      <summary>API keys</summary>
-      <div class="agentsCreds" id="agentsCreds"></div>
-    </details>
+    <section class="agentsKeys" id="agentsKeysBox">
+      <button type="button" class="agentsKeysHead" id="agentsKeysToggle" aria-expanded="false" aria-controls="agentsKeysBody"><span>API keys</span><svg class="ddChevron" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z"/></svg></button>
+      <div class="agentsKeysBody" id="agentsKeysBody"><div><div class="agentsCreds" id="agentsCreds"></div></div></div>
+    </section>
     <p class="settingsStatus" id="settingsStatus"></p>
     <div class="settingsActions"><button id="settingsSave" type="button">Save</button></div>
   </section>

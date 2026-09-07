@@ -45,6 +45,14 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>
 const SETTINGS_KEY='optibox.demo.settings.v1';
 let AGENTS={selection:{},credentials:[],usingOwnKeys:false,envPending:false};
 let selectedReasoning='';
+// The two subscriptions, in the order the panel offers them.
+const SUBSCRIPTIONS=[{id:'claude',label:'Claude subscription'},{id:'codex',label:'ChatGPT subscription'}];
+// A sign-in in progress, per provider: {sessionId,url,userCode,interval,phase}.
+// phase: 'starting' | 'code' (Claude waits for a paste) | 'polling' (ChatGPT
+// waits for the user to finish in their browser) | 'connecting'.
+let OAUTH={claude:null,codex:null};
+// Keys the user pressed Clear on: sent as "" on the next Save.
+let clearedCreds={};
 function readSettings(){try{return JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}')||{};}catch{return {};}}
 function writeSettings(next){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(next));}catch(_){}}
 function rememberSelection(){writeSettings({harness:selectedHarness,provider:selectedProvider,model:selectedModel,reasoningEffort:selectedReasoning});}
@@ -54,27 +62,41 @@ function selectedModelOption(){const h=H.find(x=>x.name===selectedHarness);retur
 // (their own credentials first, the preview's as the fallback) — the page just
 // renders that verdict, so the two can never disagree.
 function modelUnlocked(m){return Boolean(m&&m.keyAvailable);}
+// Credentials arrive grouped by the server; the fallback keeps an older payload
+// (subscriptions carry an oauth provider, everything else is a typed key) sane.
+function credGroup(c){return (c&&c.group)||(c&&c.oauth?'subscription':'key');}
+function credsIn(group){return (AGENTS.credentials||[]).filter(c=>credGroup(c)===group);}
+function subCredential(provider){return (AGENTS.credentials||[]).find(c=>c.oauth===provider);}
+/** Whose credentials the next turn runs on. The panel and the pill say the same. */
+function runsOn(){
+  if(credsIn('subscription').some(c=>c.connected))return 'your subscription';
+  if(credsIn('key').some(c=>c.connected))return 'your keys';
+  return "the app's keys";
+}
 function currentSettingsStatus(){
   const model=selectedModelOption();
   if(!boxAccountReady())return {ok:false,msg:'This preview has no Box account configured.'};
-  if(model&&!modelUnlocked(model))return {ok:false,msg:'Add your '+(model.requiredEnv||'provider key')+' in Agents to use '+(model.label||model.model)+'.'};
-  if(AGENTS.envPending)return {ok:true,msg:'New credentials saved — they apply when your machine next starts.'};
-  return {ok:true,msg:AGENTS.usingOwnKeys?'Running on your own credentials.':'Running on this preview\'s shared keys.'};
+  if(model&&!modelUnlocked(model))return {ok:false,msg:'Add your '+(model.requiredEnv||'provider key')+' below to use '+(model.label||model.model)+'.'};
+  return {ok:true,msg:'Runs on '+runsOn()+' · '+(AGENTS.envPending?'applies at next start':'applied now')};
 }
-function updateSettingsStatus(msg){const st=currentSettingsStatus();const el=$('settingsStatus');if(el){el.className='settingsStatus '+(st.ok?'okText':'dangerText');el.textContent=msg||st.msg;}if(!st.ok&&!msg)setState('Agents setup required · '+st.msg);}
+// The status line is quiet by default; it only turns red when it is blocking.
+function updateSettingsStatus(msg){const st=currentSettingsStatus();const el=$('settingsStatus');if(el){el.className='settingsStatus'+(st.ok?'':' dangerText');el.textContent=msg||st.msg;}if(!st.ok&&!msg)setState('Agents setup required · '+st.msg);}
 function reasoningLevels(){const m=selectedModelOption();return (m&&m.reasoningEffort)||[];}
 function renderSettingsControls(){
   const hs=$('settingsHarness'), ms=$('settingsModel');if(!hs||!ms)return;
   hs.innerHTML=H.map(h=>'<option value="'+esc(h.name)+'">'+esc(h.name)+'</option>').join('');
   hs.value=selectedHarness;
   const h=H.find(x=>x.name===selectedHarness);
-  ms.innerHTML=(h?h.models:[]).map(m=>'<option value="'+esc(m.provider+'|'+m.model)+'"'+(modelUnlocked(m)?'':' disabled')+'>'+esc((m.label||m.model)+' · '+(modelUnlocked(m)?'ready':'needs '+m.requiredEnv))+'</option>').join('');
+  // The harness sits in the select next door, so the model names only itself.
+  // A model the user cannot reach is greyed, and carries its own one-line reason.
+  ms.innerHTML=(h?h.models:[]).map(m=>'<option value="'+esc(m.provider+'|'+m.model)+'"'+(modelUnlocked(m)?'':' disabled')+'>'+esc(m.model+(modelUnlocked(m)?'':' · needs '+m.requiredEnv))+'</option>').join('');
   ms.value=selectedProvider+'|'+selectedModel;
   const levels=reasoningLevels(), row=$('settingsReasoningRow'), rs=$('settingsReasoning');
   if(row&&rs){
     if(levels.length){row.hidden=false;rs.innerHTML=['<option value="">default</option>'].concat(levels.map(l=>'<option value="'+esc(l)+'">'+esc(l)+'</option>')).join('');rs.value=levels.indexOf(selectedReasoning)>=0?selectedReasoning:'';}
     else{row.hidden=true;rs.innerHTML='';}
   }
+  renderSignin();
   renderCredentialFields();
   renderAgentPill();
   updateSettingsStatus();
@@ -86,45 +108,139 @@ function renderAgentPill(){
   const el=$('agentPill');if(!el)return;
   const m=selectedModelOption();
   const head=(m&&m.label)||((selectedHarness||'no harness')+' · '+(selectedModel||'no model'));
-  el.textContent=head+' · '+(AGENTS.usingOwnKeys?'your keys':'server keys');
+  el.textContent=head+' · '+runsOn();
 }
+// ---- Sign in: the two subscriptions, connected the way the Box dashboard does
+// it. Claude prints a code the user pastes back; ChatGPT shows a short code the
+// user types in their browser while we poll. Both apply to the user's own box
+// the moment they land, through the same route a typed key takes.
+function renderSignin(){
+  const wrap=$('agentsSignin');if(!wrap)return;
+  wrap.innerHTML=SUBSCRIPTIONS.map(function(p){
+    const cred=subCredential(p.id)||{}, flow=OAUTH[p.id];
+    if(cred.connected){
+      return '<div class="signRow done" data-sub="'+esc(p.id)+'">'
+        +'<span class="signName">'+esc(p.label)+'</span>'
+        +'<span class="signHint" data-detail="'+esc(p.id)+'">'+esc(cred.detail||'connected')+'</span>'
+        +'<button type="button" class="linkBtn" data-disconnect="'+esc(p.id)+'">Disconnect</button></div>';
+    }
+    if(!flow)return '<button type="button" class="signBtn" data-connect="'+esc(p.id)+'">Connect '+esc(p.label)+'</button>';
+    if(flow.phase==='starting')return '<div class="signRow" data-sub="'+esc(p.id)+'"><span class="signName">'+esc(p.label)+'</span><span class="signHint">opening the sign-in…</span></div>';
+    // The real authorize URL is 400 characters of PKCE; the link carries it,
+    // the panel shows the host the user is about to land on.
+    const host=String(flow.url||'').replace(/^https?:\/\//,'').split('/')[0];
+    const head='<div class="signRow open" data-sub="'+esc(p.id)+'"><span class="signName">'+esc(p.label)+'</span>'
+      +'<a class="signLink" data-url="'+esc(p.id)+'" href="'+esc(flow.url||'')+'" target="_blank" rel="noopener noreferrer">Open '+esc(host)+'</a>';
+    if(p.id==='claude'){
+      return head
+        +'<div class="signCode"><input data-code="claude" autocomplete="off" placeholder="Paste the code"/>'
+        +'<button type="button" data-submit="claude"'+(flow.phase==='connecting'?' disabled':'')+'>'+(flow.phase==='connecting'?'Connecting…':'Connect')+'</button></div>'
+        +'<span class="signHint">Approve on that page, then paste the code it shows.</span>'
+        +'<button type="button" class="linkBtn" data-cancel="claude">Cancel</button></div>';
+    }
+    return head
+      +'<p class="signUserCode" data-usercode="codex">'+esc(flow.userCode||'')+'</p>'
+      +'<span class="signHint">Type that code on the page. This finishes on its own.</span>'
+      +'<button type="button" class="linkBtn" data-cancel="codex">Cancel</button></div>';
+  }).join('');
+  if(!wrap.querySelectorAll)return;
+  wrap.querySelectorAll('[data-connect]').forEach(b=>b.addEventListener('click',()=>startSignin(b.getAttribute('data-connect'))));
+  wrap.querySelectorAll('[data-submit]').forEach(b=>b.addEventListener('click',()=>submitSigninCode(b.getAttribute('data-submit'))));
+  wrap.querySelectorAll('[data-code]').forEach(el=>el.addEventListener('keydown',e=>{if(e.key==='Enter'){if(e.preventDefault)e.preventDefault();submitSigninCode(el.getAttribute('data-code'));}}));
+  wrap.querySelectorAll('[data-cancel]').forEach(b=>b.addEventListener('click',()=>{OAUTH[b.getAttribute('data-cancel')]=null;renderSignin();}));
+  wrap.querySelectorAll('[data-disconnect]').forEach(b=>b.addEventListener('click',()=>disconnectSignin(b.getAttribute('data-disconnect'))));
+}
+function adoptAgents(r){AGENTS={selection:r.selection||{},credentials:r.credentials||[],usingOwnKeys:Boolean(r.usingOwnKeys),envPending:Boolean(r.envPending)};}
+function errText(e){return String((e&&e.message)||e);}
+function openExternal(url){try{if(typeof window!=='undefined'&&window.open)window.open(url,'_blank','noopener');}catch(_){}}
+async function postJson(path,body){
+  return (await (await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})).json());
+}
+async function startSignin(provider){
+  OAUTH[provider]={phase:'starting'};renderSignin();
+  try{
+    const r=await postJson('/api/agents/oauth/start',{userId:selectedUser,conversationId:selectedConversation,provider});
+    if(!r||r.ok!==true)throw new Error((r&&r.message)||'could not start the sign-in');
+    OAUTH[provider]={sessionId:r.sessionId,url:r.url||'',userCode:r.userCode||'',
+      interval:typeof r.interval==='number'?r.interval:5,phase:provider==='claude'?'code':'polling'};
+    renderSignin();
+    openExternal(r.url);
+    if(provider==='codex')pollSignin(provider);
+  }catch(e){OAUTH[provider]=null;renderSignin();updateSettingsStatus('Could not start the sign-in: '+errText(e));}
+}
+/** Both flows land here once the provider hands back tokens. */
+function signinConnected(provider,r){
+  OAUTH[provider]=null;
+  adoptAgents(r);
+  // No second sentence: the one status line already reads "Runs on your
+  // subscription · applied now" (or "· applies at next start").
+  return refreshCatalog().then(function(){renderSettingsControls();updateSettingsStatus();});
+}
+async function submitSigninCode(provider){
+  const flow=OAUTH[provider], wrap=$('agentsSignin');
+  if(!flow||!flow.sessionId)return;
+  const input=wrap&&wrap.querySelector&&wrap.querySelector('[data-code="'+provider+'"]');
+  const code=((input&&input.value)||'').trim();
+  if(!code)return void updateSettingsStatus('Paste the code that page showed you.');
+  flow.phase='connecting';renderSignin();
+  try{
+    const r=await postJson('/api/agents/oauth/complete',{userId:selectedUser,conversationId:selectedConversation,sessionId:flow.sessionId,code});
+    if(!r||r.ok!==true)throw new Error((r&&r.message)||'the sign-in failed');
+    if(r.status!=='connected'){flow.phase='code';renderSignin();return void updateSettingsStatus('That code was not accepted. Paste the newest one.');}
+    await signinConnected(provider,r);
+  }catch(e){if(OAUTH[provider])OAUTH[provider].phase='code';renderSignin();updateSettingsStatus('Could not connect: '+errText(e));}
+}
+/** ChatGPT: ask the server on the provider's own cadence until it is done. */
+function pollSignin(provider){
+  const flow=OAUTH[provider];
+  if(!flow||flow.phase!=='polling')return;
+  const sessionId=flow.sessionId;
+  setTimeout(async function(){
+    const cur=OAUTH[provider];
+    if(!cur||cur.sessionId!==sessionId||cur.phase!=='polling')return;
+    try{
+      const r=await(await fetch('/api/agents/oauth/status?'+new URLSearchParams({userId:selectedUser,conversationId:selectedConversation,sessionId}))).json();
+      if(!r||r.ok!==true)throw new Error((r&&r.message)||'the sign-in failed');
+      if(r.status==='connected')return void await signinConnected(provider,r);
+    }catch(e){OAUTH[provider]=null;renderSignin();return void updateSettingsStatus('Could not connect: '+errText(e));}
+    pollSignin(provider);
+  },Math.max(0,flow.interval)*1000);
+}
+async function disconnectSignin(provider){
+  updateSettingsStatus('disconnecting…');
+  try{
+    const r=await postJson('/api/agents/oauth/disconnect',{userId:selectedUser,conversationId:selectedConversation,provider});
+    if(!r||r.ok!==true)throw new Error((r&&r.message)||'could not disconnect');
+    adoptAgents(r);await refreshCatalog();renderSettingsControls();updateSettingsStatus();
+  }catch(e){updateSettingsStatus('Could not disconnect: '+errText(e));}
+}
+// ---- API keys: the secondary option, folded away until asked for.
 function renderCredentialFields(){
   const wrap=$('agentsCreds');if(!wrap)return;
-  wrap.innerHTML=(AGENTS.credentials||[]).map(function(c){
-    const state=c.connected?'connected · ••••'+esc(c.last4):'not connected';
-    const field=c.multiline
-      ? '<textarea rows="4" data-cred="'+esc(c.id)+'" autocomplete="off" placeholder="'+esc(c.hint)+'"></textarea>'
-      : '<input type="password" data-cred="'+esc(c.id)+'" autocomplete="off" placeholder="'+esc(c.hint)+'"/>';
-    return '<label class="credRow" data-row="'+esc(c.id)+'">'
-      +'<span class="credHead"><span>'+esc(c.label)+'</span>'
-      +'<span class="credState '+(c.connected?'okText':'')+'" data-state="'+esc(c.id)+'">'+state+'</span></span>'
-      +field
-      +'<span class="credFoot"><span class="credTarget">'+esc(c.kind==='file'?'~/'+c.target:c.target)+'</span>'
-      +(c.connected?'<button type="button" class="credClear" data-clear="'+esc(c.id)+'">Clear</button>':'')+'</span></label>';
+  wrap.innerHTML=credsIn('key').map(function(c){
+    const cleared=clearedCreds[c.id]===true;
+    const field=(c.connected&&!cleared)
+      ? '<span class="credState" data-state="'+esc(c.id)+'">connected ····'+esc(c.last4)+'</span>'
+        +'<button type="button" class="linkBtn" data-clear="'+esc(c.id)+'">Clear</button>'
+      : '<input type="password" data-cred="'+esc(c.id)+'" autocomplete="off" placeholder="'+esc(c.hint)+'"/>'
+        +(cleared?'<span class="credState dangerText" data-state="'+esc(c.id)+'">removed on save</span>':'');
+    return '<label class="credRow" data-row="'+esc(c.id)+'"><span class="credName">'+esc(c.label)+'</span>'+field+'</label>';
   }).join('');
   if(!wrap.querySelectorAll)return;
   wrap.querySelectorAll('[data-clear]').forEach(function(b){
-    b.addEventListener('click',function(){
-      const id=b.getAttribute('data-clear');
-      const row=wrap.querySelector('[data-row="'+id+'"]');
-      if(row)row.dataset.cleared='1';
-      const st=wrap.querySelector('[data-state="'+id+'"]');
-      if(st){st.textContent='will be removed on save';st.className='credState dangerText';}
-      b.remove();
-    });
+    b.addEventListener('click',function(){clearedCreds[b.getAttribute('data-clear')]=true;renderCredentialFields();});
   });
 }
 function openSettings(){if(!$('settingsBackdrop'))return;renderSettingsControls();$('settingsBackdrop').classList.add('open');$('settingsHarness').focus();}
 function closeSettings(){if($('settingsBackdrop'))$('settingsBackdrop').classList.remove('open');}
-/** Read the panel's credential fields: a typed value sets it, Clear sends "". */
+/** Read the panel's key fields: a typed value sets it, Clear sends "". */
 function credentialPatch(){
   const wrap=$('agentsCreds'), patch={};
   if(!wrap||!wrap.querySelectorAll)return patch;
   wrap.querySelectorAll('[data-cred]').forEach(function(el){
-    const id=el.getAttribute('data-cred'), row=wrap.querySelector('[data-row="'+id+'"]');
-    const value=(el.value||'').trim();
+    const id=el.getAttribute('data-cred'), value=(el.value||'').trim();
     if(value)patch[id]=value;
-    else if(row&&row.dataset&&row.dataset.cleared==='1')patch[id]='';
+    else if(clearedCreds[id])patch[id]='';
   });
   return patch;
 }
@@ -141,10 +257,11 @@ async function saveSettings(){
       credentials:patch,
     })})).json();
     if(!r||r.ok!==true)throw new Error((r&&r.message)||'save failed');
-    AGENTS={selection:r.selection||{},credentials:r.credentials||[],usingOwnKeys:Boolean(r.usingOwnKeys),envPending:Boolean(r.envPending)};
+    adoptAgents(r);
+    clearedCreds={};
     await refreshCatalog();
     renderSettingsControls();
-    updateSettingsStatus(r.message||'saved');
+    updateSettingsStatus();
   }catch(e){
     updateSettingsStatus('Could not save: '+String(e&&e.message||e));
     const el=$('settingsStatus');if(el)el.className='settingsStatus dangerText';
@@ -156,7 +273,7 @@ async function saveSettings(){
 async function loadAgents(){
   try{
     const r=await(await fetch('/api/agents?'+new URLSearchParams({userId:selectedUser}))).json();
-    if(r&&r.ok)AGENTS={selection:r.selection||{},credentials:r.credentials||[],usingOwnKeys:Boolean(r.usingOwnKeys),envPending:Boolean(r.envPending)};
+    if(r&&r.ok)adoptAgents(r);
   }catch(_){/* the panel still opens; nothing is connected */}
 }
 const hiddenContextPattern=new RegExp('<consumer-context>[\s\S]*?</consumer-context>','g');
@@ -234,7 +351,7 @@ function renderTotals(){const seconds=activeSeconds();$('totalSeconds').textCont
 // or not against their own credentials (falling back to the preview's), so the
 // greying in the panel is the same verdict /api/send enforces.
 async function refreshCatalog(){const r=await fetch('/api/harnesses?'+new URLSearchParams({userId:selectedUser}));const j=await r.json();H=j.harnesses;PRICING=j.pricing||PRICING;HARNESS_META={serverKeysAllowed:j.serverKeysAllowed===undefined?true:Boolean(j.serverKeysAllowed),credentialMode:j.credentialMode||(j.serverKeysAllowed===false?'byok-required':'server-or-byok'),env:j.env||{}};if(PRICING)billRate=PRICING.ratePerSecond;}
-async function load(){await refreshCatalog();await loadAgents();chooseDefaultModel();renderSettingsControls();const note=$('settingsNote');if(note)note.textContent=HARNESS_META.serverKeysAllowed?'Add your own keys to run your machine on them; without them it falls back to this preview\'s shared keys.':'This preview has no shared model keys: add your own below to run anything.';renderTotals();paintDiagram();if(!currentSettingsStatus().ok)openSettings();}
+async function load(){await refreshCatalog();await loadAgents();chooseDefaultModel();renderSettingsControls();renderTotals();paintDiagram();if(!currentSettingsStatus().ok)openSettings();}
 // Priority: what this device last used > what the user saved server-side > the
 // first model their credentials actually unlock.
 function chooseDefaultModel(){

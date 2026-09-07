@@ -67,17 +67,26 @@
 <div class="settingsBackdrop" id="settingsBackdrop" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
   <section class="settingsDialog">
     <div class="settingsHead">
-      <div><h2 id="settingsTitle">Agents</h2><p>The agent that runs on your machine, and the credentials it runs on. Stored for you and applied to your own machine.</p></div>
+      <h2 id="settingsTitle">Agents</h2>
       <button id="settingsClose" class="iconButton" type="button" aria-label="Close Agents"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></svg></button>
     </div>
-    <div class="settingsGrid">
-      <label>Harness<select id="settingsHarness"></select></label>
-      <label>Model<select id="settingsModel"></select></label>
-    </div>
-    <label id="settingsReasoningRow" hidden>Reasoning<select id="settingsReasoning"></select></label>
-    <div class="agentsCreds" id="agentsCreds"></div>
-    <div class="settingsNote" id="settingsNote">Loading credential mode…</div>
-    <div class="settingsStatus" id="settingsStatus"></div>
+    <section class="agentsSection" aria-labelledby="agentsPickHead">
+      <h3 id="agentsPickHead">Your agent</h3>
+      <div class="agentsPicks">
+        <label>Harness<select id="settingsHarness"></select></label>
+        <label>Model<select id="settingsModel"></select></label>
+        <label id="settingsReasoningRow" hidden>Thinking<select id="settingsReasoning"></select></label>
+      </div>
+    </section>
+    <section class="agentsSection" aria-labelledby="agentsSigninHead">
+      <h3 id="agentsSigninHead">Sign in</h3>
+      <div class="agentsSignin" id="agentsSignin"></div>
+    </section>
+    <details class="agentsKeys" id="agentsKeysBox">
+      <summary>API keys</summary>
+      <div class="agentsCreds" id="agentsCreds"></div>
+    </details>
+    <p class="settingsStatus" id="settingsStatus"></p>
     <div class="settingsActions"><button id="settingsSave" type="button">Save</button></div>
   </section>
 </div>

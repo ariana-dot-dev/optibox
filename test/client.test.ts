@@ -140,6 +140,7 @@ function bootClient(opts: {
   catalog?: unknown;
   agents?: unknown;
   onAgentsSave?: (body: any) => unknown;
+  onOAuth?: (step: string, params: any) => unknown;
 } = { now: 1_000_000, uuid: () => "turn-1" }) {
   const elements = new Map<string, FakeElement>();
   const getElement = (id: string) => {
@@ -151,11 +152,12 @@ function bootClient(opts: {
     "composer", "msg", "send", "stopBox", "showTraces", "chat", "empty",
     "schematic", "routeStatus", "machineState", "totalSeconds", "totalCost", "autoStopTimer", "matrix",
     "settingsBackdrop", "settingsHarness", "settingsModel", "settingsReasoningRow", "settingsReasoning",
-    "agentsCreds", "settingsNote", "settingsStatus", "settingsSave", "settingsClose", "settingsOpen", "agentPill",
+    "agentsSignin", "agentsCreds", "settingsStatus", "settingsSave", "settingsClose", "settingsOpen", "agentPill",
   ]) getElement(id);
 
   const sendRequests: any[] = [];
   const agentsSaves: any[] = [];
+  const oauthCalls: { step: string; params: any }[] = [];
   let now = opts.now;
   const catalog = opts.catalog ?? DEFAULT_CATALOG;
   const agents = opts.agents ?? { ok: true, selection: {}, credentials: [], usingOwnKeys: false, envPending: false };
@@ -179,6 +181,13 @@ function bootClient(opts: {
     Date: Object.assign(class extends Date { static now() { now += 1000; return now; } }, Date),
     fetch: async (url: string, init?: any) => {
       if (url.startsWith("/api/harnesses")) return { ok: true, json: async () => catalog };
+      // The OAuth routes must be matched BEFORE /api/agents: they share the prefix.
+      if (url.startsWith("/api/agents/oauth/")) {
+        const [path, query] = url.slice("/api/agents/oauth/".length).split("?");
+        const params = init?.body ? JSON.parse(init.body) : Object.fromEntries(new URLSearchParams(query ?? ""));
+        oauthCalls.push({ step: path as string, params });
+        return { ok: true, json: async () => opts.onOAuth?.(path as string, params) ?? { ok: true } };
+      }
       if (url.startsWith("/api/agents")) {
         if (init?.method === "POST") {
           const body = JSON.parse(init.body);
@@ -196,10 +205,24 @@ function bootClient(opts: {
   });
 
   vm.runInContext(extractClientScript(""), context);
-  return { getElement, sendRequests, agentsSaves };
+  return { getElement, sendRequests, agentsSaves, oauthCalls };
 }
 
 const settle = async (times = 1) => { for (let i = 0; i < times; i++) await new Promise((r) => setImmediate(r)); };
+/** Let a zero-delay poll timer fire, then let its promises settle. */
+const tick = async (times = 1) => { for (let i = 0; i < times; i++) { await new Promise((r) => setTimeout(r, 2)); await settle(3); } };
+
+/** The credential list the real routes return, with nothing connected. */
+const NOTHING_CONNECTED = [
+  { id: "claudeSubscription", label: "Claude Pro/Max", hint: "", kind: "env", target: "CLAUDE_CODE_OAUTH_TOKEN", group: "subscription", oauth: "claude", connected: false, last4: "", detail: "" },
+  { id: "codexSubscription", label: "ChatGPT", hint: "", kind: "file", target: ".codex/auth.json", group: "subscription", oauth: "codex", connected: false, last4: "", detail: "" },
+  { id: "anthropicApiKey", label: "Anthropic", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
+  { id: "openaiApiKey", label: "OpenAI", hint: "sk-…", kind: "env", target: "OPENAI_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
+  { id: "openrouterApiKey", label: "OpenRouter", hint: "sk-or-…", kind: "env", target: "OPENROUTER_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
+  { id: "llmgatewayApiKey", label: "llmgateway", hint: "llmgtwy_…", kind: "env", target: "LLMGATEWAY_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
+];
+const withConnected = (id: string, extra: Record<string, unknown> = {}) =>
+  NOTHING_CONNECTED.map((c) => (c.id === id ? { ...c, connected: true, ...extra } : c));
 
 test("interactive demo client sends exactly one /api/send after page load", async () => {
   let n = 0;
@@ -300,44 +323,146 @@ test("interactive demo client groups consecutive tool calls into minimal chains"
   assert.ok(assistantIndex > children.indexOf(toolChains[0]!) && assistantIndex < children.indexOf(toolChains[1]!), "normal message bubble remains between chains");
 });
 
-test("Agents panel shows connected credentials masked, and Save posts new values, cleared ones and the selection", async () => {
+test("the Agents panel is read top to bottom: your agent, sign in, API keys folded away, one status line", () => {
+  const html = readFileSync("scripts/assets/app.html", "utf8");
+  const at = (needle: string) => {
+    const i = html.indexOf(needle);
+    assert.ok(i > 0, `${needle} is missing from the panel`);
+    return i;
+  };
+  const order = [
+    at('id="settingsTitle"'),
+    at(">Your agent<"), at('id="settingsHarness"'), at('id="settingsModel"'), at('id="settingsReasoning"'),
+    at(">Sign in<"), at('id="agentsSignin"'),
+    at('<details class="agentsKeys"'),
+    at('id="settingsStatus"'),
+    at('id="settingsSave"'),
+  ];
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), "markup order IS the reading order");
+  assert.match(html, /<summary>API keys<\/summary>/);
+  assert.doesNotMatch(html, /<details[^>]*\sopen/, "API keys start folded");
+  assert.doesNotMatch(html, /settingsNote/, "the old explanatory note is gone");
+  assert.doesNotMatch(html, /settingsGrid/, "the old two-column grid is gone");
+});
+
+test("Connect Claude subscription: the approval URL, then the pasted code, then the connected state", async () => {
+  const { getElement, oauthCalls } = bootClient({
+    now: 7_000_000,
+    uuid: () => "turn-claude-oauth",
+    agents: { ok: true, selection: {}, usingOwnKeys: false, envPending: false, credentials: NOTHING_CONNECTED },
+    onOAuth: (step, params) => {
+      if (step === "start") return { ok: true, sessionId: "sess-1", provider: params.provider, url: "https://claude.ai/oauth/authorize?code=true" };
+      return { ok: true, status: "connected", applied: "now", selection: {}, usingOwnKeys: true, envPending: false, credentials: withConnected("claudeSubscription") };
+    },
+  });
+  await settle(2);
+
+  const signin = getElement("agentsSignin");
+  assert.match(signin.innerHTML, /Connect Claude subscription/);
+  assert.match(signin.innerHTML, /Connect ChatGPT subscription/);
+
+  signin.querySelector('[data-connect="claude"]')!.dispatch("click");
+  await settle(3);
+  assert.deepEqual(oauthCalls.map((c) => c.step), ["start"]);
+  assert.equal(oauthCalls[0]!.params.provider, "claude");
+  assert.match(signin.innerHTML, /https:\/\/claude\.ai\/oauth\/authorize\?code=true/, "the URL to approve is on screen");
+  assert.match(signin.innerHTML, /data-code="claude"/, "and a field for the code Anthropic prints");
+
+  signin.querySelector('[data-code="claude"]')!.value = "the-code#state";
+  signin.querySelector('[data-submit="claude"]')!.dispatch("click");
+  await settle(4);
+
+  assert.deepEqual(oauthCalls.map((c) => c.step), ["start", "complete"]);
+  assert.equal(oauthCalls[1]!.params.sessionId, "sess-1");
+  assert.equal(oauthCalls[1]!.params.code, "the-code#state");
+  assert.match(signin.innerHTML, /data-disconnect="claude"/, "a connected subscription offers Disconnect");
+  assert.ok(!signin.innerHTML.includes('data-connect="claude"'), "and no longer offers Connect");
+  assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applied now");
+  assert.equal(getElement("agentPill").textContent, "claude · claude-sonnet · your subscription");
+});
+
+test("Connect ChatGPT subscription: a user code to type, polled until the box has it", async () => {
+  let polls = 0;
+  const { getElement, oauthCalls } = bootClient({
+    now: 8_000_000,
+    uuid: () => "turn-codex-oauth",
+    agents: { ok: true, selection: {}, usingOwnKeys: false, envPending: true, credentials: NOTHING_CONNECTED },
+    onOAuth: (step) => {
+      if (step === "start") return { ok: true, sessionId: "sess-2", url: "https://auth.openai.com/codex/device", userCode: "WDJB-MJHT", interval: 0 };
+      if (++polls < 2) return { ok: true, status: "pending" };
+      return { ok: true, status: "connected", applied: "next-start", selection: {}, usingOwnKeys: true, envPending: true, credentials: withConnected("codexSubscription", { detail: "account ····ad94" }) };
+    },
+  });
+  await settle(2);
+
+  const signin = getElement("agentsSignin");
+  signin.querySelector('[data-connect="codex"]')!.dispatch("click");
+  await settle(3);
+  assert.match(signin.innerHTML, /WDJB-MJHT/, "the short code the user types is on screen");
+  assert.match(signin.innerHTML, /https:\/\/auth\.openai\.com\/codex\/device/);
+
+  await tick(4);
+  assert.deepEqual(oauthCalls.map((c) => c.step), ["start", "status", "status"], "polling stops the moment it connects");
+  assert.equal(oauthCalls[1]!.params.sessionId, "sess-2");
+  assert.match(signin.innerHTML, /account ····ad94/, "the connected row names the account the backend returned");
+  assert.match(signin.innerHTML, /data-disconnect="codex"/);
+  assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applies at next start");
+});
+
+test("a connected subscription can be disconnected, and the status line falls back to the app's keys", async () => {
+  const { getElement, oauthCalls } = bootClient({
+    now: 9_000_000,
+    uuid: () => "turn-disconnect",
+    agents: { ok: true, selection: {}, usingOwnKeys: true, envPending: false, credentials: withConnected("claudeSubscription") },
+    onOAuth: () => ({ ok: true, applied: "now", selection: {}, usingOwnKeys: false, envPending: false, credentials: NOTHING_CONNECTED }),
+  });
+  await settle(2);
+
+  const signin = getElement("agentsSignin");
+  assert.match(signin.innerHTML, /data-disconnect="claude"/);
+  assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applied now");
+
+  signin.querySelector('[data-disconnect="claude"]')!.dispatch("click");
+  await settle(4);
+  assert.deepEqual(oauthCalls.map((c) => c.step), ["disconnect"]);
+  assert.equal(oauthCalls[0]!.params.provider, "claude");
+  assert.match(signin.innerHTML, /Connect Claude subscription/);
+  assert.equal(getElement("settingsStatus").textContent, "Runs on the app's keys · applied now");
+});
+
+test("API keys hold only the typed credentials, masked, and Save posts new values and cleared ones", async () => {
   const { getElement, agentsSaves } = bootClient({
     now: 4_000_000,
     uuid: () => "turn-agents",
     agents: {
       ok: true,
       selection: { harness: "claude", provider: "anthropic", model: "claude-sonnet" },
-      usingOwnKeys: true,
-      envPending: false,
-      credentials: [
-        { id: "anthropicApiKey", label: "Anthropic API key", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", multiline: false, connected: true, last4: "9xQ2" },
-        { id: "openaiApiKey", label: "OpenAI API key", hint: "sk-…", kind: "env", target: "OPENAI_API_KEY", multiline: false, connected: false, last4: "" },
-        { id: "codexSubscription", label: "Codex ChatGPT subscription", hint: "auth.json", kind: "file", target: ".codex/auth.json", multiline: true, connected: false, last4: "" },
-      ],
+      usingOwnKeys: true, envPending: false,
+      credentials: withConnected("anthropicApiKey", { last4: "9xQ2" }),
     },
     // What the route really answers: the fresh view, secrets still absent.
     onAgentsSave: (body: any) => ({
-      ok: true, applied: "now", message: "applied to your box now", selection: body.selection, usingOwnKeys: true, envPending: false,
-      credentials: [
-        { id: "anthropicApiKey", label: "Anthropic API key", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", multiline: false, connected: false, last4: "" },
-        { id: "openaiApiKey", label: "OpenAI API key", hint: "sk-…", kind: "env", target: "OPENAI_API_KEY", multiline: false, connected: true, last4: "nai" },
-        { id: "codexSubscription", label: "Codex ChatGPT subscription", hint: "auth.json", kind: "file", target: ".codex/auth.json", multiline: true, connected: false, last4: "" },
-      ],
+      ok: true, applied: "now", selection: body.selection, usingOwnKeys: true, envPending: false,
+      credentials: withConnected("openaiApiKey", { last4: "nai" }),
     }),
   });
   await settle(2);
 
   const creds = getElement("agentsCreds");
-  assert.match(creds.innerHTML, /connected · ••••9xQ2/, "a connected credential reports only its last 4");
+  assert.ok(!creds.innerHTML.includes("Subscription") && !creds.innerHTML.includes("data-cred=\"claudeSubscription\""),
+    "subscriptions live under Sign in, never among the keys");
+  for (const id of ["anthropicApiKey", "openaiApiKey", "openrouterApiKey", "llmgatewayApiKey"]) {
+    assert.ok(creds.innerHTML.includes(`data-row="${id}"`), `${id} has a row`);
+  }
+  assert.match(creds.innerHTML, /connected ····9xQ2/, "a connected key reports only its last 4");
   assert.ok(!creds.innerHTML.includes("sk-ant-9xQ2"), "the secret itself never reaches the page");
-  assert.match(creds.innerHTML, /data-clear="anthropicApiKey"/, "a connected credential offers Clear");
-  assert.ok(!creds.innerHTML.includes('data-clear="openaiApiKey"'), "an unconnected credential has nothing to clear");
-  assert.match(creds.innerHTML, /<textarea[^>]*data-cred="codexSubscription"/, "the Codex auth.json is a textarea");
+  assert.match(creds.innerHTML, /data-clear="anthropicApiKey"/, "a connected key offers Clear");
+  assert.ok(!creds.innerHTML.includes('data-clear="openaiApiKey"'), "an unconnected key has nothing to clear");
 
-  // Type a new OpenAI key, and clear the Anthropic one.
-  creds.querySelector('[data-cred="openaiApiKey"]')!.value = "sk-new-openai";
   creds.querySelector('[data-clear="anthropicApiKey"]')!.dispatch("click");
-  assert.equal(creds.querySelector('[data-state="anthropicApiKey"]')!.textContent, "will be removed on save");
+  assert.match(creds.innerHTML, /data-state="anthropicApiKey">removed on save</, "Clear turns the row back into an empty field, marked for removal");
+  assert.match(creds.innerHTML, /data-cred="anthropicApiKey"/, "and it can be retyped right away");
+  creds.querySelector('[data-cred="openaiApiKey"]')!.value = "sk-new-openai";
 
   getElement("settingsSave").dispatch("click");
   await settle(4);
@@ -347,11 +472,11 @@ test("Agents panel shows connected credentials masked, and Save posts new values
     "typed values are sent; a cleared credential is sent as the empty string");
   assert.equal(agentsSaves[0].selection.harness, "claude");
   assert.equal(agentsSaves[0].selection.model, "claude-sonnet");
-  assert.equal(getElement("settingsStatus").textContent, "applied to your box now");
-  assert.equal(creds.querySelector('[data-cred="openaiApiKey"]')!.value, "", "typed secrets are wiped from the form after the save");
+  assert.equal(getElement("settingsStatus").textContent, "Runs on your keys · applied now");
+  assert.ok(!creds.innerHTML.includes('data-cred="openaiApiKey"'), "the typed secret leaves the form once it is stored");
 });
 
-test("the composer pill names the running agent and whose keys it runs on, and opens the panel", async () => {
+test("the composer pill names the running agent and whose credentials it runs on, and opens the panel", async () => {
   const catalog = {
     ...DEFAULT_CATALOG,
     harnesses: [{ name: "claude-code", models: [{ provider: "anthropic", model: "claude-sonnet-5", label: "Claude Code · claude-sonnet-5", keyAvailable: true, requiredEnv: "ANTHROPIC_API_KEY" }] }],
@@ -363,47 +488,50 @@ test("the composer pill names the running agent and whose keys it runs on, and o
     agents: {
       ok: true,
       selection: { harness: "claude-code", provider: "anthropic", model: "claude-sonnet-5" },
-      usingOwnKeys: false,
-      envPending: false,
-      credentials: [{ id: "anthropicApiKey", label: "Anthropic API key", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", multiline: false, connected: false, last4: "" }],
+      usingOwnKeys: false, envPending: false, credentials: NOTHING_CONNECTED,
     },
-    onAgentsSave: (body: any) => ({
-      ok: true, applied: "now", message: "applied to your box now", selection: body.selection, usingOwnKeys: true, envPending: false,
-      credentials: [{ id: "anthropicApiKey", label: "Anthropic API key", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", multiline: false, connected: true, last4: "hro1" }],
-    }),
+    onOAuth: (step, params) => {
+      if (step === "start") return { ok: true, sessionId: "sess-3", provider: params.provider, url: "https://claude.ai/oauth/authorize?code=true" };
+      return { ok: true, status: "connected", applied: "now", selection: {}, usingOwnKeys: true, envPending: false, credentials: withConnected("claudeSubscription") };
+    },
   });
   await settle(2);
 
   const pill = getElement("agentPill");
-  assert.equal(pill.textContent, "Claude Code · claude-sonnet-5 · server keys",
+  assert.equal(pill.textContent, "Claude Code · claude-sonnet-5 · the app's keys",
     "the pill mirrors the selection GET /api/agents returned");
 
   // It is the same entry point as the gear.
   pill.dispatch("click");
   assert.ok(getElement("settingsBackdrop").classList.names.has("open"));
 
-  getElement("agentsCreds").querySelector('[data-cred="anthropicApiKey"]')!.value = "sk-ant-hro1";
-  getElement("settingsSave").dispatch("click");
+  const signin = getElement("agentsSignin");
+  signin.querySelector('[data-connect="claude"]')!.dispatch("click");
+  await settle(3);
+  signin.querySelector('[data-code="claude"]')!.value = "pasted";
+  signin.querySelector('[data-submit="claude"]')!.dispatch("click");
   await settle(4);
-  assert.equal(pill.textContent, "Claude Code · claude-sonnet-5 · your keys",
-    "saving a key of your own flips the pill to 'your keys'");
+  assert.equal(pill.textContent, "Claude Code · claude-sonnet-5 · your subscription",
+    "connecting a subscription flips the pill to it");
 });
 
-test("the 'Show N more lines' toggle is a text row, so a collapsed bubble ends with the same padding as any other", () => {
+test("every message bubble is inset by the same amount on all four sides, collapsed or not", () => {
   const css = readFileSync("scripts/assets/app.css", "utf8");
+  // One value = top and bottom can never drift apart again.
+  for (const rule of [...css.matchAll(/(?:^|[},])\.msg\{([^}]*)\}/g)]) {
+    assert.match(rule[1]!, /padding:12px(;|$)/, "the bubble's inset is one value on every side");
+  }
   // The global reset gives every button a 42px box; inside a bubble that box
   // would sit below the toggle as dead space a normal message does not have.
   assert.match(css, /(^|\})button\{[^}]*min-height:42px/m, "the global button box is what the toggle must opt out of");
-  const rule = css.match(/\.msgMore\{([^}]*)\}/);
-  assert.ok(rule, ".msgMore must be styled");
-  assert.match(rule![1]!, /min-height:0/, "the toggle takes no minimum control height");
-  assert.match(rule![1]!, /padding:0(;|$)/, "the toggle adds no vertical padding of its own");
-  // Only the bubble's own padding separates the last row from the bubble edge,
-  // whichever row that is.
-  assert.doesNotMatch(rule![1]!, /margin-bottom/, "nothing extra below the toggle");
+  const toggle = css.match(/\.msgMore\{([^}]*)\}/);
+  assert.ok(toggle, ".msgMore must be styled");
+  assert.match(toggle![1]!, /min-height:0/, "the toggle takes no minimum control height");
+  assert.match(toggle![1]!, /padding:0(;|$)/, "the toggle adds no box of its own");
+  assert.doesNotMatch(toggle![1]!, /margin-bottom/, "nothing extra below the toggle");
 });
 
-test("a model the user has no key for is greyed out and the panel says which key to add", async () => {
+test("a model the user has no key for is greyed out and the one status line says which key to add", async () => {
   const { getElement } = bootClient({
     now: 5_000_000,
     uuid: () => "turn-locked",
@@ -415,6 +543,7 @@ test("a model the user has no key for is greyed out and the panel says which key
   await settle(2);
 
   assert.match(getElement("settingsModel").innerHTML, /disabled/, "a model without a key cannot be picked");
-  assert.match(getElement("settingsStatus").textContent, /Add your OPENAI_API_KEY in Agents/);
+  assert.match(getElement("settingsModel").innerHTML, /gpt-5 · needs OPENAI_API_KEY/, "greyed, with its one-line reason");
+  assert.equal(getElement("settingsStatus").textContent, "Add your OPENAI_API_KEY below to use Codex · GPT-5.");
   assert.ok(getElement("settingsBackdrop").classList.names.has("open"), "the panel opens itself when nothing can run");
 });

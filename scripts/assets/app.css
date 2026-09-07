@@ -42,18 +42,61 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 /* ---- footer control bar --------------------------------------------------- */
 .composerBar{display:none;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 16px calc(12px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid var(--line)}.composerBar button,.composerBar .traceToggle{min-height:32px;background:#fff;color:var(--ink2);border:1px solid var(--line);padding:0 12px;font-weight:400;font-size:12px;display:inline-flex;align-items:center;gap:8px;cursor:pointer;border-radius:var(--r-ctl);transition:border-color .15s ease,color .15s ease}.composerBar button:hover,.composerBar .traceToggle:hover{border-color:var(--line2);color:var(--ink)}.traceToggle{cursor:pointer}.traceToggle input{accent-color:var(--ink)}.iconButton{width:36px;display:inline-flex;align-items:center;justify-content:center;padding:0!important;font-size:16px}.iconButton svg{width:16px;height:16px;display:block}.composerBar .iconButton{width:32px;font-size:14px;margin-left:auto}
 
-/* ---- settings dialog (floats: shadow, no border) -------------------------- */
-.settingsBackdrop{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:16px}.settingsBackdrop.open{display:flex}.settingsDialog{width:min(560px,100%);max-height:calc(92dvh/var(--z));overflow:auto;background:#fff;border:0;box-shadow:var(--shadow-lg);padding:16px;color:var(--ink);border-radius:var(--r-surf)}.settingsHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.settingsHead h2{margin:0;font-size:20px;font-weight:400;letter-spacing:-.02em}.settingsHead p{margin:4px 0 0;color:var(--ink2);font-size:12px}.settingsDialog label{display:grid;gap:4px;margin-top:12px;font-size:12px;color:var(--ink2)}.settingsDialog input,.settingsDialog select{width:100%;border:1px solid var(--line);background:#fff;color:var(--ink);min-height:38px;padding:8px 12px;font:inherit;font-size:13px;border-radius:var(--r-ctl)}.settingsDialog input:focus,.settingsDialog select:focus{outline:none;border-color:var(--ink)}.settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.settingsNote{margin-top:12px;border:0;background:var(--fill);padding:12px;font-size:12px;color:var(--ink2);border-radius:var(--r-obj)}.settingsActions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}.settingsActions button.secondary{background:#fff;color:var(--ink);border:1px solid var(--line)}.settingsStatus{font-size:12px;color:var(--ink2);margin-top:8px}.dangerText{color:var(--red)}.okText{color:var(--green)}
-/* ---- Agents panel: one row per credential --------------------------------
-   Same label/field grammar as the rest of the dialog; the row only adds a head
-   (name + connected state) and a foot (where it lands on the box + Clear). */
-.settingsDialog label[hidden]{display:none}.settingsDialog textarea{width:100%;border:1px solid var(--line);background:#fff;color:var(--ink);padding:8px 12px;font:400 12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;border-radius:var(--r-ctl);resize:vertical}.settingsDialog textarea:focus{outline:none;border-color:var(--ink)}.credHead,.credFoot{display:flex;align-items:baseline;justify-content:space-between;gap:8px}.credHead span:first-child{color:var(--ink)}.credState{font-size:11px;color:var(--ink3);white-space:nowrap}.credTarget{font:400 11px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink3)}.credClear{background:none;border:0;padding:0;color:var(--ink2);font:inherit;font-size:11px;text-decoration:underline;cursor:pointer}.credClear:hover{color:var(--red)}
+/* ---- Agents panel (floats: shadow, no border) -----------------------------
+   ONE type scale: 20 title · 13 body/control · 12 section label + status ·
+   11 hint. ONE spacing unit: 12px between blocks, 8px inside one. Tint
+   (--fill) marks a block; nothing here is bordered. Read top to bottom:
+   your agent -> sign in -> API keys (folded) -> one status line -> Save. */
+.settingsBackdrop{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.36);display:none;align-items:center;justify-content:center;padding:16px}.settingsBackdrop.open{display:flex}
+/* min-width:0 is load-bearing: as a flex item the dialog's default
+   min-width:auto is its min-content width, and three selects side by side then
+   push it wider than a 390px phone. */
+.settingsDialog{width:min(460px,100%);min-width:0;max-height:calc(92dvh/var(--z));overflow:auto;background:#fff;border:0;box-shadow:var(--shadow-lg);padding:16px;color:var(--ink);border-radius:var(--r-surf);display:grid;gap:12px}
+.settingsHead{display:flex;align-items:center;justify-content:space-between;gap:12px}.settingsHead h2{margin:0;font-size:20px;font-weight:400;letter-spacing:-.02em}
+/* Only the two Connect buttons are loud in here: close and Save stay quiet. */
+.settingsHead .iconButton{min-height:28px;width:28px;background:none;color:var(--ink3)}.settingsHead .iconButton:hover{color:var(--ink)}
+.agentsSection{display:grid;gap:8px;min-width:0}.agentsSection>h3{margin:0;font-size:12px;font-weight:400;color:var(--ink2)}
+.agentsPicks{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:8px}
+.agentsPicks label{display:grid;gap:4px;min-width:0;font-size:11px;color:var(--ink3)}.agentsPicks label[hidden]{display:none}
+.settingsDialog select,.settingsDialog input{width:100%;min-width:0;border:0;background:var(--fill);color:var(--ink);min-height:38px;padding:0 10px;font:inherit;font-size:13px;border-radius:var(--r-ctl)}
+.settingsDialog select:focus,.settingsDialog input:focus{outline:2px solid var(--line2);outline-offset:-2px}
+.settingsDialog select:disabled,.settingsDialog option:disabled{color:var(--ink3)}
+/* Sign in: two primary buttons, each replaced in place by its own flow. */
+.agentsSignin{display:grid;gap:8px}
+.signBtn{width:100%;min-height:38px;font-size:13px;padding:0 12px;border-radius:var(--r-ctl)}
+.signRow{display:grid;gap:8px;min-width:0;background:var(--fill);padding:12px;border-radius:var(--r-obj)}
+.signName{font-size:13px;color:var(--ink)}
+.signHint{font-size:11px;color:var(--ink3)}
+.signLink{font-size:12px;color:var(--ink);overflow-wrap:anywhere}
+.signCode{display:grid;grid-template-columns:1fr auto;gap:8px}
+.signCode input{background:#fff}
+.signCode button{min-height:38px;font-size:13px;padding:0 14px;border-radius:var(--r-ctl)}
+.signUserCode{margin:0;font:400 22px/1.1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.08em;color:var(--ink);overflow-wrap:anywhere}
+.signRow.done{grid-template-columns:1fr auto;gap:2px 8px;align-items:center}
+.signRow.done .signName,.signRow.done .signHint{grid-column:1}
+.signRow.done .linkBtn{grid-column:2;grid-row:1/span 2}
+.linkBtn{min-height:0;background:none;border:0;padding:0;color:var(--ink2);font:inherit;font-size:11px;text-decoration:underline;cursor:pointer;justify-self:start}
+.linkBtn:hover{color:var(--ink)}
+/* API keys: folded away, one row each, a masked input or a connected line. */
+.agentsKeys{background:var(--fill);border-radius:var(--r-obj);padding:0 12px}
+.agentsKeys>summary{list-style:none;cursor:pointer;padding:12px 0;font-size:12px;color:var(--ink2);display:flex;justify-content:space-between}
+.agentsKeys>summary::-webkit-details-marker{display:none}
+.agentsKeys>summary:after{content:"+";color:var(--ink3)}.agentsKeys[open]>summary:after{content:"–"}
+.agentsCreds{display:grid;gap:8px;padding-bottom:12px}
+.credRow{display:grid;grid-template-columns:1fr auto;align-items:center;gap:4px 8px;min-width:0}
+.credName{grid-column:1/-1;font-size:11px;color:var(--ink3)}
+.credRow input{grid-column:1/-1;background:#fff}
+.credState{grid-column:1;font-size:13px;color:var(--ink2);overflow-wrap:anywhere}
+.settingsStatus{margin:0;font-size:12px;color:var(--ink2)}
+.settingsActions{display:flex;justify-content:flex-end}
+.settingsActions button{min-height:38px;font-size:13px;padding:0 16px;border-radius:var(--r-ctl);background:var(--fill);color:var(--ink)}.settingsActions button:hover{background:var(--fill2)}
+.dangerText{color:var(--red)}.okText{color:var(--green)}
 
 /* ---- chat ------------------------------------------------------------------
    Voice hierarchy inside the stream, loudest to quietest:
    user bubble (ink fill) > assistant bubble (gray fill) > embeds/decks (gray
    fill objects) > tool/receipt lines (bare 13px ink2) > trace (dashed meta). */
-.chat{flex:1;overflow:auto;overflow-x:clip;padding:16px 16px 20px;display:flex;flex-direction:column;gap:8px;scroll-behavior:smooth;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}.empty{margin:auto;color:var(--ink2);text-align:center;font-size:13px;max-width:280px}.msg{max-width:86%;padding:10px 12px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;font-weight:400;border:0;border-radius:var(--r-obj)}.msg.user{align-self:flex-end;background:var(--ink);color:#fff;border-bottom-right-radius:4px}.msg.assistant{align-self:flex-start;background:var(--fill);color:var(--ink);border-bottom-left-radius:4px}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed var(--line2);color:var(--ink2);font-size:12px;max-width:92%;padding:8px 12px;border-radius:var(--r-obj)}.msg .body code{background:rgba(0,0,0,.08);padding:1px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}.msg.user .body code{background:rgba(255,255,255,.18)}.msg .body pre{background:#101418;color:#e6edf3;padding:10px 12px;border-radius:var(--r-ctl);overflow-x:auto;margin:6px 0;white-space:pre}.msg .body pre code{background:none;padding:0;color:inherit}.msg .body .mdh{display:inline-block;font-size:1.05em}.msg .body .mdli{display:inline-block;padding-left:16px;position:relative}.msg .body .mdli:before{content:'•';position:absolute;left:4px;color:var(--ink3)}.msg .body a{color:inherit;text-decoration:underline}.msg .body table.mdt{border-collapse:collapse;margin:8px 0;font-size:.92em;white-space:normal;display:block;overflow-x:auto;max-width:100%}.msg .body table.mdt th,.msg .body table.mdt td{border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}.msg .body table.mdt th{background:var(--fill2);font-weight:500}.msg.user .body table.mdt th,.msg.user .body table.mdt td{border-color:rgba(255,255,255,.22)}.msg.user .body table.mdt th{background:rgba(255,255,255,.12)}
+.chat{flex:1;overflow:auto;overflow-x:clip;padding:16px 16px 20px;display:flex;flex-direction:column;gap:8px;scroll-behavior:smooth;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}.empty{margin:auto;color:var(--ink2);text-align:center;font-size:13px;max-width:280px}/* ONE inset all round: the space under the last row of a bubble is the space above its first, collapsed or not. */.msg{max-width:86%;padding:12px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;font-weight:400;border:0;border-radius:var(--r-obj)}.msg.user{align-self:flex-end;background:var(--ink);color:#fff;border-bottom-right-radius:4px}.msg.assistant{align-self:flex-start;background:var(--fill);color:var(--ink);border-bottom-left-radius:4px}.msg.trace{align-self:flex-start;background:#fff;border:1px dashed var(--line2);color:var(--ink2);font-size:12px;max-width:92%;padding:12px;border-radius:var(--r-obj)}.msg .body code{background:rgba(0,0,0,.08);padding:1px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}.msg.user .body code{background:rgba(255,255,255,.18)}.msg .body pre{background:#101418;color:#e6edf3;padding:10px 12px;border-radius:var(--r-ctl);overflow-x:auto;margin:6px 0;white-space:pre}.msg .body pre code{background:none;padding:0;color:inherit}.msg .body .mdh{display:inline-block;font-size:1.05em}.msg .body .mdli{display:inline-block;padding-left:16px;position:relative}.msg .body .mdli:before{content:'•';position:absolute;left:4px;color:var(--ink3)}.msg .body a{color:inherit;text-decoration:underline}.msg .body table.mdt{border-collapse:collapse;margin:8px 0;font-size:.92em;white-space:normal;display:block;overflow-x:auto;max-width:100%}.msg .body table.mdt th,.msg .body table.mdt td{border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}.msg .body table.mdt th{background:var(--fill2);font-weight:500}.msg.user .body table.mdt th,.msg.user .body table.mdt td{border-color:rgba(255,255,255,.22)}.msg.user .body table.mdt th{background:rgba(255,255,255,.12)}
 .tag{display:block;margin-bottom:4px;color:var(--ink2);letter-spacing:.01em;font-size:11px;font-weight:400}.msg.user .tag{color:rgba(255,255,255,.65)}.msg.trace .tag{color:var(--ink3)}
 
 /* ---- attachment deck: fanned white cards (border edge, shadow only when
@@ -135,7 +178,7 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
    inside the bubble's own padding, so a collapsed message ends with the same
    space below it as an ordinary one. Without min-height:0 it inherits the
    global button box (42px) and the collapsed bubble grows a dead gap. */
-.msgMore{display:block;min-height:0;margin-top:6px;background:none;border:0;padding:0;color:var(--ink3);font:inherit;font-size:12px;line-height:1.4;cursor:pointer;text-decoration:underline}.msgMore:hover{color:var(--ink)}.msg.user .msgMore{color:rgba(255,255,255,.7)}.msg.user .msgMore:hover{color:#fff}
+.msgMore{display:block;min-height:0;margin-top:8px;background:none;border:0;padding:0;color:var(--ink3);font:inherit;font-size:12px;line-height:1.4;cursor:pointer;text-decoration:underline}.msgMore:hover{color:var(--ink)}.msg.user .msgMore{color:rgba(255,255,255,.7)}.msg.user .msgMore:hover{color:#fff}
 .working.inMsg{align-self:auto;margin-top:8px;padding:0;font-size:12px;color:var(--ink3);opacity:.9}
 .toolChainDetails{display:none;margin:8px 0 2px 16px;color:var(--ink2)}.toolChain.open .toolChainDetails{display:grid;gap:8px}.toolCallDetail{font-size:12px;line-height:1.35}.toolCallHead{color:var(--ink)}.toolCallMeta{color:var(--ink2);white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}.toolCallOutput{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink2);max-height:180px;overflow:auto}@keyframes toolEllipsis{0%{content:''}25%{content:'.'}50%{content:'..'}75%,100%{content:'...'}}
 /* Receipt reads exactly like a tool-call line: same size, color, placement. */
@@ -243,8 +286,9 @@ body{overflow:hidden;overscroll-behavior:none}
 .counters{gap:8px}.counter{padding:8px 8px}
 .label{font-size:11px}.value{font-size:16px}.state{font-size:11px}
 .chat{padding:12px 12px 16px;gap:8px}
-.msg{max-width:88%;font-size:14px;padding:8px 12px}
+.msg{max-width:88%;font-size:14px;padding:12px}
 .msg.trace{font-size:12px}
+.settingsBackdrop{padding:12px}.settingsDialog{padding:12px}
 .empty{font-size:13px}
 .msg .body pre{max-width:100%}
 .composer{padding:12px 12px calc(12px + env(safe-area-inset-bottom))}

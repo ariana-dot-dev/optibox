@@ -363,8 +363,8 @@ test("one entry point: the Agents button lives in the prompt box, immediately le
   assert.doesNotMatch(html, /settingsOpen/, "and so is the gear in the footer");
   // Size, colour and hover come from ONE declaration shared with its neighbours.
   assert.match(css, /#agentsOpen,#attach,#mic\{[^}]*width:26px;height:26px[^}]*color:var\(--ink3\)/);
-  assert.match(css, /#agentsOpen\{right:83px\}#attach\{right:51px\}/, "32px apart, the same step as attach to mic");
-  assert.match(css, /#agentsOpen\{right:calc\(79px \+ env\(safe-area-inset-right\)\)/, "same step again on the mobile safe-area offset");
+  assert.match(css, /#agentsOpen\{right:89px\}#attach\{right:57px\}/, "32px apart, the same step as attach to mic");
+  assert.match(css, /#agentsOpen\{right:calc\(85px \+ env\(safe-area-inset-right\)\)/, "same step again on the mobile safe-area offset");
 });
 
 test("the prompt box is twice as tall and reserves 3x insets on its right and bottom", () => {
@@ -375,9 +375,19 @@ test("the prompt box is twice as tall and reserves 3x insets on its right and bo
   const mobile = css.slice(css.indexOf("@media(max-width:900px)")).match(/textarea\{([^}]*)\}/)![1]!;
   assert.match(mobile, /min-height:104px/, "twice the old 52px");
   assert.match(mobile, /padding:12px 39px 36px 13px/);
-  // The icon row sits 3px above the box's bottom edge and is 26px tall, so the
-  // 39px bottom band clears it: text and buttons can never overlap.
-  assert.match(css, /#agentsOpen,#attach,#mic\{position:absolute;bottom:19px/);
+  // The icon row sits 9px (3x the old 3px) off the box's right and bottom edges
+  // and is 26px tall, so the 39px bottom band clears it: text and buttons can
+  // never overlap.
+  assert.match(css, /#agentsOpen,#attach,#mic\{position:absolute;bottom:25px/);
+  assert.match(css, /#mic\{right:25px\}/);
+  // The menu is sized by its labels, never clipped to its trigger.
+  assert.match(css, /\.ddMenu\{[^}]*min-width:100%;width:max-content/);
+});
+
+test("the dropdown menu hangs from the trigger's right edge when it would overflow the viewport", () => {
+  const js = readFileSync("scripts/assets/app.js", "utf8");
+  assert.match(js, /d\.right=true;drawDropdown\(el\)/);
+  assert.match(js, /\(d\.right\?' right':''\)/);
 });
 
 const TWO_HARNESSES = {

@@ -60,7 +60,7 @@ function drawDropdown(el){
   const cur=d.options.find(o=>o.value===d.value)||d.options[0];
   el.className=('dd'+(d.open?' open':'')+' '+(el.ddClass||'')).trim();
   el.innerHTML='<button type="button" class="ddTrigger" data-ddtrigger="1" aria-haspopup="listbox" aria-expanded="'+(d.open?'true':'false')+'"><span class="ddValue">'+esc(cur?cur.label:'')+'</span>'+DD_CHEVRON+'</button>'
-    +'<div class="ddMenu'+(d.up?' up':'')+'" role="listbox"'+(d.open?'':' hidden')+'>'
+    +'<div class="ddMenu'+(d.up?' up':'')+(d.right?' right':'')+'" role="listbox"'+(d.open?'':' hidden')+'>'
     +d.options.map(function(o,i){
       return '<button type="button" class="ddItem'+(o.value===d.value?' on':'')+(i===d.active?' active':'')+'" role="option" data-ddvalue="'+esc(o.value)+'"'
         +(o.disabled?' disabled aria-disabled="true"':'')+' aria-selected="'+(o.value===d.value?'true':'false')+'">'
@@ -92,8 +92,15 @@ function openDropdown(el){
   closeOtherDropdowns(el);
   d.open=true;
   d.active=Math.max(0,d.options.findIndex(o=>o.value===d.value));
-  d.up=dropdownOpensUp(el);
-  ddOpenEl=el;drawDropdown(el);focusDropdown(el);
+  d.up=dropdownOpensUp(el);d.right=false;
+  ddOpenEl=el;drawDropdown(el);
+  // The menu is sized by its labels, not its trigger: if that pushes it past the
+  // viewport's right edge, hang it from the trigger's right edge instead.
+  try{
+    const m=el.querySelector('.ddMenu'), r=m&&m.getBoundingClientRect?m.getBoundingClientRect():null;
+    if(r&&r.width>0&&r.right>window.innerWidth-8){d.right=true;drawDropdown(el);}
+  }catch(_){}
+  focusDropdown(el);
 }
 function closeDropdown(el,refocus){
   const d=el&&el.dd;if(!d)return;

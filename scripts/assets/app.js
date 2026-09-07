@@ -35,21 +35,120 @@ let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
 let autoStopInterval=null, autoStopDeadline=0, autoStopBoxId=null;
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+// ---- Agents panel ---------------------------------------------------------
+// The user's own setup — which agent runs their private machine, and the
+// credentials it runs on — lives SERVER-side (GET/POST /api/agents) so it
+// survives a new device and can be applied to the machine itself. The browser
+// never receives a secret back: a credential is typed once and afterwards only
+// reports "connected · last 4". localStorage keeps nothing but the last
+// harness/model picked, so the composer opens where the user left it.
 const SETTINGS_KEY='optibox.demo.settings.v1';
+let AGENTS={selection:{},credentials:[],usingOwnKeys:false,envPending:false};
+let selectedReasoning='';
 function readSettings(){try{return JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}')||{};}catch{return {};}}
-function writeSettings(next){localStorage.setItem(SETTINGS_KEY,JSON.stringify(next));}
-function has(v){return typeof v==='string'&&v.trim().length>0;}
-function clientProviderKeyAvailable(provider){const s=readSettings();if(provider==='anthropic')return has(s.anthropicApiKey)||Boolean(HARNESS_META.env&&HARNESS_META.env.ANTHROPIC_API_KEY);if(provider==='openrouter')return has(s.openrouterApiKey)||Boolean(HARNESS_META.env&&HARNESS_META.env.OPENROUTER_API_KEY);return has(s.openaiApiKey)||Boolean(HARNESS_META.env&&HARNESS_META.env.OPENAI_API_KEY);}
-function clientBoxKeyAvailable(){const s=readSettings();return has(s.boxApiKey)||Boolean(HARNESS_META.env&&HARNESS_META.env.BOX_API_KEY);}
-function currentApiKeys(){const s=readSettings();return {boxApiKey:s.boxApiKey||'',anthropicApiKey:s.anthropicApiKey||'',openaiApiKey:s.openaiApiKey||'',openrouterApiKey:s.openrouterApiKey||''};}
+function writeSettings(next){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(next));}catch(_){}}
+function rememberSelection(){writeSettings({harness:selectedHarness,provider:selectedProvider,model:selectedModel,reasoningEffort:selectedReasoning});}
+function boxAccountReady(){return Boolean(HARNESS_META.env&&HARNESS_META.env.BOX_API_KEY);}
 function selectedModelOption(){const h=H.find(x=>x.name===selectedHarness);return h&&h.models.find(m=>m.provider===selectedProvider&&m.model===selectedModel);}
-function currentSettingsStatus(){const model=selectedModelOption();if(!clientBoxKeyAvailable())return {ok:false,msg:'BOX_API_KEY required for this preview.'};if(model&&!clientProviderKeyAvailable(model.provider))return {ok:false,msg:(model.requiredEnv||'Provider key')+' required for '+(model.label||model.model)+'.'};return {ok:true,msg:HARNESS_META.serverKeysAllowed&&!Object.values(currentApiKeys()).some(Boolean)?'Using private server keys for this preview.':'BYOK credentials ready.'};}
-function updateSettingsStatus(){const st=currentSettingsStatus();const el=$('settingsStatus');if(el){el.className='settingsStatus '+(st.ok?'okText':'dangerText');el.textContent=st.msg;}if(!st.ok)setState('Settings required · '+st.msg);}
-function renderSettingsControls(){const hs=$('settingsHarness'), ms=$('settingsModel');if(!hs||!ms)return;hs.innerHTML=H.map(h=>'<option value="'+esc(h.name)+'">'+esc(h.name)+'</option>').join('');hs.value=selectedHarness;const h=H.find(x=>x.name===selectedHarness);ms.innerHTML=(h?h.models:[]).map(m=>'<option value="'+esc(m.provider+'|'+m.model)+'">'+esc((m.label||m.model)+' · '+m.requiredEnv+(clientProviderKeyAvailable(m.provider)?' ✓':''))+'</option>').join('');ms.value=selectedProvider+'|'+selectedModel;updateSettingsStatus();}
-function openSettings(){const s=readSettings();if(!$('settingsBackdrop')||!$('settingsBoxKey'))return;$('settingsBoxKey').value=s.boxApiKey||'';$('settingsAnthropicKey').value=s.anthropicApiKey||'';$('settingsOpenaiKey').value=s.openaiApiKey||'';$('settingsOpenrouterKey').value=s.openrouterApiKey||'';renderSettingsControls();$('settingsBackdrop').classList.add('open');$('settingsHarness').focus();}
+// The server decides what a model needs and whether THIS user can reach it
+// (their own credentials first, the preview's as the fallback) — the page just
+// renders that verdict, so the two can never disagree.
+function modelUnlocked(m){return Boolean(m&&m.keyAvailable);}
+function currentSettingsStatus(){
+  const model=selectedModelOption();
+  if(!boxAccountReady())return {ok:false,msg:'This preview has no Box account configured.'};
+  if(model&&!modelUnlocked(model))return {ok:false,msg:'Add your '+(model.requiredEnv||'provider key')+' in Agents to use '+(model.label||model.model)+'.'};
+  if(AGENTS.envPending)return {ok:true,msg:'New credentials saved — they apply when your machine next starts.'};
+  return {ok:true,msg:AGENTS.usingOwnKeys?'Running on your own credentials.':'Running on this preview\'s shared keys.'};
+}
+function updateSettingsStatus(msg){const st=currentSettingsStatus();const el=$('settingsStatus');if(el){el.className='settingsStatus '+(st.ok?'okText':'dangerText');el.textContent=msg||st.msg;}if(!st.ok&&!msg)setState('Agents setup required · '+st.msg);}
+function reasoningLevels(){const m=selectedModelOption();return (m&&m.reasoningEffort)||[];}
+function renderSettingsControls(){
+  const hs=$('settingsHarness'), ms=$('settingsModel');if(!hs||!ms)return;
+  hs.innerHTML=H.map(h=>'<option value="'+esc(h.name)+'">'+esc(h.name)+'</option>').join('');
+  hs.value=selectedHarness;
+  const h=H.find(x=>x.name===selectedHarness);
+  ms.innerHTML=(h?h.models:[]).map(m=>'<option value="'+esc(m.provider+'|'+m.model)+'"'+(modelUnlocked(m)?'':' disabled')+'>'+esc((m.label||m.model)+' · '+(modelUnlocked(m)?'ready':'needs '+m.requiredEnv))+'</option>').join('');
+  ms.value=selectedProvider+'|'+selectedModel;
+  const levels=reasoningLevels(), row=$('settingsReasoningRow'), rs=$('settingsReasoning');
+  if(row&&rs){
+    if(levels.length){row.hidden=false;rs.innerHTML=['<option value="">default</option>'].concat(levels.map(l=>'<option value="'+esc(l)+'">'+esc(l)+'</option>')).join('');rs.value=levels.indexOf(selectedReasoning)>=0?selectedReasoning:'';}
+    else{row.hidden=true;rs.innerHTML='';}
+  }
+  renderCredentialFields();
+  updateSettingsStatus();
+}
+function renderCredentialFields(){
+  const wrap=$('agentsCreds');if(!wrap)return;
+  wrap.innerHTML=(AGENTS.credentials||[]).map(function(c){
+    const state=c.connected?'connected · ••••'+esc(c.last4):'not connected';
+    const field=c.multiline
+      ? '<textarea rows="4" data-cred="'+esc(c.id)+'" autocomplete="off" placeholder="'+esc(c.hint)+'"></textarea>'
+      : '<input type="password" data-cred="'+esc(c.id)+'" autocomplete="off" placeholder="'+esc(c.hint)+'"/>';
+    return '<label class="credRow" data-row="'+esc(c.id)+'">'
+      +'<span class="credHead"><span>'+esc(c.label)+'</span>'
+      +'<span class="credState '+(c.connected?'okText':'')+'" data-state="'+esc(c.id)+'">'+state+'</span></span>'
+      +field
+      +'<span class="credFoot"><span class="credTarget">'+esc(c.kind==='file'?'~/'+c.target:c.target)+'</span>'
+      +(c.connected?'<button type="button" class="credClear" data-clear="'+esc(c.id)+'">Clear</button>':'')+'</span></label>';
+  }).join('');
+  if(!wrap.querySelectorAll)return;
+  wrap.querySelectorAll('[data-clear]').forEach(function(b){
+    b.addEventListener('click',function(){
+      const id=b.getAttribute('data-clear');
+      const row=wrap.querySelector('[data-row="'+id+'"]');
+      if(row)row.dataset.cleared='1';
+      const st=wrap.querySelector('[data-state="'+id+'"]');
+      if(st){st.textContent='will be removed on save';st.className='credState dangerText';}
+      b.remove();
+    });
+  });
+}
+function openSettings(){if(!$('settingsBackdrop'))return;renderSettingsControls();$('settingsBackdrop').classList.add('open');$('settingsHarness').focus();}
 function closeSettings(){if($('settingsBackdrop'))$('settingsBackdrop').classList.remove('open');}
-function saveSettings(){writeSettings({boxApiKey:$('settingsBoxKey').value.trim(),anthropicApiKey:$('settingsAnthropicKey').value.trim(),openaiApiKey:$('settingsOpenaiKey').value.trim(),openrouterApiKey:$('settingsOpenrouterKey').value.trim(),harness:selectedHarness,provider:selectedProvider,model:selectedModel});renderSettingsControls();updateSettingsStatus();closeSettings();}
-function clearSettings(){writeSettings({harness:selectedHarness,provider:selectedProvider,model:selectedModel});$('settingsBoxKey').value='';$('settingsAnthropicKey').value='';$('settingsOpenaiKey').value='';$('settingsOpenrouterKey').value='';renderSettingsControls();}
+/** Read the panel's credential fields: a typed value sets it, Clear sends "". */
+function credentialPatch(){
+  const wrap=$('agentsCreds'), patch={};
+  if(!wrap||!wrap.querySelectorAll)return patch;
+  wrap.querySelectorAll('[data-cred]').forEach(function(el){
+    const id=el.getAttribute('data-cred'), row=wrap.querySelector('[data-row="'+id+'"]');
+    const value=(el.value||'').trim();
+    if(value)patch[id]=value;
+    else if(row&&row.dataset&&row.dataset.cleared==='1')patch[id]='';
+  });
+  return patch;
+}
+async function saveSettings(){
+  const btn=$('settingsSave');
+  const patch=credentialPatch();
+  rememberSelection();
+  if(btn){btn.disabled=true;btn.textContent=Object.keys(patch).length?'Applying…':'Saving…';}
+  updateSettingsStatus(Object.keys(patch).length?'applying your credentials to your machine…':'saving…');
+  try{
+    const r=await(await fetch('/api/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+      userId:selectedUser,conversationId:selectedConversation,
+      selection:{harness:selectedHarness,provider:selectedProvider,model:selectedModel,reasoningEffort:selectedReasoning},
+      credentials:patch,
+    })})).json();
+    if(!r||r.ok!==true)throw new Error((r&&r.message)||'save failed');
+    AGENTS={selection:r.selection||{},credentials:r.credentials||[],usingOwnKeys:Boolean(r.usingOwnKeys),envPending:Boolean(r.envPending)};
+    await refreshCatalog();
+    renderSettingsControls();
+    updateSettingsStatus(r.message||'saved');
+  }catch(e){
+    updateSettingsStatus('Could not save: '+String(e&&e.message||e));
+    const el=$('settingsStatus');if(el)el.className='settingsStatus dangerText';
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='Save';}
+    const wrap=$('agentsCreds');if(wrap&&wrap.querySelectorAll)wrap.querySelectorAll('[data-cred]').forEach(function(el){el.value='';});
+  }
+}
+async function loadAgents(){
+  try{
+    const r=await(await fetch('/api/agents?'+new URLSearchParams({userId:selectedUser}))).json();
+    if(r&&r.ok)AGENTS={selection:r.selection||{},credentials:r.credentials||[],usingOwnKeys:Boolean(r.usingOwnKeys),envPending:Boolean(r.envPending)};
+  }catch(_){/* the panel still opens; nothing is connected */}
+}
 const hiddenContextPattern=new RegExp('<consumer-context>[\s\S]*?</consumer-context>','g');
 // Never trim the ACCUMULATED buffer: deltas arrive in pieces, and a mid-stream
 // trim eats the whitespace joint between chunks ("them." + "\n" + "Good," →
@@ -121,8 +220,27 @@ function _routeEvent(ev){
 }
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}
 function renderTotals(){const seconds=activeSeconds();$('totalSeconds').textContent=seconds.toFixed(1)+'s';$('totalCost').textContent=fmtUsd(seconds*billRate);}
-async function load(){const r=await fetch('/api/harnesses');const j=await r.json();H=j.harnesses;PRICING=j.pricing;HARNESS_META={serverKeysAllowed:j.serverKeysAllowed===undefined?true:Boolean(j.serverKeysAllowed),credentialMode:j.credentialMode||(j.serverKeysAllowed===false?'byok-required':'server-or-byok'),env:j.env||{BOX_API_KEY:true,ANTHROPIC_API_KEY:H.some(h=>h.models.some(m=>m.provider==='anthropic'&&m.keyAvailable)),OPENAI_API_KEY:H.some(h=>h.models.some(m=>m.provider==='openai'&&m.keyAvailable)),OPENROUTER_API_KEY:H.some(h=>h.models.some(m=>m.provider==='openrouter'&&m.keyAvailable))}};billRate=PRICING.ratePerSecond;chooseDefaultModel();renderSettingsControls();const note=$('settingsNote');if(note)note.textContent=HARNESS_META.serverKeysAllowed?'Private preview: configured server keys are available; BYOK overrides them.':'Public/dev preview: server keys are disabled. Add your own Box and model provider keys.';renderTotals();paintDiagram();if(!currentSettingsStatus().ok)openSettings();}
-function chooseDefaultModel(){const saved=readSettings();const savedHarness=H.find(h=>h.name===saved.harness);const savedModel=savedHarness&&savedHarness.models.find(m=>m.provider===saved.provider&&m.model===saved.model);if(savedHarness&&savedModel&&clientProviderKeyAvailable(savedModel.provider)){selectedHarness=savedHarness.name;selectedProvider=savedModel.provider;selectedModel=savedModel.model;return;}const preferred=H.find(h=>h.models.some(m=>clientProviderKeyAvailable(m.provider)))||H[0];if(!preferred){setState('No harnesses available');return;}const model=preferred.models.find(m=>clientProviderKeyAvailable(m.provider))||preferred.models[0];selectedHarness=preferred.name;selectedProvider=model.provider;selectedModel=model.model;if(!clientProviderKeyAvailable(model.provider)||!clientBoxKeyAvailable())setState('Waiting for BYOK settings · private machine stopped');}
+// The catalog is fetched FOR THIS USER: the server marks each model available
+// or not against their own credentials (falling back to the preview's), so the
+// greying in the panel is the same verdict /api/send enforces.
+async function refreshCatalog(){const r=await fetch('/api/harnesses?'+new URLSearchParams({userId:selectedUser}));const j=await r.json();H=j.harnesses;PRICING=j.pricing||PRICING;HARNESS_META={serverKeysAllowed:j.serverKeysAllowed===undefined?true:Boolean(j.serverKeysAllowed),credentialMode:j.credentialMode||(j.serverKeysAllowed===false?'byok-required':'server-or-byok'),env:j.env||{}};if(PRICING)billRate=PRICING.ratePerSecond;}
+async function load(){await refreshCatalog();await loadAgents();chooseDefaultModel();renderSettingsControls();const note=$('settingsNote');if(note)note.textContent=HARNESS_META.serverKeysAllowed?'Add your own keys to run your machine on them; without them it falls back to this preview\'s shared keys.':'This preview has no shared model keys: add your own below to run anything.';renderTotals();paintDiagram();if(!currentSettingsStatus().ok)openSettings();}
+// Priority: what this device last used > what the user saved server-side > the
+// first model their credentials actually unlock.
+function chooseDefaultModel(){
+  const local=readSettings(), stored=AGENTS.selection||{};
+  const wanted=[{harness:local.harness,provider:local.provider,model:local.model,reasoningEffort:local.reasoningEffort},{harness:stored.harness,provider:stored.provider,model:stored.model,reasoningEffort:stored.reasoningEffort}];
+  for(const w of wanted){
+    const h=H.find(x=>x.name===w.harness);
+    const m=h&&h.models.find(x=>x.provider===w.provider&&x.model===w.model);
+    if(h&&m&&modelUnlocked(m)){selectedHarness=h.name;selectedProvider=m.provider;selectedModel=m.model;selectedReasoning=w.reasoningEffort||'';return;}
+  }
+  const preferred=H.find(h=>h.models.some(modelUnlocked))||H[0];
+  if(!preferred){setState('No harnesses available');return;}
+  const model=preferred.models.find(modelUnlocked)||preferred.models[0];
+  selectedHarness=preferred.name;selectedProvider=model.provider;selectedModel=model.model;selectedReasoning='';
+  if(!modelUnlocked(model)||!boxAccountReady())setState('Waiting for your Agents setup · private machine stopped');
+}
 const bubbles=new Map();
 // ONE working indicator, owned by the latest turn. Concurrent/superseded turns
 // never create a second one (fixes the double "working…"). It is shown while the
@@ -229,7 +347,7 @@ async function renderDesktopRecording(ev,localId){
   for(let i=0;i<24;i++){
     if(el.__recAttempt!==attempt)return;
     try{
-      const res=await fetch('/api/fs/read',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,path:ev.path,apiKeys:currentApiKeys()})});
+      const res=await fetch('/api/fs/read',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,path:ev.path})});
       if(!res.ok)throw new Error('read '+res.status);
       const url=URL.createObjectURL(new Blob([await res.arrayBuffer()],{type:'video/mp4'}));
       if(el.__recAttempt!==attempt)return;
@@ -275,7 +393,7 @@ async function swapDesktopMode(w){
     // the machine can't park out from under a switch in progress.
     for(var i=0;i<45;i++){
       if(desktopWidget!==w)return;
-      const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,vnc:w.vnc,apiKeys:currentApiKeys()})});
+      const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,vnc:w.vnc})});
       const j=await res.json();
       if(desktopWidget!==w)return;
       if(j.ok&&j.desktopUrl&&!j.provisioning){
@@ -296,7 +414,7 @@ async function attachDesktopStream(w){
   for(var i=0;i<30;i++){
     if(desktopWidget!==w)return;
     try{
-      const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,...(w.vnc?{vnc:true}:{}),apiKeys:currentApiKeys()})});
+      const res=await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,...(w.vnc?{vnc:true}:{})})});
       const j=await res.json();
       if(desktopWidget!==w)return;
       if(j.ok&&j.desktopUrl&&!j.provisioning){
@@ -323,7 +441,7 @@ async function attachDesktopStream(w){
           while(alive()){
             await new Promise(function(r){setTimeout(r,20000);});
             if(!alive())return;
-            try{await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})});}catch(_){}
+            try{await fetch('/api/fs/desktop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser})});}catch(_){}
           }
         })();
         return;
@@ -435,7 +553,7 @@ function stopBilling(elapsed,reconciled){if(billing){if(!reconciled)totalSeconds
 let hostingList=[];
 async function stopHostingReq(port){
   try{
-    await fetch('/api/host/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,...(port?{port}:{}),apiKeys:currentApiKeys()})});
+    await fetch('/api/host/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,...(port?{port}:{})})});
     hostingList=port?hostingList.filter(h=>h.port!==port):[];
     syncHostingBar(hostingList);
     try{window.__optiboxFs.poke();}catch(_){}
@@ -528,13 +646,13 @@ async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused'
   const sendMsg=(atts.length&&!opts.silent)?msg+'\n\n[Attached files, saved in /home/user/attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
   const attachPayload=atts.map(a=>a.uploaded?{name:a.name,alreadyUploaded:true}:{name:a.name,contentB64:a.b64});
   showWorking();setState('shared bridge starting · private Box boot requested');resetRouteForTurn();
-  try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,apiKeys:currentApiKeys(),attachments:attachPayload})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
+  try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,reasoningEffort:selectedReasoning,attachments:attachPayload})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
 const stopBtn=$('stopBox');
 const diagnosticsBtn=$('downloadDiagnostics');
 const showTracesEl=$('showTraces');
 if(showTracesEl){showTracesEl.checked=false;showTracesEl.addEventListener('change',()=>{showTraces=Boolean(showTracesEl.checked);syncTraceVisibility();});}
-$('settingsOpen')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsClear')?.addEventListener('click',clearSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});$('settingsHarness')?.addEventListener('change',e=>{selectedHarness=e.target.value;const h=H.find(x=>x.name===selectedHarness);const m=h&&h.models[0];if(m){selectedProvider=m.provider;selectedModel=m.model;}renderSettingsControls();});$('settingsModel')?.addEventListener('change',e=>{const [provider,model]=String(e.target.value).split('|');selectedProvider=provider;selectedModel=model;renderSettingsControls();});
+$('settingsOpen')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});$('settingsHarness')?.addEventListener('change',e=>{selectedHarness=e.target.value;const h=H.find(x=>x.name===selectedHarness);const m=(h&&h.models.find(modelUnlocked))||(h&&h.models[0]);if(m){selectedProvider=m.provider;selectedModel=m.model;}selectedReasoning='';renderSettingsControls();});$('settingsModel')?.addEventListener('change',e=>{const [provider,model]=String(e.target.value).split('|');selectedProvider=provider;selectedModel=model;selectedReasoning='';renderSettingsControls();});$('settingsReasoning')?.addEventListener('change',e=>{selectedReasoning=String(e.target.value||'');});
 syncTraceVisibility();
 let lastSubmitAt=0;
 // ---- attachments ----------------------------------------------------------
@@ -558,14 +676,14 @@ function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)b
 function stageAttachment(f){
   f.__dest='attachments/'+f.name.replace(/[\/\\]/g,'_');
   f.__uploading=true;f.__uploaded=false;
-  fetch('/api/fs/upload?'+new URLSearchParams({userId:selectedUser,path:f.__dest}),{method:'POST',headers:{'content-type':'application/octet-stream','x-fs-keys':JSON.stringify(currentApiKeys())},body:f})
+  fetch('/api/fs/upload?'+new URLSearchParams({userId:selectedUser,path:f.__dest}),{method:'POST',headers:{'content-type':'application/octet-stream'},body:f})
     .then(async r=>{const j=await r.json().catch(()=>({}));if(!r.ok||j.ok===false)throw new Error(j.message||r.statusText);f.__uploaded=true;})
     .catch(()=>{f.__uploaded=false;})
     .finally(()=>{f.__uploading=false;renderPending();try{window.__optiboxFs.poke();}catch(_){}});
 }
 function unstageAttachment(f){
   if(!f.__dest||(!f.__uploaded&&!f.__uploading))return;
-  fetch('/api/fs/delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,path:f.__dest,apiKeys:currentApiKeys()})})
+  fetch('/api/fs/delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,path:f.__dest})})
     .then(()=>{try{window.__optiboxFs.poke();}catch(_){}})
     .catch(()=>{});
 }
@@ -673,7 +791,7 @@ function renderAttachDeck(el,atts,side){
 // file. A named path only shows if it actually exists under /home/user.
 const AGENT_FILE_EXT=/\.(png|jpe?g|gif|webp|bmp|avif|svg|pdf|mp4|webm|m4v|mov|ogv|mp3|wav|ogg|oga|m4a|opus|csv|xlsx?|json|txt|md|py|js|ts|tsx|html?|css|zip|sqlite3?|db|docx?|pptx?)$/i;
 async function fetchTreeFiles(){
-  try{const t=await (await fetch('/api/fs/tree',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
+  try{const t=await (await fetch('/api/fs/tree',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser})})).json();
     return (t.entries||[]).filter(e=>e.kind!=='directory'&&e.kind!=='d'&&e.kind!=='dir');
   }catch(_){return null;}
 }
@@ -813,7 +931,7 @@ fileInput.addEventListener('change',()=>{if(fileInput.files.length)addPendingFil
 composer.addEventListener('dragover',e=>{if(e.dataTransfer&&[...e.dataTransfer.types].includes('Files')){e.preventDefault();composer.classList.add('attachDrop');}});
 composer.addEventListener('dragleave',e=>{if(e.target===composer||!composer.contains(e.relatedTarget))composer.classList.remove('attachDrop');});
 composer.addEventListener('drop',e=>{composer.classList.remove('attachDrop');if(e.dataTransfer&&e.dataTransfer.files.length){e.preventDefault();addPendingFiles(e.dataTransfer.files);}});
-stopBtn.addEventListener('click',async e=>{e.preventDefault();stopBtn.disabled=true;addMsg('trace','manual stop','pause request sent for this conversation\n');setState('Private machine stopping · manual pause requested');try{const res=await fetch('/api/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()})});await drain(res,newTurnId());}catch(err){addMsg('assistant','error','Stop failed: '+String(err&&err.message||err));}finally{stopBtn.disabled=false;}});
+stopBtn.addEventListener('click',async e=>{e.preventDefault();stopBtn.disabled=true;addMsg('trace','manual stop','pause request sent for this conversation\n');setState('Private machine stopping · manual pause requested');try{const res=await fetch('/api/stop',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation})});await drain(res,newTurnId());}catch(err){addMsg('assistant','error','Stop failed: '+String(err&&err.message||err));}finally{stopBtn.disabled=false;}});
 diagnosticsBtn?.addEventListener('click',e=>{e.preventDefault();const a=document.createElement('a');a.href='/api/diagnostics?format=json';a.download='optibox-diagnostics.json';document.body.appendChild(a);a.click();a.remove();addMsg('trace','diagnostics','downloaded redacted JSON event log from /api/diagnostics\n');});
 msgEl.addEventListener('keydown',e=>{if((e.key==='Enter'||e.code==='Enter'||e.keyCode===13||e.which===13)&&!e.shiftKey){e.preventDefault();submitComposer('textarea.enter');}});
 msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.inputType==='insertParagraph')&&!e.shiftKey){e.preventDefault();submitComposer('textarea.beforeinput');}});
@@ -842,7 +960,7 @@ function notifyComposing(force){
   // The response carries the same runtime snapshot as the tree poll — apply it
   // through the SAME reducer so the counters reconcile within one ping of the
   // wake instead of waiting out the 4s poll (which raced short compose windows).
-  fetch('/api/fs/activity',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()})}).then(r=>r.json()).then(j=>{if(j&&j.runtime)applyRuntimeStatus(j.runtime);}).catch(()=>{});
+  fetch('/api/fs/activity',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation})}).then(r=>r.json()).then(j=>{if(j&&j.runtime)applyRuntimeStatus(j.runtime);}).catch(()=>{});
 }
 // ---- voice messages -------------------------------------------------------
 // Telegram-style: mic shows when the box is empty; press it to record with a
@@ -955,7 +1073,7 @@ async function finishRecording(){
   let text='';
   try{
     const b64=await readAsB64(file);
-    const r=await fetch('/api/transcribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({audioB64:b64,mime:recMime,apiKeys:currentApiKeys()})});
+    const r=await fetch('/api/transcribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({audioB64:b64,mime:recMime})});
     const j=await r.json();
     if(!j.ok)throw new Error(j.message||'transcription failed');
     text=(j.text||'').trim();
@@ -1012,7 +1130,7 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
     if(td&&td.boxStarted&&!td.receiptShown){const used=activeSeconds()-(td.startSeconds||0);if(used>=0.1&&billRate>0){td.receiptShown=true;const r=document.createElement('div');r.className='receipt';r.textContent=used.toFixed(1)+'s machine time · '+fmtUsd(used*billRate);const c=$('chat');const stick=chatStick(c);c.appendChild(r);if(stick)c.scrollTop=c.scrollHeight;}}}
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
-if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation,apiKeys:currentApiKeys()};},onRuntime:applyRuntimeStatus};
+if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation};},onRuntime:applyRuntimeStatus};
 load();
 
 // ---- reopen & restore ------------------------------------------------------
@@ -1040,7 +1158,7 @@ function replayEvent(ev,seq){
 }
 async function fetchHistory(sinceSeq){
   try{
-    const r=await(await fetch('/api/history',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,sinceSeq:sinceSeq,apiKeys:currentApiKeys()})})).json();
+    const r=await(await fetch('/api/history',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,sinceSeq:sinceSeq})})).json();
     return (r&&r.ok&&Array.isArray(r.events))?r.events:[];
   }catch(_){return [];}
 }
@@ -1080,7 +1198,7 @@ restoreConversation();
       if(!window.confirm('Delete your machine, its snapshots, and all messages/billing history?'))return;
       b.disabled=true;b.textContent='resetting…';
       try{
-        var r=await(await fetch('/api/reset',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,apiKeys:currentApiKeys()})})).json();
+        var r=await(await fetch('/api/reset',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser})})).json();
         if(!r||r.ok!==true)throw new Error((r&&r.message)||'reset failed');
         selectedConversation=persistConversationId('conv-'+Math.random().toString(36).slice(2,10));historyMaxSeq=0;lastTurnComplete=true;if(tailTimer){clearTimeout(tailTimer);tailTimer=0;}
         var c=$('chat');if(c)c.innerHTML='<div class="empty" id="empty">Send a message to start the demo.</div>';

@@ -4,7 +4,6 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { URL, fileURLToPath } from "node:url";
 import path from "node:path";
 import {
-  AGENT_CREDENTIALS,
   BoxHttpClient,
   BOX_PRICING,
   Engine,
@@ -51,9 +50,12 @@ function instanceId(): string {
 }
 const INSTANCE_ID = instanceId();
 
-// Public task-agent previews must never reuse the task agent's real Box/LLM keys.
-// Alfred/private previews can opt into the old zero-config behavior with
-// OPTIBOX_ALLOW_SERVER_KEYS=1; non-agent private runtimes also keep it by default.
+// Public task-agent previews must never reuse the task agent's real LLM keys:
+// there, every user brings their own in the Agents panel and each box runs on
+// them alone. Alfred/private previews opt into server keys as the FALLBACK with
+// OPTIBOX_ALLOW_SERVER_KEYS=1; non-agent private runtimes keep it by default.
+// The Box API key is always the operator's — a user is handed a machine from
+// that account, they never bring a Box account of their own.
 const allowServerKeys =
   process.env.OPTIBOX_ALLOW_SERVER_KEYS === "1" ||
   (process.env.PRODUCT_MODE !== "agent" &&
@@ -111,7 +113,7 @@ function sharedModelFor(providerEnv: Record<string, string>): string {
 }
 
 const serverProviderEnv = allowServerKeys ? providerEnvFromProcess() : {};
-const serverBoxApiKey = allowServerKeys ? process.env.BOX_API_KEY : undefined;
+const serverBoxApiKey = process.env.BOX_API_KEY;
 // ONE Postgres pool and ONE engine for the process. Provider keys are no longer
 // part of the engine's identity: they are per USER (users.provider_env), applied
 // to that user's own box. All coordination state lives in the DB.
@@ -150,11 +152,7 @@ function envForProvider(provider: string): string {
  * server's as the fallback — and a subscription counts as well as an API key.
  */
 async function credentialError(selection: { harness: string; provider: string; model: string }, userId: string): Promise<string | undefined> {
-  if (!serverBoxApiKey) {
-    return allowServerKeys
-      ? "BOX_API_KEY is not configured on this preview."
-      : "This public/dev preview has server keys disabled and no Box API key configured.";
-  }
+  if (!serverBoxApiKey) return "BOX_API_KEY is not configured on this preview.";
   const unlocks = await unlocksFor(userId);
   const alt = HARNESS_ALT_UNLOCKS[selection.harness] ?? [];
   const required = envForProvider(selection.provider);
@@ -886,7 +884,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(payload));
       };
       try {
-        return void json(200, { ok: true, ...(await engine().getUserAgents(userId)), catalog: AGENT_CREDENTIALS });
+        return void json(200, { ok: true, ...(await engine().getUserAgents(userId)) });
       } catch (e) {
         return void json(500, { ok: false, message: e instanceof Error ? e.message : String(e) });
       }
@@ -922,7 +920,7 @@ const server = http.createServer(async (req, res) => {
           : result.applied === "next-start"
             ? "applies when your box next starts"
             : "saved";
-        return void json(200, { ok: true, applied: result.applied, message, ...(await engine().getUserAgents(userId)), catalog: AGENT_CREDENTIALS });
+        return void json(200, { ok: true, applied: result.applied, message, ...(await engine().getUserAgents(userId)) });
       } catch (e) {
         fsLog({ route: "agents.save", userId, status: 502, error: e instanceof Error ? e.message : String(e) });
         return void json(502, { ok: false, message: e instanceof Error ? e.message : String(e) });

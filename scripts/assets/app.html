@@ -66,20 +66,18 @@
 <div class="settingsBackdrop" id="settingsBackdrop" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
   <section class="settingsDialog">
     <div class="settingsHead">
-      <div><h2 id="settingsTitle">Demo settings</h2><p>Choose harness/model and bring your own keys for public/dev previews.</p></div>
-      <button id="settingsClose" class="iconButton" type="button" aria-label="Close settings"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></svg></button>
+      <div><h2 id="settingsTitle">Agents</h2><p>The agent that runs on your machine, and the credentials it runs on. Stored for you and applied to your own machine.</p></div>
+      <button id="settingsClose" class="iconButton" type="button" aria-label="Close Agents"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></svg></button>
     </div>
     <div class="settingsGrid">
       <label>Harness<select id="settingsHarness"></select></label>
       <label>Model<select id="settingsModel"></select></label>
     </div>
-    <label>BOX_API_KEY<input id="settingsBoxKey" type="password" autocomplete="off" placeholder="bx_…"/></label>
-    <label>ANTHROPIC_API_KEY<input id="settingsAnthropicKey" type="password" autocomplete="off" placeholder="sk-ant-…"/></label>
-    <label>OPENAI_API_KEY<input id="settingsOpenaiKey" type="password" autocomplete="off" placeholder="sk-…"/></label>
-    <label>OPENROUTER_API_KEY<input id="settingsOpenrouterKey" type="password" autocomplete="off" placeholder="sk-or-…"/></label>
+    <label id="settingsReasoningRow" hidden>Reasoning<select id="settingsReasoning"></select></label>
+    <div class="agentsCreds" id="agentsCreds"></div>
     <div class="settingsNote" id="settingsNote">Loading credential mode…</div>
     <div class="settingsStatus" id="settingsStatus"></div>
-    <div class="settingsActions"><button id="settingsClear" class="secondary" type="button">Clear BYOK</button><button id="settingsSave" type="button">Save</button></div>
+    <div class="settingsActions"><button id="settingsSave" type="button">Save</button></div>
   </section>
 </div>
 <script src="/static/app.js"></script></body></html>

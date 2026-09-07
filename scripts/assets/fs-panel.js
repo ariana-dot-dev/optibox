@@ -26,7 +26,7 @@ const isHiddenPath = (p) => p.split("/").some((seg) => seg.startsWith("."));
 
 function ctx() {
   const c = window.__optiboxFs && window.__optiboxFs.ctx ? window.__optiboxFs.ctx() : {};
-  return { userId: c.userId || "user-a", apiKeys: c.apiKeys || {} };
+  return { userId: c.userId || "user-a" };
 }
 
 async function api(path, body, asBytes) {
@@ -295,7 +295,7 @@ async function uploadBinary(dest, blob) {
   const c = ctx();
   const res = await fetch("/api/fs/upload?" + new URLSearchParams({ userId: c.userId, path: dest }), {
     method: "POST",
-    headers: { "content-type": "application/octet-stream", "x-fs-keys": JSON.stringify(c.apiKeys || {}) },
+    headers: { "content-type": "application/octet-stream" },
     body: blob,
   });
   const json = await res.json().catch(() => ({}));

@@ -83,7 +83,7 @@ export function splitCredentialPatch(patch: AgentCredentialPatch): {
   for (const [id, raw] of Object.entries(patch)) {
     const spec = agentCredentialById(id);
     if (!spec || typeof raw !== "string") continue;
-    const value = spec.multiline ? raw.trim() : raw.trim();
+    const value = raw.trim();
     if (spec.env) providerEnv[spec.env] = value;
     else if (spec.file) agentFiles[spec.file] = value;
   }

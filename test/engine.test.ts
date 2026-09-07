@@ -691,7 +691,7 @@ test("ChatGPT sign-in: a device code, polling until the user finishes, then ~/.c
   engine.dispose();
 });
 
-test("Kimi sign-in: a device code on auth.kimi.com with kimi-cli's headers, polled until approved, then the credential file on the box, renewed before a bring-up", async () => {
+test("Kimi sign-in: a device code on auth.kimi.com with kimi-cli's headers, polled until approved, then the token pair as box env, renewed before a bring-up", async () => {
   const box = new FakeBoxClient();
   const provider = new FakeOAuthProvider();
   provider.kimiExpiresIn = 30; // inside the refresh buffer: the first bring-up renews it
@@ -717,20 +717,17 @@ test("Kimi sign-in: a device code on auth.kimi.com with kimi-cli's headers, poll
   const view = await engine.getUserAgents("ukimi");
   const cred = view.credentials.find((c) => c.id === "kimiSubscription")!;
   assert.equal(cred.connected, true);
-  assert.equal(cred.target, ".kimi/credentials/kimi-code.json");
+  assert.equal(cred.target, "KIMI_CODE_ACCESS_TOKEN");
   assert.doesNotMatch(JSON.stringify(view), /rt-kimi-1/, "the refresh token never leaves the server");
 
   await collect(engine, "ukimi", "ckimi", "hello");
   const boxId = (await engine.activeUserBoxId("ukimi"))!;
-  const file = JSON.parse(box.files.get(`${boxId}:.kimi/credentials/kimi-code.json`)!);
-  assert.equal(file.access_token, "kimi-access-renewed", "the box got the renewed token, not the 30s one");
-  assert.equal(file.refresh_token, "rt-kimi-2");
-  assert.equal(file.scope, "kimi");
-  assert.equal(file.token_type, "Bearer");
-  assert.equal(file.expires_in, 7200);
-  assert.ok(typeof file.expires_at === "number" && file.expires_at > Date.now() / 1000 + 7000, "expires_at is unix seconds");
+  const env = JSON.parse(box.files.get(`${boxId}:create`)!).env;
+  assert.equal(env.KIMI_CODE_ACCESS_TOKEN, "kimi-access-renewed", "the box got the renewed token, not the 30s one");
+  assert.equal(env.KIMI_CODE_REFRESH_TOKEN, "rt-kimi-2");
+  assert.ok(Number(env.KIMI_CODE_TOKEN_EXPIRY) > Date.now() / 1000 + 7000, "expiry is unix seconds");
+  assert.equal(box.files.get(`${boxId}:.kimi/credentials/kimi-code.json`), undefined, "no file: the box writes ~/.kimi-code itself from the env");
   assert.ok(provider.calls.some((c) => c.body.grant_type === "refresh_token" && c.body.refresh_token === "rt-kimi-1"), "the stored refresh token was spent");
-  assert.ok(box.commands.some((c) => c.includes("mkdir -p '.kimi/credentials'")), "parent dir created before the files PUT");
 
   await engine.disconnectSubscription("ukimi", "kimi");
   assert.equal((await engine.getUserAgents("ukimi")).credentials.find((c) => c.id === "kimiSubscription")!.connected, false);

@@ -430,7 +430,6 @@ export class Engine {
           ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
           expiresAt: tokens.expiresAt,
           ...(tokens.accountId ? { accountId: tokens.accountId } : {}),
-          ...(tokens.scope !== undefined ? { scope: tokens.scope, tokenType: tokens.tokenType ?? "", expiresIn: tokens.expiresIn ?? 0 } : {}),
           connectedAt: Date.now(),
         },
       },

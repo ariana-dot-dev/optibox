@@ -217,10 +217,10 @@ const tick = async (times = 1) => { for (let i = 0; i < times; i++) { await new 
 const NOTHING_CONNECTED = [
   { id: "claudeSubscription", label: "Claude Pro/Max", hint: "", kind: "env", target: "CLAUDE_CODE_OAUTH_TOKEN", group: "subscription", oauth: "claude", connected: false, last4: "", detail: "" },
   { id: "codexSubscription", label: "ChatGPT", hint: "", kind: "file", target: ".codex/auth.json", group: "subscription", oauth: "codex", connected: false, last4: "", detail: "" },
-  { id: "kimiSubscription", label: "Kimi", hint: "", kind: "file", target: ".kimi/credentials/kimi-code.json", group: "subscription", oauth: "kimi", connected: false, last4: "", detail: "" },
+  { id: "kimiSubscription", label: "Kimi Code", hint: "", kind: "env", target: "KIMI_CODE_ACCESS_TOKEN", group: "subscription", oauth: "kimi", connected: false, last4: "", detail: "" },
   { id: "anthropicApiKey", label: "Anthropic", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
   { id: "openaiApiKey", label: "OpenAI", hint: "sk-…", kind: "env", target: "OPENAI_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
-  { id: "moonshotApiKey", label: "Moonshot", hint: "sk-…", kind: "env", target: "KIMI_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
+  { id: "moonshotApiKey", label: "Moonshot", hint: "sk-…", kind: "env", target: "MOONSHOT_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
   { id: "openrouterApiKey", label: "OpenRouter", hint: "sk-or-…", kind: "env", target: "OPENROUTER_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
   { id: "llmgatewayApiKey", label: "llmgateway", hint: "llmgtwy_…", kind: "env", target: "LLMGATEWAY_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
 ];
@@ -556,7 +556,7 @@ test("Connect Kimi subscription: the approval link carries the code, polled unti
   await settle(2);
 
   const signin = getElement("agentsSignin");
-  assert.match(signin.innerHTML, /Connect Kimi subscription/, "offered next to Claude and ChatGPT");
+  assert.match(signin.innerHTML, /Connect Kimi Code subscription/, "offered next to Claude and ChatGPT");
   signin.querySelector('[data-connect="kimi"]')!.dispatch("click");
   await settle(3);
   assert.equal(oauthCalls[0]!.params.provider, "kimi");

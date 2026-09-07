@@ -35,10 +35,6 @@ export interface OAuthTokens {
   expiresAt: number;
   /** ChatGPT only: the account id codex needs beside the token. */
   accountId?: string;
-  /** Kimi only: kimi-cli keeps these three in its credential file. */
-  expiresIn?: number;
-  scope?: string;
-  tokenType?: string;
 }
 
 export interface DeviceStart {
@@ -117,21 +113,6 @@ export function codexAuthJson(accessToken: string, accountId: string): string {
     OPENAI_API_KEY: null,
     tokens: { id_token: accessToken, access_token: accessToken, refresh_token: "", account_id: accountId },
     last_refresh: new Date().toISOString(),
-  });
-}
-
-/**
- * The exact JSON kimi-cli keeps in ~/.kimi/credentials/kimi-code.json (its
- * OAuthToken.to_dict). expires_at is unix seconds.
- */
-export function kimiCredentialsJson(tokens: OAuthTokens): string {
-  return JSON.stringify({
-    access_token: tokens.accessToken,
-    refresh_token: tokens.refreshToken ?? "",
-    expires_at: Math.floor(tokens.expiresAt / 1000),
-    scope: tokens.scope ?? "",
-    token_type: tokens.tokenType ?? "",
-    expires_in: tokens.expiresIn ?? 0,
   });
 }
 
@@ -314,9 +295,6 @@ export class OAuthClient {
       accessToken: String(data.access_token),
       ...(data.refresh_token ? { refreshToken: String(data.refresh_token) } : {}),
       expiresAt: Date.now() + expiresIn * 1000,
-      expiresIn,
-      scope: String(data.scope ?? ""),
-      tokenType: String(data.token_type ?? ""),
     };
   }
 

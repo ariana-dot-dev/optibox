@@ -164,7 +164,7 @@ const SETTINGS_KEY='optibox.demo.settings.v1';
 let AGENTS={selection:{},credentials:[],usingOwnKeys:false,envPending:false};
 let selectedReasoning='';
 // The three subscriptions, in the order the panel offers them.
-const SUBSCRIPTIONS=[{id:'claude',label:'Claude subscription'},{id:'codex',label:'ChatGPT subscription'},{id:'kimi',label:'Kimi subscription'}];
+const SUBSCRIPTIONS=[{id:'claude',label:'Claude subscription'},{id:'codex',label:'ChatGPT subscription'},{id:'kimi',label:'Kimi Code subscription'}];
 // A sign-in in progress, per provider: {sessionId,url,userCode,interval,phase}.
 // phase: 'starting' | 'code' (Claude waits for a paste) | 'polling' (ChatGPT and
 // Kimi wait for the user to finish in their browser) | 'connecting'.

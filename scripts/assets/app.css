@@ -218,11 +218,11 @@ html{zoom:1.15;--z:1.15;-webkit-text-size-adjust:100%;text-size-adjust:100%}body
 textarea{width:100%;min-height:116px;max-height:240px;resize:none;border:0;background:var(--fill);color:var(--ink);padding:13px 45px 39px 15px;font:inherit;font-weight:400;outline:none;display:block;border-radius:var(--r-surf)}textarea:focus{background:var(--fill2)}
 /* One row of icon buttons in the box's bottom-right: Agents, attach, mic/send.
    Same size, same quiet ink3, same hover tint; only the accent differs. */
-#agentsOpen,#attach,#mic{position:absolute;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:var(--ink3);border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}
+#agentsOpen,#attach,#mic{position:absolute;bottom:25px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:var(--ink3);border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}
 #agentsOpen svg,#attach svg,#mic svg{width:16px;height:16px;display:block}
 #agentsOpen:hover,#attach:hover{background:var(--fill2);color:var(--ink)}
-#agentsOpen{right:83px}#attach{right:51px}
-#mic{right:19px}#mic:hover{background:var(--red);color:#fff}
+#agentsOpen{right:89px}#attach{right:57px}
+#mic{right:25px}#mic:hover{background:var(--red);color:#fff}
 /* When there's text/attachments to send, swap mic->send; else show mic. */
 .composer.hasText #mic,.composer.recording #mic,.composer.recording #attach,.composer.recording #send,.composer.recording textarea,.composer.recording #agentsOpen{display:none}
 .composer:not(.hasText) #send{display:none}
@@ -253,11 +253,10 @@ textarea{width:100%;min-height:116px;max-height:240px;resize:none;border:0;backg
 .pendingAttach .cardRemove{position:absolute;top:3px;right:3px;width:17px;height:17px;min-height:0;box-sizing:border-box;border-radius:50%;background:rgba(17,17,17,.7);color:#fff;font-size:12px;line-height:1;cursor:pointer;opacity:0;transition:opacity .12s ease;z-index:3;padding:0;display:flex;align-items:center;justify-content:center}
 .pendingAttach .card:hover .cardRemove{opacity:1}.pendingAttach .cardRemove:hover{background:var(--red)}.pendingAttach .cardRemove svg{width:10px;height:10px;display:block}
 button{min-height:42px;border:0;background:var(--ink);color:#fff;padding:0 16px;font:inherit;font-weight:400;cursor:pointer;border-radius:var(--r-obj)}button:disabled{opacity:.5;cursor:not-allowed}
-/* Concentric with the textarea's 16px corner: the corner arc's center sits 16px
-   in from the right/bottom edges, so a circle centered there with r=13 keeps a
-   uniform 3px gap to both straight edges AND the arc. Offsets = composer pad 16
-   + corner R 16 - button r 13 = 19px. */
-#send{position:absolute;right:19px;bottom:19px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:var(--ink3);border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}#send:hover,#send:focus-visible{background:var(--red);color:#fff}#send svg{width:14px;height:14px;display:block}
+/* The icon row keeps a 9px gap (3x the old concentric 3px) to the box's right
+   and bottom edges. Offsets = composer pad 16 + 9 = 25px; siblings step 32px
+   (26px button + 6px gap). */
+#send{position:absolute;right:25px;bottom:25px;width:26px;height:26px;min-height:26px;padding:0;background:transparent;color:var(--ink3);border:0;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:background .15s ease,color .15s ease}#send:hover,#send:focus-visible{background:var(--red);color:#fff}#send svg{width:14px;height:14px;display:block}
 
 /* ---- backend schematic ----------------------------------------------------- */
 .schematic{align-self:center;border:1px solid var(--line);background:#fff;padding:20px;color:var(--ink);border-radius:var(--r-surf)}.schematic h2{font-family:"Funnel Display",Inter,ui-sans-serif,system-ui,sans-serif;font-size:20px;line-height:1.15;letter-spacing:-.02em;margin:0 0 16px;color:var(--ink);font-weight:400}
@@ -332,14 +331,14 @@ textarea{min-height:104px;font-size:16px;padding:12px 39px 36px 13px}/* 16px inp
    composer padding-bottom adds env(safe-area-inset-bottom) on top of its own
    12px, but those buttons kept the unchanged desktop offset — so on any phone
    with a home-indicator gap the buttons sat entirely BELOW the textarea's real
-   bottom edge. Recomputed for the mobile 12px pad (same concentric formula as
-   desktop: pad + corner-radius(16) - button-radius(13) = 15px) and the offset
+   bottom edge. Recomputed for the mobile 12px pad (same 9px edge gap as
+   desktop: pad 12 + 9 = 21px) and the offset
    GROWS by the same safe-area amount the padding grew by, so the button's
    position relative to the textarea stays constant regardless of the device's
    home-indicator height. */
-#agentsOpen{right:calc(79px + env(safe-area-inset-right));bottom:calc(15px + env(safe-area-inset-bottom))}
-#attach{right:calc(47px + env(safe-area-inset-right));bottom:calc(15px + env(safe-area-inset-bottom))}
-#mic,#send{right:calc(15px + env(safe-area-inset-right));bottom:calc(15px + env(safe-area-inset-bottom))}
+#agentsOpen{right:calc(85px + env(safe-area-inset-right));bottom:calc(21px + env(safe-area-inset-bottom))}
+#attach{right:calc(53px + env(safe-area-inset-right));bottom:calc(21px + env(safe-area-inset-bottom))}
+#mic,#send{right:calc(21px + env(safe-area-inset-right));bottom:calc(21px + env(safe-area-inset-bottom))}
 .schematic h2{font-size:18px;margin-bottom:12px}
 .node .nodeTitle{font-size:13px}.node .nodeSub{font-size:11px}
 .composerBar{padding-bottom:calc(12px + env(safe-area-inset-bottom))}

@@ -1,9 +1,11 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { arch, hostname, release, type as osType, version as osVersion } from "node:os";
 
 /**
- * The two consumer sign-ins, ported from the Box product's own backend
- * (backend/src/services/claude-oauth.service.ts, codex-oauth.service.ts) so
- * optibox users connect a subscription exactly the way the Box dashboard does.
+ * The three consumer sign-ins, ported from the Box product's own backend
+ * (backend/src/services/claude-oauth.service.ts, codex-oauth.service.ts,
+ * kimi-oauth.service.ts) so optibox users connect a subscription exactly the
+ * way the Box dashboard does.
  *
  *   Claude Pro/Max  : PKCE. We build an authorize URL on claude.ai; the user
  *                     approves; Anthropic's callback page PRINTS a code; the
@@ -12,16 +14,19 @@ import { createHash, randomBytes } from "node:crypto";
  *                     user types it at auth.openai.com/codex/device; we poll
  *                     until OpenAI hands us an authorization code, then
  *                     exchange that for tokens.
+ *   Kimi (Kimi Code): RFC 8628 device auth on auth.kimi.com, as kimi-cli 1.50
+ *                     does it. The link we get already carries the user code;
+ *                     we poll the token endpoint until it answers with tokens.
  *
- * Both mint an access token that expires and a refresh token. The refresh
+ * All three mint an access token that expires and a refresh token. The refresh
  * token stays server-side and is spent just before the user's box comes up.
  *
  * Everything here is pure transport: no database, no box. `fetch` and the
- * endpoint table are injectable so the suite can drive both flows against a
+ * endpoint table are injectable so the suite can drive every flow against a
  * fake provider.
  */
 
-export type OAuthProvider = "claude" | "codex";
+export type OAuthProvider = "claude" | "codex" | "kimi";
 
 export interface OAuthTokens {
   accessToken: string;
@@ -30,6 +35,10 @@ export interface OAuthTokens {
   expiresAt: number;
   /** ChatGPT only: the account id codex needs beside the token. */
   accountId?: string;
+  /** Kimi only: kimi-cli keeps these three in its credential file. */
+  expiresIn?: number;
+  scope?: string;
+  tokenType?: string;
 }
 
 export interface DeviceStart {
@@ -51,12 +60,17 @@ export interface OAuthEndpoints {
   codexVerify: string;
   codexToken: string;
   codexRedirect: string;
+  kimiDeviceCode: string;
+  kimiToken: string;
 }
 
-/** Public clients of the Claude Code and Codex CLIs; not secrets. */
+/** Public clients of the Claude Code, Codex and Kimi CLIs; not secrets. */
 export const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 export const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+export const KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const CLAUDE_SCOPE = "org:create_api_key user:profile user:inference";
+/** kimi-cli's version string: auth.kimi.com wants the device headers of a known client. */
+const KIMI_CLI_VERSION = "1.50.0";
 
 export const OAUTH_ENDPOINTS: OAuthEndpoints = {
   claudeAuthorize: "https://claude.ai/oauth/authorize",
@@ -67,6 +81,8 @@ export const OAUTH_ENDPOINTS: OAuthEndpoints = {
   codexVerify: "https://auth.openai.com/codex/device",
   codexToken: "https://auth.openai.com/oauth/token",
   codexRedirect: "https://auth.openai.com/deviceauth/callback",
+  kimiDeviceCode: "https://auth.kimi.com/api/oauth/device_authorization",
+  kimiToken: "https://auth.kimi.com/api/oauth/token",
 };
 
 /** Refresh this long before a token actually expires. */
@@ -104,15 +120,36 @@ export function codexAuthJson(accessToken: string, accountId: string): string {
   });
 }
 
+/**
+ * The exact JSON kimi-cli keeps in ~/.kimi/credentials/kimi-code.json (its
+ * OAuthToken.to_dict). expires_at is unix seconds.
+ */
+export function kimiCredentialsJson(tokens: OAuthTokens): string {
+  return JSON.stringify({
+    access_token: tokens.accessToken,
+    refresh_token: tokens.refreshToken ?? "",
+    expires_at: Math.floor(tokens.expiresAt / 1000),
+    scope: tokens.scope ?? "",
+    token_type: tokens.tokenType ?? "",
+    expires_in: tokens.expiresIn ?? 0,
+  });
+}
+
 export class OAuthError extends Error {}
+
+/** Header values must be ASCII (kimi-cli strips everything else). */
+const asciiHeader = (value: string): string => value.replace(/[^\x20-\x7e]/g, "").trim() || "unknown";
 
 export class OAuthClient {
   private readonly fetchImpl: typeof fetch;
   private readonly urls: OAuthEndpoints;
+  /** X-Msh-Device-Id: kimi-cli persists one per install; stable per optibox instance. */
+  private readonly kimiDeviceId: string;
 
-  constructor(opts: { fetch?: typeof fetch; endpoints?: Partial<OAuthEndpoints> } = {}) {
+  constructor(opts: { fetch?: typeof fetch; endpoints?: Partial<OAuthEndpoints>; kimiDeviceId?: string } = {}) {
     this.fetchImpl = opts.fetch ?? ((...args) => fetch(...args));
     this.urls = { ...OAUTH_ENDPOINTS, ...(opts.endpoints ?? {}) };
+    this.kimiDeviceId = opts.kimiDeviceId ?? randomUUID().replace(/-/g, "");
   }
 
   // -------------------------------------------------------------- Claude
@@ -243,6 +280,94 @@ export class OAuthClient {
       expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000,
       ...(accountId ? { accountId } : {}),
     };
+  }
+
+  // -------------------------------------------------------------- Kimi
+
+  /** The device headers every auth.kimi.com call carries (kimi-cli's _common_headers). */
+  kimiHeaders(): Record<string, string> {
+    return {
+      "X-Msh-Platform": "kimi_cli",
+      "X-Msh-Version": KIMI_CLI_VERSION,
+      "X-Msh-Device-Name": asciiHeader(hostname()),
+      "X-Msh-Device-Model": asciiHeader(`${osType()} ${release()} ${arch()}`),
+      "X-Msh-Os-Version": asciiHeader(osVersion()),
+      "X-Msh-Device-Id": this.kimiDeviceId,
+    };
+  }
+
+  private async kimiPost(url: string, body: Record<string, string>): Promise<{ status: number; data: Record<string, unknown> }> {
+    const res = await this.fetchImpl(url, {
+      method: "POST",
+      headers: { ...this.kimiHeaders(), "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(body).toString(),
+    });
+    const text = await res.text();
+    let data: Record<string, unknown> = {};
+    try { const parsed = JSON.parse(text); if (parsed && typeof parsed === "object") data = parsed; } catch { /* not JSON */ }
+    return { status: res.status, data };
+  }
+
+  private kimiTokens(data: Record<string, unknown>): OAuthTokens {
+    const expiresIn = Number(data.expires_in) || 0;
+    return {
+      accessToken: String(data.access_token),
+      ...(data.refresh_token ? { refreshToken: String(data.refresh_token) } : {}),
+      expiresAt: Date.now() + expiresIn * 1000,
+      expiresIn,
+      scope: String(data.scope ?? ""),
+      tokenType: String(data.token_type ?? ""),
+    };
+  }
+
+  /** Step 1: ask auth.kimi.com for a user code and the link that carries it. */
+  async startKimiDevice(): Promise<DeviceStart> {
+    const { status, data } = await this.kimiPost(this.urls.kimiDeviceCode, { client_id: KIMI_CLIENT_ID });
+    if (status !== 200 || !data.device_code || !data.user_code) throw new OAuthError(`Kimi sign-in could not start (${status}).`);
+    return {
+      deviceAuthId: String(data.device_code),
+      userCode: String(data.user_code),
+      verificationUrl: String(data.verification_uri_complete || data.verification_uri || ""),
+      interval: Number(data.interval) || 5,
+    };
+  }
+
+  /**
+   * Step 2, called on a timer: 200 + access_token is done, `expired_token`
+   * means the user must start again, anything else (authorization_pending,
+   * slow_down, a network blip) is pending, exactly like kimi-cli.
+   */
+  async pollKimiDevice(deviceCode: string): Promise<DevicePoll> {
+    let result: { status: number; data: Record<string, unknown> };
+    try {
+      result = await this.kimiPost(this.urls.kimiToken, {
+        client_id: KIMI_CLIENT_ID,
+        device_code: deviceCode,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      });
+    } catch {
+      return { status: "pending" };
+    }
+    if (result.status === 200 && typeof result.data.access_token === "string") return { status: "complete", tokens: this.kimiTokens(result.data) };
+    if (result.data.error === "expired_token") throw new OAuthError("that Kimi sign-in expired before it was approved, start it again");
+    return { status: "pending" };
+  }
+
+  /** 401/403 = signed out (start again); 429/5xx are retried with backoff. */
+  async refreshKimi(refreshToken: string, retryDelayMs = 1000): Promise<OAuthTokens> {
+    let last = "";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { status, data } = await this.kimiPost(this.urls.kimiToken, { client_id: KIMI_CLIENT_ID, grant_type: "refresh_token", refresh_token: refreshToken });
+      if (status === 401 || status === 403) throw new OAuthError("Kimi signed this subscription out. Connect it again.");
+      if (status === 200 && typeof data.access_token === "string") {
+        const next = this.kimiTokens(data);
+        return { ...next, refreshToken: next.refreshToken || refreshToken };
+      }
+      last = String(data.error_description || `HTTP ${status}`);
+      if (![429, 500, 502, 503, 504].includes(status)) break;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, retryDelayMs * 2 ** attempt));
+    }
+    throw new OAuthError(`Kimi token refresh failed (${last}).`);
   }
 }
 

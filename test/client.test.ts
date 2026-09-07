@@ -217,8 +217,10 @@ const tick = async (times = 1) => { for (let i = 0; i < times; i++) { await new 
 const NOTHING_CONNECTED = [
   { id: "claudeSubscription", label: "Claude Pro/Max", hint: "", kind: "env", target: "CLAUDE_CODE_OAUTH_TOKEN", group: "subscription", oauth: "claude", connected: false, last4: "", detail: "" },
   { id: "codexSubscription", label: "ChatGPT", hint: "", kind: "file", target: ".codex/auth.json", group: "subscription", oauth: "codex", connected: false, last4: "", detail: "" },
+  { id: "kimiSubscription", label: "Kimi", hint: "", kind: "file", target: ".kimi/credentials/kimi-code.json", group: "subscription", oauth: "kimi", connected: false, last4: "", detail: "" },
   { id: "anthropicApiKey", label: "Anthropic", hint: "sk-ant-…", kind: "env", target: "ANTHROPIC_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
   { id: "openaiApiKey", label: "OpenAI", hint: "sk-…", kind: "env", target: "OPENAI_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
+  { id: "moonshotApiKey", label: "Moonshot", hint: "sk-…", kind: "env", target: "KIMI_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
   { id: "openrouterApiKey", label: "OpenRouter", hint: "sk-or-…", kind: "env", target: "OPENROUTER_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
   { id: "llmgatewayApiKey", label: "llmgateway", hint: "llmgtwy_…", kind: "env", target: "LLMGATEWAY_API_KEY", group: "key", oauth: "", connected: false, last4: "", detail: "" },
 ];
@@ -537,6 +539,36 @@ test("Connect ChatGPT subscription: a user code to type, polled until the box ha
   assert.match(signin.innerHTML, /account ····ad94/, "the connected row names the account the backend returned");
   assert.match(signin.innerHTML, /data-disconnect="codex"/);
   assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applies at next start");
+});
+
+test("Connect Kimi subscription: the approval link carries the code, polled until the box has it", async () => {
+  let polls = 0;
+  const { getElement, oauthCalls } = bootClient({
+    now: 8_500_000,
+    uuid: () => "turn-kimi-oauth",
+    agents: { ok: true, selection: {}, usingOwnKeys: false, envPending: false, credentials: NOTHING_CONNECTED },
+    onOAuth: (step) => {
+      if (step === "start") return { ok: true, sessionId: "sess-k", url: "https://auth.kimi.com/device?user_code=KIMI-4321", userCode: "KIMI-4321", interval: 0 };
+      if (++polls < 2) return { ok: true, status: "pending" };
+      return { ok: true, status: "connected", applied: "now", selection: {}, usingOwnKeys: true, envPending: false, credentials: withConnected("kimiSubscription") };
+    },
+  });
+  await settle(2);
+
+  const signin = getElement("agentsSignin");
+  assert.match(signin.innerHTML, /Connect Kimi subscription/, "offered next to Claude and ChatGPT");
+  signin.querySelector('[data-connect="kimi"]')!.dispatch("click");
+  await settle(3);
+  assert.equal(oauthCalls[0]!.params.provider, "kimi");
+  assert.match(signin.innerHTML, /KIMI-4321/, "the code the user confirms is on screen");
+  assert.match(signin.innerHTML, /href="https:\/\/auth\.kimi\.com\/device\?user_code=KIMI-4321"/, "the link carries the code");
+  assert.match(signin.innerHTML, /data-cancel="kimi"/);
+
+  await tick(4);
+  assert.deepEqual(oauthCalls.map((c) => c.step), ["start", "status", "status"], "polling stops the moment it connects");
+  assert.equal(oauthCalls[1]!.params.sessionId, "sess-k");
+  assert.match(signin.innerHTML, /data-disconnect="kimi"/);
+  assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applied now");
 });
 
 test("a connected subscription can be disconnected, and the status line falls back to the app's keys", async () => {

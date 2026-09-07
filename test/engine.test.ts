@@ -573,6 +573,8 @@ const FAKE_OAUTH: OAuthEndpoints = {
   codexVerify: "https://fake-openai.test/codex/device",
   codexToken: "https://fake-openai.test/oauth/token",
   codexRedirect: "https://fake-openai.test/deviceauth/callback",
+  kimiDeviceCode: "https://fake-kimi.test/api/oauth/device_authorization",
+  kimiToken: "https://fake-kimi.test/api/oauth/token",
 };
 
 /** An OpenAI access token is a JWT whose payload names the ChatGPT account. */
@@ -580,24 +582,37 @@ const chatGptJwt = (account: string): string =>
   `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: account } })).toString("base64url")}.sig`;
 
 class FakeOAuthProvider {
-  calls: Array<{ url: string; body: Record<string, string> }> = [];
+  calls: Array<{ url: string; body: Record<string, string>; headers: Record<string, string> }> = [];
   /** How many polls the user takes before approving the device code. */
   pollsBeforeApproval = 1;
   claudeExpiresIn = 3600;
+  kimiExpiresIn = 3600;
   private polls = 0;
   readonly client = new OAuthClient({
     endpoints: FAKE_OAUTH,
-    fetch: ((input: unknown, init: { body?: string }) => this.handle(String(input), init)) as unknown as typeof fetch,
+    kimiDeviceId: "device-fixed-id",
+    fetch: ((input: unknown, init: { body?: string; headers?: Record<string, string> }) => this.handle(String(input), init)) as unknown as typeof fetch,
   });
 
-  private reply(body: unknown) {
-    return { ok: true, status: 200, statusText: "OK", text: async () => JSON.stringify(body) };
+  private reply(body: unknown, status = 200) {
+    return { ok: status < 300, status, statusText: "OK", text: async () => JSON.stringify(body) };
   }
 
-  private async handle(url: string, init: { body?: string }) {
+  private async handle(url: string, init: { body?: string; headers?: Record<string, string> }) {
     const raw = String(init?.body ?? "");
     const body: Record<string, string> = raw.startsWith("{") ? JSON.parse(raw) : Object.fromEntries(new URLSearchParams(raw));
-    this.calls.push({ url, body });
+    this.calls.push({ url, body, headers: { ...(init?.headers ?? {}) } });
+    if (url === FAKE_OAUTH.kimiDeviceCode) {
+      return this.reply({ user_code: "KIMI-4321", device_code: "kimi-dev-1", verification_uri: "https://fake-kimi.test/device", verification_uri_complete: "https://fake-kimi.test/device?user_code=KIMI-4321", expires_in: 300, interval: 5 });
+    }
+    if (url === FAKE_OAUTH.kimiToken && body.grant_type === "urn:ietf:params:oauth:grant-type:device_code") {
+      return ++this.polls > this.pollsBeforeApproval
+        ? this.reply({ access_token: "kimi-access-1", refresh_token: "rt-kimi-1", expires_in: this.kimiExpiresIn, scope: "kimi", token_type: "Bearer" })
+        : this.reply({ error: "authorization_pending", error_description: "waiting" }, 400);
+    }
+    if (url === FAKE_OAUTH.kimiToken && body.grant_type === "refresh_token") {
+      return this.reply({ access_token: "kimi-access-renewed", refresh_token: "rt-kimi-2", expires_in: 7200, scope: "kimi", token_type: "Bearer" });
+    }
     if (url === FAKE_OAUTH.claudeToken) {
       const renewing = body.grant_type === "refresh_token";
       return this.reply({
@@ -673,6 +688,52 @@ test("ChatGPT sign-in: a device code, polling until the user finishes, then ~/.c
   assert.equal(auth.auth_mode, "chatgpt", "codex authenticates from this file and nothing else");
   assert.equal(auth.tokens.account_id, "acct-90210");
   assert.equal(JSON.parse(box.files.get(`${boxId}:create`)!).env.CHATGPT_ACCOUNT_ID, "acct-90210");
+  engine.dispose();
+});
+
+test("Kimi sign-in: a device code on auth.kimi.com with kimi-cli's headers, polled until approved, then the credential file on the box, renewed before a bring-up", async () => {
+  const box = new FakeBoxClient();
+  const provider = new FakeOAuthProvider();
+  provider.kimiExpiresIn = 30; // inside the refresh buffer: the first bring-up renews it
+  const engine = makeEngine(box, { oauth: provider.client });
+
+  const start = await engine.startAgentOAuth("ukimi", "kimi");
+  assert.equal(start.userCode, "KIMI-4321");
+  assert.equal(start.url, "https://fake-kimi.test/device?user_code=KIMI-4321", "the link already carries the code");
+  assert.equal(start.interval, 5);
+  const deviceCall = provider.calls[0]!;
+  assert.deepEqual(deviceCall.body, { client_id: "17e5f671-d194-4dfb-9706-5516cb48c098" }, "form body, public client, no scope");
+  assert.equal(deviceCall.headers["X-Msh-Platform"], "kimi_cli");
+  assert.equal(deviceCall.headers["X-Msh-Version"], "1.50.0");
+  assert.equal(deviceCall.headers["X-Msh-Device-Id"], "device-fixed-id");
+  assert.equal(deviceCall.headers["content-type"], "application/x-www-form-urlencoded");
+
+  assert.deepEqual(await engine.completeAgentOAuth("ukimi", start.sessionId), { status: "pending" });
+  const done = await engine.completeAgentOAuth("ukimi", start.sessionId);
+  assert.equal(done.status, "connected");
+  const poll = provider.calls.find((c) => c.body.grant_type === "urn:ietf:params:oauth:grant-type:device_code")!;
+  assert.equal(poll.body.device_code, "kimi-dev-1");
+
+  const view = await engine.getUserAgents("ukimi");
+  const cred = view.credentials.find((c) => c.id === "kimiSubscription")!;
+  assert.equal(cred.connected, true);
+  assert.equal(cred.target, ".kimi/credentials/kimi-code.json");
+  assert.doesNotMatch(JSON.stringify(view), /rt-kimi-1/, "the refresh token never leaves the server");
+
+  await collect(engine, "ukimi", "ckimi", "hello");
+  const boxId = (await engine.activeUserBoxId("ukimi"))!;
+  const file = JSON.parse(box.files.get(`${boxId}:.kimi/credentials/kimi-code.json`)!);
+  assert.equal(file.access_token, "kimi-access-renewed", "the box got the renewed token, not the 30s one");
+  assert.equal(file.refresh_token, "rt-kimi-2");
+  assert.equal(file.scope, "kimi");
+  assert.equal(file.token_type, "Bearer");
+  assert.equal(file.expires_in, 7200);
+  assert.ok(typeof file.expires_at === "number" && file.expires_at > Date.now() / 1000 + 7000, "expires_at is unix seconds");
+  assert.ok(provider.calls.some((c) => c.body.grant_type === "refresh_token" && c.body.refresh_token === "rt-kimi-1"), "the stored refresh token was spent");
+  assert.ok(box.commands.some((c) => c.includes("mkdir -p '.kimi/credentials'")), "parent dir created before the files PUT");
+
+  await engine.disconnectSubscription("ukimi", "kimi");
+  assert.equal((await engine.getUserAgents("ukimi")).credentials.find((c) => c.id === "kimiSubscription")!.connected, false);
   engine.dispose();
 });
 

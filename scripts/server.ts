@@ -934,6 +934,7 @@ const server = http.createServer(async (req, res) => {
     //   POST /api/agents/oauth/start     {userId, provider}
     //        -> claude: {sessionId, url}                (approve, copy the code)
     //        -> codex:  {sessionId, url, userCode, interval}
+    //        -> kimi:   {sessionId, url, userCode, interval}  (url carries the code)
     //   POST /api/agents/oauth/complete  {userId, sessionId, code?}
     //        -> {status:"pending"} until it is done, then the fresh Agents view
     //   GET  /api/agents/oauth/status?userId=&sessionId=   (the codex poll)
@@ -956,7 +957,7 @@ const server = http.createServer(async (req, res) => {
         const step = url.pathname.slice("/api/agents/oauth/".length);
         if (step === "start") {
           const provider = param("provider");
-          if (provider !== "claude" && provider !== "codex") return void json(400, { ok: false, message: "provider must be claude or codex" });
+          if (provider !== "claude" && provider !== "codex" && provider !== "kimi") return void json(400, { ok: false, message: "provider must be claude, codex or kimi" });
           fsLog({ route: "agents.oauth.start", userId, provider });
           return void json(200, { ok: true, ...(await engine().startAgentOAuth(userId, provider)) });
         }
@@ -968,7 +969,7 @@ const server = http.createServer(async (req, res) => {
         }
         if (step === "disconnect") {
           const provider = param("provider");
-          if (provider !== "claude" && provider !== "codex") return void json(400, { ok: false, message: "provider must be claude or codex" });
+          if (provider !== "claude" && provider !== "codex" && provider !== "kimi") return void json(400, { ok: false, message: "provider must be claude, codex or kimi" });
           const result = await engine().disconnectSubscription(userId, provider, applyOpts);
           fsLog({ route: "agents.oauth.disconnect", userId, provider, applied: result.applied });
           return void json(200, { ok: true, applied: result.applied, message: appliedMessage(result.applied), ...(await engine().getUserAgents(userId)) });

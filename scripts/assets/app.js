@@ -163,12 +163,12 @@ if(typeof window!=='undefined')window.optiboxDropdown=dropdown;
 const SETTINGS_KEY='optibox.demo.settings.v1';
 let AGENTS={selection:{},credentials:[],usingOwnKeys:false,envPending:false};
 let selectedReasoning='';
-// The two subscriptions, in the order the panel offers them.
-const SUBSCRIPTIONS=[{id:'claude',label:'Claude subscription'},{id:'codex',label:'ChatGPT subscription'}];
+// The three subscriptions, in the order the panel offers them.
+const SUBSCRIPTIONS=[{id:'claude',label:'Claude subscription'},{id:'codex',label:'ChatGPT subscription'},{id:'kimi',label:'Kimi subscription'}];
 // A sign-in in progress, per provider: {sessionId,url,userCode,interval,phase}.
-// phase: 'starting' | 'code' (Claude waits for a paste) | 'polling' (ChatGPT
-// waits for the user to finish in their browser) | 'connecting'.
-let OAUTH={claude:null,codex:null};
+// phase: 'starting' | 'code' (Claude waits for a paste) | 'polling' (ChatGPT and
+// Kimi wait for the user to finish in their browser) | 'connecting'.
+let OAUTH={claude:null,codex:null,kimi:null};
 // Keys the user pressed Clear on: sent as "" on the next Save.
 let clearedCreds={};
 function readSettings(){try{return JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}')||{};}catch{return {};}}
@@ -227,10 +227,10 @@ function renderSettingsControls(){
   renderCredentialFields();
   updateSettingsStatus();
 }
-// ---- Sign in: the two subscriptions, connected the way the Box dashboard does
-// it. Claude prints a code the user pastes back; ChatGPT shows a short code the
-// user types in their browser while we poll. Both apply to the user's own box
-// the moment they land, through the same route a typed key takes.
+// ---- Sign in: the subscriptions, connected the way the Box dashboard does it.
+// Claude prints a code the user pastes back; ChatGPT and Kimi show a short code
+// the user confirms in their browser while we poll. All apply to the user's own
+// box the moment they land, through the same route a typed key takes.
 function renderSignin(){
   const wrap=$('agentsSignin');if(!wrap)return;
   wrap.innerHTML=SUBSCRIPTIONS.map(function(p){
@@ -255,10 +255,11 @@ function renderSignin(){
         +'<span class="signHint">Approve on that page, then paste the code it shows.</span>'
         +'<button type="button" class="linkBtn" data-cancel="claude">Cancel</button></div>';
     }
+    // Kimi's link already carries the code; the user only confirms it there.
     return head
-      +'<p class="signUserCode" data-usercode="codex">'+esc(flow.userCode||'')+'</p>'
-      +'<span class="signHint">Type that code on the page. This finishes on its own.</span>'
-      +'<button type="button" class="linkBtn" data-cancel="codex">Cancel</button></div>';
+      +'<p class="signUserCode" data-usercode="'+esc(p.id)+'">'+esc(flow.userCode||'')+'</p>'
+      +'<span class="signHint">'+(p.id==='kimi'?'Confirm that code on the page. This finishes on its own.':'Type that code on the page. This finishes on its own.')+'</span>'
+      +'<button type="button" class="linkBtn" data-cancel="'+esc(p.id)+'">Cancel</button></div>';
   }).join('');
   if(!wrap.querySelectorAll)return;
   wrap.querySelectorAll('[data-connect]').forEach(b=>b.addEventListener('click',()=>startSignin(b.getAttribute('data-connect'))));
@@ -282,7 +283,7 @@ async function startSignin(provider){
       interval:typeof r.interval==='number'?r.interval:5,phase:provider==='claude'?'code':'polling'};
     renderSignin();
     openExternal(r.url);
-    if(provider==='codex')pollSignin(provider);
+    if(provider!=='claude')pollSignin(provider);
   }catch(e){OAUTH[provider]=null;renderSignin();updateSettingsStatus('Could not start the sign-in: '+errText(e));}
 }
 /** Both flows land here once the provider hands back tokens. */
@@ -307,7 +308,7 @@ async function submitSigninCode(provider){
     await signinConnected(provider,r);
   }catch(e){if(OAUTH[provider])OAUTH[provider].phase='code';renderSignin();updateSettingsStatus('Could not connect: '+errText(e));}
 }
-/** ChatGPT: ask the server on the provider's own cadence until it is done. */
+/** ChatGPT and Kimi: ask the server on the provider's own cadence until it is done. */
 function pollSignin(provider){
   const flow=OAUTH[provider];
   if(!flow||flow.phase!=='polling')return;

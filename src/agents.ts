@@ -1,4 +1,4 @@
-import { codexAuthJson, type OAuthProvider, type OAuthTokens } from "./oauth.js";
+import { codexAuthJson, kimiCredentialsJson, type OAuthProvider, type OAuthTokens } from "./oauth.js";
 
 /**
  * The Agents setup a USER owns on their own machine: which harness/model runs
@@ -14,6 +14,8 @@ import { codexAuthJson, type OAuthProvider, type OAuthTokens } from "./oauth.js"
  *          ONLY from CLAUDE_CODE_OAUTH_TOKEN).
  *   file - a Codex ChatGPT subscription, which is the contents of
  *          ~/.codex/auth.json; codex resolves that path itself, nothing else.
+ *          A Kimi subscription likewise: ~/.kimi/credentials/kimi-code.json,
+ *          the file kimi-cli's own /login writes.
  *
  * A credential is either signed in to (`oauth`) or typed in (an API key). The
  * panel groups them that way: subscriptions first, keys behind a fold.
@@ -37,8 +39,10 @@ export interface AgentCredentialSpec {
 export const AGENT_CREDENTIALS: AgentCredentialSpec[] = [
   { id: "claudeSubscription", label: "Claude Pro/Max", hint: "", env: "CLAUDE_CODE_OAUTH_TOKEN", oauth: "claude", group: "subscription" },
   { id: "codexSubscription", label: "ChatGPT", hint: "", file: ".codex/auth.json", oauth: "codex", group: "subscription" },
+  { id: "kimiSubscription", label: "Kimi", hint: "", file: ".kimi/credentials/kimi-code.json", oauth: "kimi", group: "subscription" },
   { id: "anthropicApiKey", label: "Anthropic", hint: "sk-ant-…", env: "ANTHROPIC_API_KEY", group: "key" },
   { id: "openaiApiKey", label: "OpenAI", hint: "sk-…", env: "OPENAI_API_KEY", group: "key" },
+  { id: "moonshotApiKey", label: "Moonshot", hint: "sk-…", env: "KIMI_API_KEY", group: "key" },
   { id: "openrouterApiKey", label: "OpenRouter", hint: "sk-or-…", env: "OPENROUTER_API_KEY", group: "key" },
   { id: "llmgatewayApiKey", label: "llmgateway", hint: "llmgtwy_…", env: "LLMGATEWAY_API_KEY", group: "key" },
 ];
@@ -68,6 +72,10 @@ export interface AgentOAuthRecord {
   expiresAt?: number;
   /** ChatGPT only. */
   accountId?: string;
+  /** Kimi only: kept so a refresh rewrites the credential file faithfully. */
+  scope?: string;
+  tokenType?: string;
+  expiresIn?: number;
   connectedAt?: number;
 }
 export type AgentOAuthState = Partial<Record<OAuthProvider, AgentOAuthRecord>>;
@@ -81,7 +89,7 @@ export interface AgentCredentialState {
   /** Env var name or home-relative file path this credential lands as. */
   target: string;
   group: "subscription" | "key";
-  /** "claude" / "codex" for the sign-in credentials, "" for typed keys. */
+  /** "claude" / "codex" / "kimi" for the sign-in credentials, "" for typed keys. */
   oauth: string;
   connected: boolean;
   /** Last 4 characters of the stored value; "" when not connected. */
@@ -125,7 +133,8 @@ export function splitCredentialPatch(patch: AgentCredentialPatch): {
  * Claude Code authenticates from CLAUDE_CODE_OAUTH_TOKEN. Codex authenticates
  * from ~/.codex/auth.json and nothing else, so the token is written as that
  * file; CHATGPT_ACCOUNT_ID rides along because the box's own bring-up helper
- * reads it when it rewrites the file.
+ * reads it when it rewrites the file. Kimi authenticates from the credential
+ * file its own /login writes.
  */
 export function subscriptionCredentials(provider: OAuthProvider, tokens: OAuthTokens): {
   providerEnv: Record<string, string>;
@@ -133,6 +142,9 @@ export function subscriptionCredentials(provider: OAuthProvider, tokens: OAuthTo
 } {
   if (provider === "claude") {
     return { providerEnv: { CLAUDE_CODE_OAUTH_TOKEN: tokens.accessToken }, agentFiles: {} };
+  }
+  if (provider === "kimi") {
+    return { providerEnv: {}, agentFiles: { ".kimi/credentials/kimi-code.json": kimiCredentialsJson(tokens) } };
   }
   const accountId = tokens.accountId ?? "";
   return {
@@ -146,9 +158,9 @@ export function subscriptionClear(provider: OAuthProvider): {
   providerEnv: Record<string, string>;
   agentFiles: Record<string, string>;
 } {
-  return provider === "claude"
-    ? { providerEnv: { CLAUDE_CODE_OAUTH_TOKEN: "" }, agentFiles: {} }
-    : { providerEnv: { CHATGPT_ACCOUNT_ID: "" }, agentFiles: { ".codex/auth.json": "" } };
+  if (provider === "claude") return { providerEnv: { CLAUDE_CODE_OAUTH_TOKEN: "" }, agentFiles: {} };
+  if (provider === "kimi") return { providerEnv: {}, agentFiles: { ".kimi/credentials/kimi-code.json": "" } };
+  return { providerEnv: { CHATGPT_ACCOUNT_ID: "" }, agentFiles: { ".codex/auth.json": "" } };
 }
 
 /** The read-only view of what a user has connected. Secrets never leave here. */

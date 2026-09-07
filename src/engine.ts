@@ -1,10 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Db } from "./db.js";
 import {
   AGENT_CREDENTIALS, agentCredentialStates, applyPatch, sameMap, subscriptionClear, subscriptionCredentials, subscriptionSpec,
   type AgentOAuthState, type UserAgentSelection, type UserAgentsView,
 } from "./agents.js";
-import { OAuthClient, tokenIsStale, type OAuthProvider, type OAuthTokens } from "./oauth.js";
+import { OAuthClient, tokenIsStale, type DevicePoll, type OAuthProvider, type OAuthTokens } from "./oauth.js";
 import { buildHiddenContext, BOX_PRICE_USD_PER_SECOND, BOX_PRICING } from "./context.js";
 import { boxRules, boxTurnPrompt, directProviderStream, sharedPrompt, type SharedStream } from "./shared.js";
 import type { BoxClient, BoxEvent, BoxInfo, ConsumerTurnEvent, ConsumerTurnEventBody, ConsumerTurnInput, HarnessSelection, TranscriptMessage } from "./types.js";
@@ -60,11 +60,11 @@ export interface EngineOptions {
 export interface AgentOAuthStart {
   sessionId: string;
   provider: OAuthProvider;
-  /** Claude: the page the user approves. ChatGPT: where the user types the code. */
+  /** Claude: the page the user approves. ChatGPT: where the user types the code. Kimi: the approval link, code included. */
   url: string;
-  /** ChatGPT only: the short code the user types. */
+  /** ChatGPT and Kimi: the short code the user confirms. */
   userCode?: string;
-  /** ChatGPT only: seconds between polls. */
+  /** ChatGPT and Kimi: seconds between polls. */
   interval?: number;
 }
 
@@ -173,7 +173,8 @@ export class Engine {
     this.opts = opts;
     this.db = opts.db;
     this.box = opts.box;
-    this.oauth = opts.oauth ?? new OAuthClient();
+    // Kimi wants a stable device id per client; one per optibox instance, never per process.
+    this.oauth = opts.oauth ?? new OAuthClient({ kimiDeviceId: createHash("sha256").update(`kimi-device:${opts.instanceId}:${opts.credHash}`).digest("hex").slice(0, 32) });
     if (!opts.sharedStream && !opts.sharedModel && !opts.sharedModelForEnv) throw new Error("Engine requires sharedModel (\"<provider>/<model>\") or sharedStream");
     const ms = opts.sweepIntervalMs ?? 5_000;
     if (ms > 0) {
@@ -235,7 +236,7 @@ export class Engine {
     let agentFiles = row.agentFiles;
     const oauth: AgentOAuthState = { ...row.oauth };
     let changed = false;
-    for (const provider of ["claude", "codex"] as OAuthProvider[]) {
+    for (const provider of ["claude", "codex", "kimi"] as OAuthProvider[]) {
       const record = oauth[provider];
       const spec = subscriptionSpec(provider);
       const live = spec.env ? providerEnv[spec.env] : agentFiles[spec.file as string];
@@ -243,7 +244,9 @@ export class Engine {
       try {
         const tokens = provider === "claude"
           ? await this.oauth.refreshClaude(record.refreshToken)
-          : await this.oauth.refreshCodex(record.refreshToken);
+          : provider === "kimi"
+            ? await this.oauth.refreshKimi(record.refreshToken)
+            : await this.oauth.refreshCodex(record.refreshToken);
         const accountId = tokens.accountId ?? record.accountId;
         const next = subscriptionCredentials(provider, { ...tokens, ...(accountId ? { accountId } : {}) });
         providerEnv = applyPatch(providerEnv, next.providerEnv);
@@ -353,9 +356,9 @@ export class Engine {
   // ------------------------------------------------- subscription sign-ins
 
   /**
-   * Step 1 of a sign-in. Claude hands back a page to approve; ChatGPT hands
-   * back a short code and the page to type it into. Either way the session id
-   * is what the browser carries into step 2.
+   * Step 1 of a sign-in. Claude hands back a page to approve; ChatGPT and Kimi
+   * hand back a short code and the page to confirm it on. Either way the
+   * session id is what the browser carries into step 2.
    */
   async startAgentOAuth(userId: string, provider: OAuthProvider): Promise<AgentOAuthStart> {
     const now = Date.now();
@@ -367,16 +370,17 @@ export class Engine {
       this.oauthSessions.set(sessionId, { provider, userId, verifier, expiresAt });
       return { sessionId, provider, url };
     }
-    const device = await this.oauth.startCodexDevice();
+    const device = provider === "kimi" ? await this.oauth.startKimiDevice() : await this.oauth.startCodexDevice();
     this.oauthSessions.set(sessionId, { provider, userId, deviceAuthId: device.deviceAuthId, userCode: device.userCode, expiresAt });
     return { sessionId, provider, url: device.verificationUrl, userCode: device.userCode, interval: device.interval };
   }
 
   /**
-   * Step 2. Claude needs the code the user pasted; ChatGPT needs nothing and
-   * is called on a timer until it stops answering "pending". Connecting
-   * applies the subscription to the user's box through the SAME path a typed
-   * key takes, so a live box restarts on it and a parked one picks it up next.
+   * Step 2. Claude needs the code the user pasted; ChatGPT and Kimi need
+   * nothing and are called on a timer until they stop answering "pending".
+   * Connecting applies the subscription to the user's box through the SAME
+   * path a typed key takes, so a live box restarts on it and a parked one
+   * picks it up next.
    */
   async completeAgentOAuth(
     userId: string,
@@ -396,10 +400,19 @@ export class Engine {
       this.oauthSessions.delete(sessionId);
       return this.connectSubscription(userId, "claude", tokens, opts);
     }
-    const poll = await this.oauth.pollCodexDevice(session.deviceAuthId as string, session.userCode as string);
+    let poll: DevicePoll;
+    try {
+      poll = session.provider === "kimi"
+        ? await this.oauth.pollKimiDevice(session.deviceAuthId as string)
+        : await this.oauth.pollCodexDevice(session.deviceAuthId as string, session.userCode as string);
+    } catch (e) {
+      // An expired device code is final: drop the session so the browser starts a fresh one.
+      this.oauthSessions.delete(sessionId);
+      throw e;
+    }
     if (poll.status === "pending") return { status: "pending" };
     this.oauthSessions.delete(sessionId);
-    return this.connectSubscription(userId, "codex", poll.tokens, opts);
+    return this.connectSubscription(userId, session.provider, poll.tokens, opts);
   }
 
   private async connectSubscription(
@@ -417,6 +430,7 @@ export class Engine {
           ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
           expiresAt: tokens.expiresAt,
           ...(tokens.accountId ? { accountId: tokens.accountId } : {}),
+          ...(tokens.scope !== undefined ? { scope: tokens.scope, tokenType: tokens.tokenType ?? "", expiresIn: tokens.expiresIn ?? 0 } : {}),
           connectedAt: Date.now(),
         },
       },

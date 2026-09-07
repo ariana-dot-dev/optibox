@@ -819,7 +819,7 @@ export class Engine {
       // held back while it could still complete, so no partial ever leaks.
       const msgs = new Map<string, { text: string; flushed: number; index: number }>();
       const seenUses = new Set<string>(), seenResults = new Set<string>();
-      let sawEnd = false, cursor: string | undefined, polls = 0, done = false;
+      let sawEnd = false, cursor: string | undefined, polls = 0, done = false, harnessError = "";
       const onTool = (tool: { use?: { id?: string; name?: string; input?: unknown }; result?: { tool_use_id?: string; content?: unknown; is_error?: boolean } }) => {
         const use = tool.use;
         if (use && !seenUses.has(String(use.id))) {
@@ -863,6 +863,8 @@ export class Engine {
             if (typeof d.content === "string" && d.content) onText(String(e.id).replace(/-tools$/, ""), d.content);
             if (Array.isArray(d.tools)) for (const t of d.tools) onTool(t as Parameters<typeof onTool>[0]);
           } else if (e.type === "prompt" && ["finished", "failed", "interrupted"].includes(String(d.status))) {
+            // A failed run carries the harness's own reason (missing key, bad model): keep it for the user.
+            if (d.status === "failed" && typeof d.error === "string" && d.error) harnessError = d.error.trim().slice(0, 400);
             done = true;
           }
         }
@@ -891,7 +893,7 @@ export class Engine {
       if (sawEnd || !visible && msgs.size > 0 && [...msgs.values()].every((m) => /^\s*<end>\s*$/.test(m.text))) return { outcome: "silent", text: "" };
       if (!visible) {
         // Rule 6 binding clause: no text and no <end> is LOUD, never silence.
-        return { outcome: "blocked", text: "", diagnostic: `harness ended with no answer and no <end> (tools used: ${seenUses.size})`, blockedEmitted: false };
+        return { outcome: "blocked", text: "", diagnostic: harnessError ? `the agent could not run: ${harnessError}` : `harness ended with no answer and no <end> (tools used: ${seenUses.size})`, blockedEmitted: false };
       }
       await this.db.q(
         `insert into transcripts(user_key, conversation_id, role, content, mode, scenario_id) values($1,$2,'assistant',$3,'box',$4)`,

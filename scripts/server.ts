@@ -141,6 +141,11 @@ function providerEnvFromProcess(): Record<string, string> {
   return env;
 }
 
+/** The one sentence every credential change answers with. */
+function appliedMessage(applied: "now" | "next-start" | "none"): string {
+  return applied === "now" ? "applied now" : applied === "next-start" ? "applies at next start" : "saved";
+}
+
 function envForProvider(provider: string): string {
   if (provider === "anthropic") return "ANTHROPIC_API_KEY";
   if (provider === "openrouter") return "OPENROUTER_API_KEY";
@@ -915,15 +920,62 @@ const server = http.createServer(async (req, res) => {
           { providerEnv, agentFiles, selection },
           { ...(typeof body.conversationId === "string" && body.conversationId ? { conversationId: body.conversationId } : {}) },
         );
-        const message = result.applied === "now"
-          ? "applied to your box now"
-          : result.applied === "next-start"
-            ? "applies when your box next starts"
-            : "saved";
-        return void json(200, { ok: true, applied: result.applied, message, ...(await engine().getUserAgents(userId)) });
+        return void json(200, { ok: true, applied: result.applied, message: appliedMessage(result.applied), ...(await engine().getUserAgents(userId)) });
       } catch (e) {
         fsLog({ route: "agents.save", userId, status: 502, error: e instanceof Error ? e.message : String(e) });
         return void json(502, { ok: false, message: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Connecting a SUBSCRIPTION, the same way the Box dashboard does it.
+    //   POST /api/agents/oauth/start     {userId, provider}
+    //        -> claude: {sessionId, url}                (approve, copy the code)
+    //        -> codex:  {sessionId, url, userCode, interval}
+    //   POST /api/agents/oauth/complete  {userId, sessionId, code?}
+    //        -> {status:"pending"} until it is done, then the fresh Agents view
+    //   GET  /api/agents/oauth/status?userId=&sessionId=   (the codex poll)
+    //   POST /api/agents/oauth/disconnect{userId, provider}
+    // The credential lands on the user's box exactly like a typed key.
+    // ---------------------------------------------------------------------
+    if (url.pathname.startsWith("/api/agents/oauth/")) {
+      const isGet = req.method === "GET";
+      const body = isGet ? {} : await readBody(req, 100_000);
+      const param = (name: string): string =>
+        String((isGet ? url.searchParams.get(name) : (body as Record<string, unknown>)[name]) ?? "");
+      const userId = param("userId") || "user-a";
+      const conversationId = param("conversationId");
+      const json = (status: number, payload: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      const applyOpts = conversationId ? { conversationId } : {};
+      try {
+        const step = url.pathname.slice("/api/agents/oauth/".length);
+        if (step === "start") {
+          const provider = param("provider");
+          if (provider !== "claude" && provider !== "codex") return void json(400, { ok: false, message: "provider must be claude or codex" });
+          fsLog({ route: "agents.oauth.start", userId, provider });
+          return void json(200, { ok: true, ...(await engine().startAgentOAuth(userId, provider)) });
+        }
+        if (step === "complete" || step === "status") {
+          const result = await engine().completeAgentOAuth(userId, param("sessionId"), param("code"), applyOpts);
+          if (result.status === "pending") return void json(200, { ok: true, status: "pending" });
+          fsLog({ route: "agents.oauth.connected", userId, applied: result.applied });
+          return void json(200, { ok: true, status: "connected", applied: result.applied, message: appliedMessage(result.applied), ...(await engine().getUserAgents(userId)) });
+        }
+        if (step === "disconnect") {
+          const provider = param("provider");
+          if (provider !== "claude" && provider !== "codex") return void json(400, { ok: false, message: "provider must be claude or codex" });
+          const result = await engine().disconnectSubscription(userId, provider, applyOpts);
+          fsLog({ route: "agents.oauth.disconnect", userId, provider, applied: result.applied });
+          return void json(200, { ok: true, applied: result.applied, message: appliedMessage(result.applied), ...(await engine().getUserAgents(userId)) });
+        }
+        return void json(404, { ok: false, message: "unknown oauth step" });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        fsLog({ route: "agents.oauth", userId, status: 502, error: message });
+        return void json(502, { ok: false, message });
       }
     }
 

@@ -3,6 +3,7 @@ import { after, before, test } from "node:test";
 import { Client } from "pg";
 import { openDb, type Db } from "../src/db.js";
 import { Engine } from "../src/engine.js";
+import { OAuthClient, type OAuthEndpoints } from "../src/oauth.js";
 import type { BoxClient, BoxEvent, BoxInfo, CommandResult, HarnessSelection, PromptRun } from "../src/types.js";
 
 /**
@@ -555,6 +556,160 @@ test("getUserAgents reports what is connected and NEVER the secret", async () =>
   // Clearing a field with "" disconnects it.
   await engine.setUserAgents("usec", { providerEnv: { ANTHROPIC_API_KEY: "" } });
   assert.equal((await engine.getUserAgents("usec")).credentials.find((c) => c.id === "anthropicApiKey")!.connected, false);
+  engine.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// Subscription sign-ins. A fake Anthropic/OpenAI answers the token endpoints,
+// so both flows run end to end without touching the real providers.
+// ---------------------------------------------------------------------------
+
+const FAKE_OAUTH: OAuthEndpoints = {
+  claudeAuthorize: "https://fake-anthropic.test/oauth/authorize",
+  claudeToken: "https://fake-anthropic.test/v1/oauth/token",
+  claudeRedirect: "https://fake-anthropic.test/oauth/code/callback",
+  codexDeviceCode: "https://fake-openai.test/deviceauth/usercode",
+  codexDeviceToken: "https://fake-openai.test/deviceauth/token",
+  codexVerify: "https://fake-openai.test/codex/device",
+  codexToken: "https://fake-openai.test/oauth/token",
+  codexRedirect: "https://fake-openai.test/deviceauth/callback",
+};
+
+/** An OpenAI access token is a JWT whose payload names the ChatGPT account. */
+const chatGptJwt = (account: string): string =>
+  `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: account } })).toString("base64url")}.sig`;
+
+class FakeOAuthProvider {
+  calls: Array<{ url: string; body: Record<string, string> }> = [];
+  /** How many polls the user takes before approving the device code. */
+  pollsBeforeApproval = 1;
+  claudeExpiresIn = 3600;
+  private polls = 0;
+  readonly client = new OAuthClient({
+    endpoints: FAKE_OAUTH,
+    fetch: ((input: unknown, init: { body?: string }) => this.handle(String(input), init)) as unknown as typeof fetch,
+  });
+
+  private reply(body: unknown) {
+    return { ok: true, status: 200, statusText: "OK", text: async () => JSON.stringify(body) };
+  }
+
+  private async handle(url: string, init: { body?: string }) {
+    const raw = String(init?.body ?? "");
+    const body: Record<string, string> = raw.startsWith("{") ? JSON.parse(raw) : Object.fromEntries(new URLSearchParams(raw));
+    this.calls.push({ url, body });
+    if (url === FAKE_OAUTH.claudeToken) {
+      const renewing = body.grant_type === "refresh_token";
+      return this.reply({
+        access_token: renewing ? "sk-ant-oat01-renewed" : "sk-ant-oat01-first",
+        refresh_token: renewing ? "rt-claude-2" : "rt-claude-1",
+        expires_in: this.claudeExpiresIn,
+        token_type: "Bearer",
+      });
+    }
+    if (url === FAKE_OAUTH.codexDeviceCode) return this.reply({ device_auth_id: "dev-1", user_code: "ABCD-EFGH", interval: "5" });
+    if (url === FAKE_OAUTH.codexDeviceToken) {
+      return ++this.polls > this.pollsBeforeApproval
+        ? this.reply({ authorization_code: "auth-code-1", code_verifier: "verifier-1" })
+        : this.reply({ status: "pending" });
+    }
+    if (url === FAKE_OAUTH.codexToken) return this.reply({ access_token: chatGptJwt("acct-90210"), refresh_token: "rt-codex-1", expires_in: 3600, token_type: "Bearer" });
+    throw new Error(`unexpected oauth call ${url}`);
+  }
+}
+
+test("Claude sign-in: the user approves a PKCE URL, pastes the code, and their box runs on the token", async () => {
+  const box = new FakeBoxClient();
+  const provider = new FakeOAuthProvider();
+  const engine = makeEngine(box, { oauth: provider.client });
+
+  const start = await engine.startAgentOAuth("uclaude", "claude");
+  const url = new URL(start.url);
+  assert.equal(`${url.origin}${url.pathname}`, FAKE_OAUTH.claudeAuthorize);
+  assert.equal(url.searchParams.get("code_challenge_method"), "S256");
+  assert.ok(url.searchParams.get("code_challenge"), "PKCE challenge is in the URL");
+  assert.equal(url.searchParams.get("redirect_uri"), FAKE_OAUTH.claudeRedirect);
+
+  const done = await engine.completeAgentOAuth("uclaude", start.sessionId, "pasted-code#state-x");
+  assert.equal(done.status, "connected");
+  assert.equal(done.status === "connected" && done.applied, "next-start", "no machine yet: the token rides the create call");
+  const exchange = provider.calls.find((c) => c.body.grant_type === "authorization_code")!;
+  assert.equal(exchange.body.code, "pasted-code", "a pasted 'code#state' is split the way Anthropic prints it");
+  assert.ok(exchange.body.code_verifier, "the PKCE verifier goes back with the code");
+
+  const view = await engine.getUserAgents("uclaude");
+  assert.equal(view.credentials.find((c) => c.id === "claudeSubscription")!.connected, true);
+  assert.equal(view.credentials.find((c) => c.id === "claudeSubscription")!.last4, "irst");
+  assert.doesNotMatch(JSON.stringify(view), /rt-claude-1/, "the refresh token never leaves the server");
+
+  await collect(engine, "uclaude", "cclaude", "hello");
+  const boxId = (await engine.activeUserBoxId("uclaude"))!;
+  assert.deepEqual(JSON.parse(box.files.get(`${boxId}:create`)!).env, { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-first" });
+  engine.dispose();
+});
+
+test("ChatGPT sign-in: a device code, polling until the user finishes, then ~/.codex/auth.json on the box", async () => {
+  const box = new FakeBoxClient();
+  const provider = new FakeOAuthProvider();
+  const engine = makeEngine(box, { oauth: provider.client });
+
+  const start = await engine.startAgentOAuth("ucodex", "codex");
+  assert.equal(start.userCode, "ABCD-EFGH");
+  assert.equal(start.url, FAKE_OAUTH.codexVerify, "the page the user types the code into");
+  assert.equal(start.interval, 5, "the provider's own polling cadence");
+
+  assert.deepEqual(await engine.completeAgentOAuth("ucodex", start.sessionId), { status: "pending" });
+  const done = await engine.completeAgentOAuth("ucodex", start.sessionId);
+  assert.equal(done.status, "connected");
+
+  const view = await engine.getUserAgents("ucodex");
+  const cred = view.credentials.find((c) => c.id === "codexSubscription")!;
+  assert.equal(cred.connected, true);
+  assert.equal(cred.detail, "account ····0210", "the panel can name the connected account");
+
+  await collect(engine, "ucodex", "ccodex", "hello");
+  const boxId = (await engine.activeUserBoxId("ucodex"))!;
+  const auth = JSON.parse(box.files.get(`${boxId}:.codex/auth.json`)!);
+  assert.equal(auth.auth_mode, "chatgpt", "codex authenticates from this file and nothing else");
+  assert.equal(auth.tokens.account_id, "acct-90210");
+  assert.equal(JSON.parse(box.files.get(`${boxId}:create`)!).env.CHATGPT_ACCOUNT_ID, "acct-90210");
+  engine.dispose();
+});
+
+test("a subscription token close to expiry is renewed before the box comes up", async () => {
+  const box = new FakeBoxClient();
+  const provider = new FakeOAuthProvider();
+  provider.claudeExpiresIn = 30; // inside the 2-minute refresh buffer
+  const engine = makeEngine(box, { oauth: provider.client });
+
+  const start = await engine.startAgentOAuth("uref", "claude");
+  await engine.completeAgentOAuth("uref", start.sessionId, "code-1");
+  await collect(engine, "uref", "cref", "hello");
+
+  const boxId = (await engine.activeUserBoxId("uref"))!;
+  assert.equal(JSON.parse(box.files.get(`${boxId}:create`)!).env.CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-oat01-renewed", "the box started on the renewed token");
+  assert.ok(provider.calls.some((c) => c.body.grant_type === "refresh_token" && c.body.refresh_token === "rt-claude-1"), "the stored refresh token was spent");
+  engine.dispose();
+});
+
+test("disconnecting a subscription clears what it put on the box and its refresh token", async () => {
+  const box = new FakeBoxClient();
+  const provider = new FakeOAuthProvider();
+  provider.pollsBeforeApproval = 0;
+  const engine = makeEngine(box, { oauth: provider.client });
+
+  await assert.rejects(engine.completeAgentOAuth("udis", "no-such-session"), /expired/, "a stale session id is refused");
+
+  const start = await engine.startAgentOAuth("udis", "codex");
+  assert.equal((await engine.completeAgentOAuth("udis", start.sessionId)).status, "connected");
+  await engine.disconnectSubscription("udis", "codex");
+
+  const view = await engine.getUserAgents("udis");
+  assert.equal(view.credentials.find((c) => c.id === "codexSubscription")!.connected, false);
+  assert.equal(view.usingOwnKeys, false, "nothing of the user's is left on the box");
+
+  await collect(engine, "udis", "cdis", "hello");
+  assert.equal(provider.calls.filter((c) => c.body.grant_type === "refresh_token").length, 0, "nothing left to refresh");
   engine.dispose();
 });
 

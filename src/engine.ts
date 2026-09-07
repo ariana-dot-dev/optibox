@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "./db.js";
-import { agentCredentialStates, applyPatch, sameMap, type UserAgentSelection, type UserAgentsView } from "./agents.js";
+import {
+  AGENT_CREDENTIALS, agentCredentialStates, applyPatch, sameMap, subscriptionClear, subscriptionCredentials, subscriptionSpec,
+  type AgentOAuthState, type UserAgentSelection, type UserAgentsView,
+} from "./agents.js";
+import { OAuthClient, tokenIsStale, type OAuthProvider, type OAuthTokens } from "./oauth.js";
 import { buildHiddenContext, BOX_PRICE_USD_PER_SECOND, BOX_PRICING } from "./context.js";
 import { boxRules, boxTurnPrompt, directProviderStream, sharedPrompt, type SharedStream } from "./shared.js";
 import type { BoxClient, BoxEvent, BoxInfo, ConsumerTurnEvent, ConsumerTurnEventBody, ConsumerTurnInput, HarnessSelection, TranscriptMessage } from "./types.js";
@@ -48,7 +52,25 @@ export interface EngineOptions {
   eventPollMs?: number;
   /** Parallel scenarios: the shared model may fan a turn into N conversations on the user's Box. */
   scenariosEnabled?: boolean;
+  /** The subscription sign-ins. Injectable so the suite can drive a fake provider. */
+  oauth?: OAuthClient;
 }
+
+/** What the browser needs to walk the user through one sign-in. */
+export interface AgentOAuthStart {
+  sessionId: string;
+  provider: OAuthProvider;
+  /** Claude: the page the user approves. ChatGPT: where the user types the code. */
+  url: string;
+  /** ChatGPT only: the short code the user types. */
+  userCode?: string;
+  /** ChatGPT only: seconds between polls. */
+  interval?: number;
+}
+
+export type AgentOAuthResult =
+  | { status: "pending" }
+  | { status: "connected"; applied: "now" | "next-start" | "none"; boxId?: string };
 
 type EventBody = ConsumerTurnEventBody;
 
@@ -121,7 +143,20 @@ interface UserAgentsRow {
   agentFiles: Record<string, string>;
   selection: UserAgentSelection;
   envPending: boolean;
+  /** Refresh tokens of the connected subscriptions; never reaches the box. */
+  oauth: AgentOAuthState;
 }
+
+/** One sign-in the user has started but not finished. Lives for 10 minutes. */
+interface OAuthSession {
+  provider: OAuthProvider;
+  userId: string;
+  verifier?: string;
+  deviceAuthId?: string;
+  userCode?: string;
+  expiresAt: number;
+}
+const OAUTH_SESSION_TTL_MS = 10 * 60_000;
 
 export class Engine {
   private readonly db: Db;
@@ -130,11 +165,15 @@ export class Engine {
   private sweeper: ReturnType<typeof setInterval> | undefined;
   /** In-process abort registry: aborting drops the shared stream and interrupts the box conversation. */
   private readonly turnAborts = new Map<string, AbortController>();
+  private readonly oauth: OAuthClient;
+  /** Sign-ins in flight. Short-lived by design: an abandoned one just expires. */
+  private readonly oauthSessions = new Map<string, OAuthSession>();
 
   constructor(opts: EngineOptions) {
     this.opts = opts;
     this.db = opts.db;
     this.box = opts.box;
+    this.oauth = opts.oauth ?? new OAuthClient();
     if (!opts.sharedStream && !opts.sharedModel && !opts.sharedModelForEnv) throw new Error("Engine requires sharedModel (\"<provider>/<model>\") or sharedStream");
     const ms = opts.sweepIntervalMs ?? 5_000;
     if (ms > 0) {
@@ -161,21 +200,68 @@ export class Engine {
    * nothing. Reads never write, so this is safe on every turn.
    */
   private async userAgentsRow(userId: string): Promise<UserAgentsRow> {
-    const row = await this.db.one<{ provider_env: Record<string, string> | null; agent_files: Record<string, string> | null; agent_selection: UserAgentSelection | null; env_pending: boolean | null }>(
-      `select provider_env, agent_files, agent_selection, env_pending from users where key=$1`, [this.userKey(userId)],
+    const row = await this.db.one<{ provider_env: Record<string, string> | null; agent_files: Record<string, string> | null; agent_selection: UserAgentSelection | null; env_pending: boolean | null; agent_oauth: AgentOAuthState | null }>(
+      `select provider_env, agent_files, agent_selection, env_pending, agent_oauth from users where key=$1`, [this.userKey(userId)],
     );
     return {
       providerEnv: row?.provider_env ?? {},
       agentFiles: row?.agent_files ?? {},
       selection: row?.agent_selection ?? {},
       envPending: Boolean(row?.env_pending),
+      oauth: row?.agent_oauth ?? {},
     };
   }
 
-  /** The environment the user's box runs on: their keys when they have any, else the server's. */
+  /**
+   * The environment the user's box runs on: their keys when they have any, else
+   * the server's. Every bring-up goes through here, which is exactly where an
+   * expiring subscription token is renewed, so a box never starts on a dead one.
+   */
   async userProviderEnv(userId: string): Promise<Record<string, string>> {
+    await this.refreshSubscriptions(userId);
     const own = (await this.userAgentsRow(userId)).providerEnv;
     return Object.keys(own).length ? { ...own } : { ...(this.opts.providerEnv ?? {}) };
+  }
+
+  /**
+   * Spend a stored refresh token for any subscription whose access token is
+   * about to expire, and write the new one back where the box reads it. A
+   * failure is silent on purpose: the old token stays and the harness reports
+   * the expiry itself, which beats blocking the machine from starting.
+   */
+  private async refreshSubscriptions(userId: string): Promise<void> {
+    const row = await this.userAgentsRow(userId);
+    let providerEnv = row.providerEnv;
+    let agentFiles = row.agentFiles;
+    const oauth: AgentOAuthState = { ...row.oauth };
+    let changed = false;
+    for (const provider of ["claude", "codex"] as OAuthProvider[]) {
+      const record = oauth[provider];
+      const spec = subscriptionSpec(provider);
+      const live = spec.env ? providerEnv[spec.env] : agentFiles[spec.file as string];
+      if (!record?.refreshToken || !live || !tokenIsStale(record.expiresAt)) continue;
+      try {
+        const tokens = provider === "claude"
+          ? await this.oauth.refreshClaude(record.refreshToken)
+          : await this.oauth.refreshCodex(record.refreshToken);
+        const accountId = tokens.accountId ?? record.accountId;
+        const next = subscriptionCredentials(provider, { ...tokens, ...(accountId ? { accountId } : {}) });
+        providerEnv = applyPatch(providerEnv, next.providerEnv);
+        agentFiles = applyPatch(agentFiles, next.agentFiles);
+        oauth[provider] = {
+          ...record,
+          ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
+          expiresAt: tokens.expiresAt,
+          ...(accountId ? { accountId } : {}),
+        };
+        changed = true;
+      } catch { /* keep what we have; the harness will report the expiry */ }
+    }
+    if (!changed) return;
+    await this.db.q(
+      `update users set provider_env=$2, agent_files=$3, agent_oauth=$4 where key=$1`,
+      [this.userKey(userId), JSON.stringify(providerEnv), JSON.stringify(agentFiles), JSON.stringify(oauth)],
+    );
   }
 
   /** What the settings panel shows: selection + which credentials are connected. NEVER a secret. */
@@ -183,7 +269,7 @@ export class Engine {
     const row = await this.userAgentsRow(userId);
     return {
       selection: row.selection,
-      credentials: agentCredentialStates(row.providerEnv, row.agentFiles),
+      credentials: agentCredentialStates(row.providerEnv, row.agentFiles, row.oauth),
       usingOwnKeys: Object.keys(row.providerEnv).length > 0 || Object.keys(row.agentFiles).length > 0,
       envPending: row.envPending,
     };
@@ -204,7 +290,7 @@ export class Engine {
    */
   async setUserAgents(
     userId: string,
-    patch: { providerEnv?: Record<string, string>; agentFiles?: Record<string, string>; selection?: UserAgentSelection },
+    patch: { providerEnv?: Record<string, string>; agentFiles?: Record<string, string>; selection?: UserAgentSelection; oauth?: AgentOAuthState },
     opts: { conversationId?: string } = {},
   ): Promise<{ applied: "now" | "next-start" | "none"; boxId?: string }> {
     const key = this.userKey(userId);
@@ -217,10 +303,19 @@ export class Engine {
       if (typeof v !== "string") continue;
       if (v) (selection as Record<string, string>)[k] = v; else delete (selection as Record<string, string>)[k];
     }
+    // The refresh half of a subscription follows its access token: connect
+    // stores it, and a credential that is no longer on the box loses it, so
+    // "Disconnect" through any path leaves nothing behind.
+    const oauth: AgentOAuthState = { ...before.oauth, ...(patch.oauth ?? {}) };
+    for (const spec of AGENT_CREDENTIALS) {
+      if (!spec.oauth) continue;
+      const value = spec.env ? providerEnv[spec.env] : agentFiles[spec.file as string];
+      if (!value) delete oauth[spec.oauth];
+    }
     const credentialsChanged = !sameMap(providerEnv, before.providerEnv) || !sameMap(agentFiles, before.agentFiles);
     await this.db.q(
-      `update users set provider_env=$2, agent_selection=$4, agent_files=$3 where key=$1`,
-      [key, JSON.stringify(providerEnv), JSON.stringify(agentFiles), JSON.stringify(selection)],
+      `update users set provider_env=$2, agent_selection=$4, agent_files=$3, agent_oauth=$5 where key=$1`,
+      [key, JSON.stringify(providerEnv), JSON.stringify(agentFiles), JSON.stringify(selection), JSON.stringify(oauth)],
     );
     if (!credentialsChanged) return { applied: "none" };
 
@@ -253,6 +348,89 @@ export class Engine {
       }
       return { applied: "now", boxId: row.id };
     });
+  }
+
+  // ------------------------------------------------- subscription sign-ins
+
+  /**
+   * Step 1 of a sign-in. Claude hands back a page to approve; ChatGPT hands
+   * back a short code and the page to type it into. Either way the session id
+   * is what the browser carries into step 2.
+   */
+  async startAgentOAuth(userId: string, provider: OAuthProvider): Promise<AgentOAuthStart> {
+    const now = Date.now();
+    for (const [id, s] of this.oauthSessions) if (s.expiresAt <= now) this.oauthSessions.delete(id);
+    const sessionId = randomUUID();
+    const expiresAt = now + OAUTH_SESSION_TTL_MS;
+    if (provider === "claude") {
+      const { url, verifier } = this.oauth.startClaude();
+      this.oauthSessions.set(sessionId, { provider, userId, verifier, expiresAt });
+      return { sessionId, provider, url };
+    }
+    const device = await this.oauth.startCodexDevice();
+    this.oauthSessions.set(sessionId, { provider, userId, deviceAuthId: device.deviceAuthId, userCode: device.userCode, expiresAt });
+    return { sessionId, provider, url: device.verificationUrl, userCode: device.userCode, interval: device.interval };
+  }
+
+  /**
+   * Step 2. Claude needs the code the user pasted; ChatGPT needs nothing and
+   * is called on a timer until it stops answering "pending". Connecting
+   * applies the subscription to the user's box through the SAME path a typed
+   * key takes, so a live box restarts on it and a parked one picks it up next.
+   */
+  async completeAgentOAuth(
+    userId: string,
+    sessionId: string,
+    code?: string,
+    opts: { conversationId?: string } = {},
+  ): Promise<AgentOAuthResult> {
+    const session = this.oauthSessions.get(sessionId);
+    if (!session || session.userId !== userId || session.expiresAt <= Date.now()) {
+      this.oauthSessions.delete(sessionId);
+      throw new Error("that sign-in expired, start it again");
+    }
+    if (session.provider === "claude") {
+      const pasted = (code ?? "").trim();
+      if (!pasted) return { status: "pending" };
+      const tokens = await this.oauth.exchangeClaude(pasted, session.verifier as string);
+      this.oauthSessions.delete(sessionId);
+      return this.connectSubscription(userId, "claude", tokens, opts);
+    }
+    const poll = await this.oauth.pollCodexDevice(session.deviceAuthId as string, session.userCode as string);
+    if (poll.status === "pending") return { status: "pending" };
+    this.oauthSessions.delete(sessionId);
+    return this.connectSubscription(userId, "codex", poll.tokens, opts);
+  }
+
+  private async connectSubscription(
+    userId: string,
+    provider: OAuthProvider,
+    tokens: OAuthTokens,
+    opts: { conversationId?: string },
+  ): Promise<AgentOAuthResult> {
+    const creds = subscriptionCredentials(provider, tokens);
+    const applied = await this.setUserAgents(userId, {
+      providerEnv: creds.providerEnv,
+      agentFiles: creds.agentFiles,
+      oauth: {
+        [provider]: {
+          ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
+          expiresAt: tokens.expiresAt,
+          ...(tokens.accountId ? { accountId: tokens.accountId } : {}),
+          connectedAt: Date.now(),
+        },
+      },
+    }, opts);
+    return { status: "connected", ...applied };
+  }
+
+  /** Disconnect: everything the subscription put on the box, and its refresh token. */
+  async disconnectSubscription(
+    userId: string,
+    provider: OAuthProvider,
+    opts: { conversationId?: string } = {},
+  ): Promise<{ applied: "now" | "next-start" | "none"; boxId?: string }> {
+    return this.setUserAgents(userId, subscriptionClear(provider), opts);
   }
 
   /**

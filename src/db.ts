@@ -29,6 +29,11 @@ alter table users add column if not exists provider_env jsonb not null default '
 alter table users add column if not exists agent_files jsonb not null default '{}';
 alter table users add column if not exists agent_selection jsonb not null default '{}';
 alter table users add column if not exists env_pending boolean not null default false;
+-- agent_oauth: the half of a connected subscription the box never sees, per
+-- provider ({"claude":{"refreshToken":…,"expiresAt":…}}). The access token
+-- itself lives in provider_env / agent_files because that is what the box runs
+-- on; the refresh token stays here and is spent just before a bring-up.
+alter table users add column if not exists agent_oauth jsonb not null default '{}';
 create table if not exists boxes (
   id text primary key,
   user_key text not null,

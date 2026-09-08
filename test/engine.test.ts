@@ -774,6 +774,28 @@ test("a subscription token close to expiry is renewed before the box comes up", 
   engine.dispose();
 });
 
+test("the INSTANT answer also renews an expiring subscription, not just the box", async () => {
+  // A Kimi access token lives 15 minutes. The bridge used the stored one as-is, so once it went
+  // stale the fast answer failed and the user watched nothing until the box turn finished.
+  const box = new FakeBoxClient();
+  const provider = new FakeOAuthProvider();
+  provider.pollsBeforeApproval = 0;
+  provider.kimiExpiresIn = 30; // inside the refresh buffer
+  const seen: string[] = [];
+  const engine = makeEngine(box, {
+    oauth: provider.client,
+    sharedStream: undefined,
+    sharedModelForEnv: (env: Record<string, string>) => { seen.push(env.KIMI_CODE_ACCESS_TOKEN ?? ""); return "kimi/k3"; },
+    directStreamFactory: undefined,
+  } as never);
+  const start = await engine.startAgentOAuth("ubridge", "kimi");
+  assert.equal((await engine.completeAgentOAuth("ubridge", start.sessionId)).status, "connected");
+  await collect(engine, "ubridge", "cbridge", "hello").catch(() => undefined);
+  assert.ok(seen.length > 0, "the bridge picked a model from the env");
+  assert.equal(seen[0], "kimi-access-renewed", "the bridge ran on the renewed token, not the 30s one");
+  engine.dispose();
+});
+
 test("disconnecting a subscription clears what it put on the box and its refresh token", async () => {
   const box = new FakeBoxClient();
   const provider = new FakeOAuthProvider();

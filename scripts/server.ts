@@ -70,12 +70,14 @@ const allowServerKeys =
 // `name` is the id every route speaks; `label` is the CLI's own display name
 // (p.cli.name from GET /api/provider-models), which is what the panel shows.
 interface HarnessInfo { name: string; label: string; description: string; models: Array<{ provider: string; model: string; label: string; keyAvailable: boolean; requiredEnv: string; unlockedBy: string[]; reasoningEffort?: string[] }> }
-const CREDENTIAL_ENV: Record<string, string> = { "anthropic-api-key": "ANTHROPIC_API_KEY", "openai-api-key": "OPENAI_API_KEY", "openrouter-api-key": "OPENROUTER_API_KEY" };
+// A model whose credential is missing here is dropped, and a harness whose models all drop
+// disappears from the picker: Kimi Code was invisible until its two credentials were listed.
+const CREDENTIAL_ENV: Record<string, string> = { "anthropic-api-key": "ANTHROPIC_API_KEY", "openai-api-key": "OPENAI_API_KEY", "openrouter-api-key": "OPENROUTER_API_KEY", "moonshot-api-key": "MOONSHOT_API_KEY", "kimi-subscription": "KIMI_CODE_ACCESS_TOKEN" };
 const HARNESS_ENV: Record<string, string> = { "claude-code": "ANTHROPIC_API_KEY", codex: "OPENAI_API_KEY" };
 const PROVIDER_OF_ENV: Record<string, string> = { ANTHROPIC_API_KEY: "anthropic", OPENAI_API_KEY: "openai", OPENROUTER_API_KEY: "openrouter" };
 // A subscription unlocks the same harness its API key does: Claude Code also
 // runs on CLAUDE_CODE_OAUTH_TOKEN, codex also on a ~/.codex/auth.json file.
-const HARNESS_ALT_UNLOCKS: Record<string, string[]> = { "claude-code": ["CLAUDE_CODE_OAUTH_TOKEN"], codex: [".codex/auth.json"] };
+const HARNESS_ALT_UNLOCKS: Record<string, string[]> = { "claude-code": ["CLAUDE_CODE_OAUTH_TOKEN"], codex: [".codex/auth.json"], kimi: ["KIMI_CODE_ACCESS_TOKEN", "MOONSHOT_API_KEY"] };
 let catalogCache: { at: number; harnesses: HarnessInfo[] } | undefined;
 /** `unlocks` holds every env var name and secret-file path the viewer has. */
 async function harnessCatalog(unlocks: Set<string>): Promise<HarnessInfo[]> {

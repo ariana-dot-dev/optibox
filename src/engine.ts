@@ -478,9 +478,15 @@ export class Engine {
     };
   }
 
-  /** The bridge runs on the user's own keys when they have them, the server's otherwise. */
+  /**
+   * The bridge runs on the user's own keys when they have them, the server's otherwise.
+   * It renews an expiring subscription first, exactly as a box bring-up does: a Kimi access
+   * token lives 15 minutes, and a stale one made the instant answer fail so the user waited
+   * the box's full turn with nothing on screen.
+   */
   private async sharedStreamFor(userId: string): Promise<SharedStream> {
     if (this.opts.sharedStream) return this.opts.sharedStream;
+    await this.refreshSubscriptions(userId);
     const env = { ...(this.opts.providerEnv ?? {}), ...(await this.userAgentsRow(userId)).providerEnv };
     const model = this.opts.sharedModelForEnv?.(env) ?? (this.opts.sharedModel as string);
     return directProviderStream(env, model);
@@ -1038,10 +1044,15 @@ export class Engine {
         msgs.set(id, m);
         m.text = content;
         if (content.trim() === "<end>") { sawEnd = true; return; }
-        const hold = content.match(/(<end>\s*)+$|<(e(n(d)?)?)?$/)?.[0].length ?? 0;
-        const flushTo = content.length - hold;
+        // What the user sees never contains the sentinel, wherever the model put it: Kimi opens
+        // with it and answers anyway, and holding only a TRAILING one let "<end>I'm Kimi..."
+        // reach the screen. `flushed` counts characters of this cleaned text, so the tail hold
+        // (a sentinel still being typed) is measured on it too.
+        const clean = content.replace(/<end>/g, "");
+        const hold = clean.match(/<(e(n(d)?)?)?$/)?.[0].length ?? 0;
+        const flushTo = clean.length - hold;
         if (flushTo > m.flushed) {
-          push({ type: "user-box.delta", text: content.slice(m.flushed, flushTo), boxId: box.id, harness, model, messageId: id, messageIndex: m.index });
+          push({ type: "user-box.delta", text: clean.slice(m.flushed, flushTo), boxId: box.id, harness, model, messageId: id, messageIndex: m.index });
           m.flushed = flushTo;
         }
       };
@@ -1076,8 +1087,10 @@ export class Engine {
       // Stream over: a held tail is either the sentinel (drop) or a partial that never completed (flush).
       const visibleParts: string[] = [];
       for (const [id, m] of msgs) {
-        const rawVisible = m.text.replace(/(<end>\s*)+$/, "");
-        if (!sawEnd && rawVisible.length > m.flushed) push({ type: "user-box.delta", text: m.text.slice(m.flushed, rawVisible.length), boxId: box.id, harness, model, messageId: id, messageIndex: m.index });
+        // The sentinel is stripped WHEREVER it lands, not only at the end: Kimi opens with it
+        // and then answers anyway, and "<end>I'm Kimi..." reached the user's screen.
+        const rawVisible = m.text.replace(/<end>/g, "");
+        if (!sawEnd && rawVisible.length > m.flushed) push({ type: "user-box.delta", text: rawVisible.slice(m.flushed), boxId: box.id, harness, model, messageId: id, messageIndex: m.index });
         if (rawVisible.trim()) visibleParts.push(rawVisible.trim());
       }
       const visible = visibleParts.join("\n\n");

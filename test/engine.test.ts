@@ -251,6 +251,17 @@ test("rule 6: a silent harness is FINE when the shared surface already answered 
   engine.dispose();
 });
 
+test("the <end> sentinel never reaches the user, even when the model types it FIRST", async () => {
+  // Kimi opens with the sentinel and then answers anyway; "<end>I am Kimi..." was reaching the screen.
+  const box = new FakeBoxClient({ frames: [{ id: "m1", text: "<end>I am Kimi, and here is the answer." }] });
+  const engine = makeEngine(box);
+  const events = await collect(engine, "uend", "cend", "who are you?");
+  const shown = visibleText(events);
+  assert.ok(!shown.includes("<end>"), `sentinel leaked: ${JSON.stringify(shown)}`);
+  assert.ok(shown.includes("I am Kimi"), "the real answer still shows");
+  engine.dispose();
+});
+
 test("tool calls stream as harness.tool events; a `host` command becomes a hosting row with provenance", async () => {
   const tools = [{ use: { id: "t1", name: "Bash", input: { command: "setsid nohup host 8080 --public > h.log 2>&1 &", description: "expose" } }, result: { tool_use_id: "t1", content: "started" } }];
   const box = new FakeBoxClient({ frames: [{ id: "m1", text: "", tools }, { id: "m2", text: "Hosted at https://x.on.ascii.dev" }] });

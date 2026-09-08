@@ -99,10 +99,21 @@ export function directProviderStream(providerEnv: Record<string, string>, modelS
       body = JSON.stringify({ model: modelID, stream: true, max_tokens: 2048, messages });
       delta = (j) => (j?.type === "content_block_delta" && j?.delta?.type === "text_delta" ? String(j.delta.text ?? "") : "");
     } else {
-      const openrouter = providerID === "openrouter";
-      const key = openrouter ? providerEnv.OPENROUTER_API_KEY : providerEnv.OPENAI_API_KEY;
-      if (!key) throw new Error(`shared stream: ${openrouter ? "OPENROUTER_API_KEY" : "OPENAI_API_KEY"} is not set`);
-      url = openrouter ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
+      // Everything else is OpenAI-shaped chat completions; only the host and the key differ.
+      // Kimi Code (the subscription) and Moonshot (the platform key) are here so a user who
+      // connected only Kimi gets their OWN agent on the shared surface too, instead of the
+      // app's fallback model introducing itself as Claude (09-08).
+      const OPENAI_SHAPED: Record<string, { url: string; env: string }> = {
+        openrouter: { url: "https://openrouter.ai/api/v1/chat/completions", env: "OPENROUTER_API_KEY" },
+        openai: { url: "https://api.openai.com/v1/chat/completions", env: "OPENAI_API_KEY" },
+        kimi: { url: "https://api.kimi.com/coding/v1/chat/completions", env: "KIMI_CODE_ACCESS_TOKEN" },
+        moonshot: { url: "https://api.moonshot.ai/v1/chat/completions", env: "MOONSHOT_API_KEY" },
+      };
+      const spec = OPENAI_SHAPED[providerID];
+      if (!spec) throw new Error(`shared stream: unknown provider ${providerID}`);
+      const key = providerEnv[spec.env];
+      if (!key) throw new Error(`shared stream: ${spec.env} is not set`);
+      url = spec.url;
       headers = { "content-type": "application/json", authorization: "Bearer " + key };
       body = JSON.stringify({ model: modelID, stream: true, messages });
       delta = (j) => String(j?.choices?.[0]?.delta?.content ?? "");

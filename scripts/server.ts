@@ -109,8 +109,15 @@ async function unlocksFor(userId: string | undefined): Promise<Set<string>> {
   return unlocks;
 }
 
-/** The shared bridge model: the fastest small model the configured keys can reach. */
+/**
+ * The shared bridge model. The user's OWN credentials come first: the env handed here is the
+ * server's keys with the user's merged on top, and only a user can hold a Kimi credential, so
+ * reaching for those first is what makes the instant answer come from the agent they connected
+ * rather than from the app's fallback. Server-key users keep the fastest small model as before.
+ */
 function sharedModelFor(providerEnv: Record<string, string>): string {
+  if (providerEnv.KIMI_CODE_ACCESS_TOKEN) return "kimi/k3";
+  if (providerEnv.MOONSHOT_API_KEY) return "moonshot/kimi-k3";
   if (providerEnv.OPENROUTER_API_KEY) return "openrouter/anthropic/claude-haiku-4.5";
   if (providerEnv.ANTHROPIC_API_KEY) return "anthropic/claude-haiku-4-5";
   return "openai/gpt-4.1-mini";

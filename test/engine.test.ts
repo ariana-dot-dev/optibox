@@ -230,11 +230,24 @@ test("distinct assistant messages keep their native ids", async () => {
   engine.dispose();
 });
 
-test("rule 6 binding: no text and no <end> is a LOUD turn.blocked, never silence", async () => {
+test("rule 6 binding: a silent harness with NOTHING shown to the user is a LOUD turn.blocked", async () => {
+  // The shared surface says nothing either, so the user would be left with an empty turn.
   const box = new FakeBoxClient({ frames: [] });
-  const engine = makeEngine(box);
+  const engine = makeEngine(box, { sharedStream: sharedStream("") });
   const events = await collect(engine, "u6b", "c6b", "do a thing");
   assert.equal(events.filter((e) => e.type === "turn.blocked").length, 1, "exactly one loud block");
+  engine.dispose();
+});
+
+test("rule 6: a silent harness is FINE when the shared surface already answered in full", async () => {
+  // Adding nothing is what <end> means; some models end the turn empty instead of typing it
+  // (Kimi answers out of its thinking). The user has a complete answer, so a red error lies.
+  const box = new FakeBoxClient({ frames: [] });
+  const engine = makeEngine(box, { sharedStream: sharedStream("Paris is the capital of France.") });
+  const events = await collect(engine, "u6c", "c6c", "capital of France?");
+  assert.equal(events.filter((e) => e.type === "turn.blocked").length, 0, "no error on a turn the user got answered");
+  const done = events.find((e) => e.type === "turn.done");
+  assert.ok(done?.settled, "the turn settles");
   engine.dispose();
 });
 

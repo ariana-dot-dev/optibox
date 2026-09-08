@@ -115,7 +115,11 @@ export function directProviderStream(providerEnv: Record<string, string>, modelS
       if (!key) throw new Error(`shared stream: ${spec.env} is not set`);
       url = spec.url;
       headers = { "content-type": "application/json", authorization: "Bearer " + key };
-      body = JSON.stringify({ model: modelID, stream: true, messages });
+      // Kimi's models think before they speak, which costs the bridge its whole reason to exist:
+      // measured 8.2 s to the first token on k3, 2.4 s with thinking off, and 17 s under load.
+      // The box's own turn keeps thinking; this surface is the instant one.
+      const noThinking = providerID === "kimi" || providerID === "moonshot" ? { thinking: { type: "disabled" } } : {};
+      body = JSON.stringify({ model: modelID, stream: true, messages, ...noThinking });
       delta = (j) => String(j?.choices?.[0]?.delta?.content ?? "");
     }
     const ac = new AbortController();

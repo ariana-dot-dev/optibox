@@ -1083,7 +1083,12 @@ export class Engine {
       const visible = visibleParts.join("\n\n");
       if (sawEnd || !visible && msgs.size > 0 && [...msgs.values()].every((m) => /^\s*<end>\s*$/.test(m.text))) return { outcome: "silent", text: "" };
       if (!visible) {
-        // Rule 6 binding clause: no text and no <end> is LOUD, never silence.
+        // Rule 6 binding clause: no text and no <end> is LOUD, never silence. Except when the
+        // shared surface already answered in full and the harness reports no failure: adding
+        // nothing IS the <end> case, whether or not the model bothered to type the sentinel
+        // (Kimi answers from its thinking and can end a turn empty). The user has their answer,
+        // so a red error would be a lie about a turn that worked.
+        if (!harnessError && partialShared.trim()) return { outcome: "silent", text: "" };
         return { outcome: "blocked", text: "", diagnostic: harnessError ? `the agent could not run: ${harnessError}` : `harness ended with no answer and no <end> (tools used: ${seenUses.size})`, blockedEmitted: false };
       }
       await this.db.q(

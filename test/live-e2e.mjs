@@ -21,11 +21,14 @@ const rows = [];
 let failed = 0;
 async function turn(name, message, selection, opts = {}) {
   const t0 = Date.now();
-  const stats = { name, sharedMs: null, boxMs: null, tools: 0, route: null, done: false, blocked: null, text: "", lifecycle: [] };
+  // `text` is what the box streamed; `sharedText` what the bridge streamed. The user sees both, and
+  // rule 6 lets the box add NOTHING when the bridge already answered in full, so a memory check
+  // reads `visible`, never the box half alone.
+  const stats = { name, sharedMs: null, boxMs: null, tools: 0, route: null, done: false, blocked: null, text: "", sharedText: "", lifecycle: [], get visible() { return this.sharedText + this.text; } };
   const run = engine.runTurn({ userId: user, conversationId: conv, message, selection });
   let interrupted = false;
   for await (const e of run) {
-    if (e.type === "shared.delta" && stats.sharedMs === null) stats.sharedMs = Date.now() - t0;
+    if (e.type === "shared.delta") { if (stats.sharedMs === null) stats.sharedMs = Date.now() - t0; stats.sharedText += e.text; }
     if (e.type === "user-box.delta") { if (stats.boxMs === null) stats.boxMs = Date.now() - t0; stats.text += e.text; if (opts.interruptAfterText && !interrupted) { interrupted = true; engine.interrupt(e.turnId); } }
     if (e.type === "harness.tool" && e.phase === "tool_use") stats.tools++;
     if (e.type === "lifecycle") stats.lifecycle.push(e.state);
@@ -45,14 +48,16 @@ const pi = { harness: "pi", provider: "openai", model: process.env.PI_MODEL ?? "
 const codeword = "PLUM-" + Math.random().toString(36).slice(2, 6).toUpperCase();
 try {
   await turn("cold: bridge + box (memory seed)", `Remember: my codeword is ${codeword}. Reply only OK.`, claude);
-  await turn("warm follow-up: memory", "What is my codeword? Answer with the codeword only.", claude, { check: (s) => s.done && s.text.includes(codeword) });
-  await turn("harness switch keeps memory", "Which harness are you, and what is my codeword? One line.", pi, { check: (s) => s.done && s.text.includes(codeword) });
+  await turn("warm follow-up: memory", "What is my codeword? Answer with the codeword only.", claude, { check: (s) => s.done && s.visible.includes(codeword) });
+  await turn("harness switch keeps memory", "Which harness are you, and what is my codeword? One line.", pi, { check: (s) => s.done && s.visible.includes(codeword) });
   await turn("tool turn: shell fact", "Run `nproc` and reply with the number of cores only.", claude, { check: (s) => s.done && s.tools >= 1 && /\d/.test(s.text) });
   await turn("interrupt mid-answer", "Count slowly from 1 to 200, one number per line, and explain each.", claude, { interruptAfterText: true, check: (s) => s.route === "interrupted" && !s.blocked });
-  await turn("after interrupt: still remembers", "What is my codeword? Codeword only.", claude, { check: (s) => s.done && s.text.includes(codeword) });
+  await turn("after interrupt: still remembers", "What is my codeword? Codeword only.", claude, { check: (s) => s.done && s.visible.includes(codeword) });
   const t0 = Date.now();
   for await (const e of engine.stopUserBox(user, conv)) if (e.type === "lifecycle") rows.push({ name: `stop: ${e.state}`, totalMs: Date.now() - t0, ok: true });
-  await turn("resume from snapshot: memory survives stop", "What is my codeword? Codeword only.", claude, { check: (s) => s.done && s.text.includes(codeword) && s.lifecycle.includes("resuming") });
+  // A different sentence on purpose: the engine folds an identical message re-sent within 60 s into
+  // the previous turn (no second box round), which is not what this step measures.
+  await turn("resume from snapshot: memory survives stop", "We are back after the stop. What is my codeword? Codeword only.", claude, { check: (s) => s.done && s.visible.includes(codeword) && s.lifecycle.includes("resuming") });
 } catch (e) {
   failed++;
   console.log("FAIL exception:", e instanceof Error ? e.message : String(e));

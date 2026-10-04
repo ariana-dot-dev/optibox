@@ -14,6 +14,8 @@ export interface HarnessSelection {
   provider: string;
   model: string;
   reasoningEffort?: string;
+  /** Fast mode (Codex "priority" tier, Opus fast): only models with fastMode in GET /provider-models. */
+  fast?: boolean;
 }
 
 /**
@@ -112,7 +114,7 @@ export interface BoxClient {
   command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number }): Promise<CommandResult>;
   readFile(boxId: string, path: string): Promise<string>;
   writeFile(boxId: string, path: string, content: string): Promise<void>;
-  prompt(boxId: string, input: { provider: string; model?: string; reasoningEffort?: string; prompt: string; new?: boolean; conversationId?: string }): Promise<PromptRun>;
+  prompt(boxId: string, input: { provider: string; model?: string; reasoningEffort?: string; fast?: boolean; prompt: string; new?: boolean; conversationId?: string }): Promise<PromptRun>;
   promptRun(boxId: string, promptId: string): Promise<PromptRun>;
   events(boxId: string, input: { conversationId?: string; cursor?: string; limit?: number }): Promise<{ events: BoxEvent[]; nextCursor?: string | null }>;
   interrupt(boxId: string, conversationId?: string): Promise<void>;

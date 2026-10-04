@@ -13,7 +13,7 @@ export interface BoxHttpClientOptions {
   requestTimeoutMs?: number;
 }
 
-/** HTTP client for the Box public API v1: machines, integrated agents, files, desktop. */
+/** HTTP client for the Boat public API v1 (https://boat.dev/api/v1): sandboxes, integrated agents, files, desktop. */
 export class BoxHttpClient implements BoxClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
@@ -22,7 +22,7 @@ export class BoxHttpClient implements BoxClient {
 
   constructor(options: BoxHttpClientOptions) {
     if (!options.apiKey) throw new Error("BoxHttpClient requires a Box API key");
-    this.baseUrl = (options.baseUrl ?? process.env.BOX_API_URL ?? "https://ascii.dev/api/box/v1").replace(/\/$/, "");
+    this.baseUrl = (options.baseUrl ?? process.env.BOAT_API_URL ?? process.env.BOX_API_URL ?? "https://boat.dev/api/v1").replace(/\/$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.apiKey = options.apiKey;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
@@ -63,22 +63,22 @@ export class BoxHttpClient implements BoxClient {
     // noEnv withholds every owner secret; env is then the machine's whole environment.
     if (input.noEnv) body.noEnv = true;
     if (input.env && Object.keys(input.env).length) body.env = input.env;
-    const json = await this.request<{ box: BoxInfo }>("/boxes", { method: "POST", body: JSON.stringify(body) }, 120_000);
+    const json = await this.request<{ sandbox: BoxInfo }>("/sandboxes", { method: "POST", body: JSON.stringify(body) }, 120_000);
     // The API ignores `name` on create (boxes are born "Box <date>"), so the rename is a second call.
-    return input.name ? this.update(json.box.id, { name: input.name }) : json.box;
+    return input.name ? this.update(json.sandbox.id, { name: input.name }) : json.sandbox;
   }
 
   async get(boxId: string): Promise<BoxInfo> {
-    return (await this.request<{ box: BoxInfo }>(`/boxes/${encodeURIComponent(boxId)}`)).box;
+    return (await this.request<{ sandbox: BoxInfo }>(`/sandboxes/${encodeURIComponent(boxId)}`)).sandbox;
   }
 
   async update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo> {
-    return (await this.request<{ box: BoxInfo }>(`/boxes/${encodeURIComponent(boxId)}`, { method: "PATCH", body: JSON.stringify(input) })).box;
+    return (await this.request<{ sandbox: BoxInfo }>(`/sandboxes/${encodeURIComponent(boxId)}`, { method: "PATCH", body: JSON.stringify(input) })).sandbox;
   }
 
   async stop(boxId: string): Promise<BoxInfo | { ok: boolean }> {
-    const json = await this.request<{ box?: BoxInfo; ok: boolean }>(`/boxes/${encodeURIComponent(boxId)}/stop`, { method: "POST" });
-    return json.box ?? { ok: json.ok };
+    const json = await this.request<{ sandbox?: BoxInfo; ok: boolean }>(`/sandboxes/${encodeURIComponent(boxId)}/stop`, { method: "POST" });
+    return json.sandbox ?? { ok: json.ok };
   }
 
   /**
@@ -88,15 +88,15 @@ export class BoxHttpClient implements BoxClient {
    */
   async resume(boxId: string, input: { env?: Record<string, string> } = {}): Promise<BoxInfo | { ok: boolean }> {
     const hasEnv = Boolean(input.env && Object.keys(input.env).length);
-    const json = await this.request<{ box?: BoxInfo; ok: boolean }>(
-      `/boxes/${encodeURIComponent(boxId)}/resume`,
+    const json = await this.request<{ sandbox?: BoxInfo; ok: boolean }>(
+      `/sandboxes/${encodeURIComponent(boxId)}/resume`,
       { method: "POST", ...(hasEnv ? { body: JSON.stringify({ env: input.env }) } : {}) },
     );
-    return json.box ?? { ok: json.ok };
+    return json.sandbox ?? { ok: json.ok };
   }
 
   async deleteBox(boxId: string): Promise<void> {
-    await this.request(`/boxes/${encodeURIComponent(boxId)}`, { method: "DELETE" });
+    await this.request(`/sandboxes/${encodeURIComponent(boxId)}`, { method: "DELETE" });
   }
 
   async command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number }): Promise<CommandResult> {
@@ -105,7 +105,7 @@ export class BoxHttpClient implements BoxClient {
     const httpTimeoutMs = Math.max(this.requestTimeoutMs, ((timeoutSeconds ?? 30) * 1000) + 15_000);
     // Always name a cwd: a resumed box's default cwd can be a detached FUSE overmount.
     const json = await this.request<{ result?: CommandResult; exitCode?: number; stdout?: string; stderr?: string }>(
-      `/boxes/${encodeURIComponent(boxId)}/commands`,
+      `/sandboxes/${encodeURIComponent(boxId)}/commands`,
       { method: "POST", body: JSON.stringify({ command: input.command, cwd: input.cwd ?? "/home/user", timeoutSeconds }) },
       httpTimeoutMs,
     );
@@ -114,16 +114,16 @@ export class BoxHttpClient implements BoxClient {
 
   // ---------------------------------------------------------------- integrated agents
 
-  async prompt(boxId: string, input: { provider: string; model?: string; reasoningEffort?: string; prompt: string; new?: boolean; conversationId?: string }): Promise<PromptRun> {
+  async prompt(boxId: string, input: { provider: string; model?: string; reasoningEffort?: string; fast?: boolean; prompt: string; new?: boolean; conversationId?: string }): Promise<PromptRun> {
     const json = await this.request<{ promptId: string; conversationId: string; status: string; promptRun?: { done?: boolean } }>(
-      `/boxes/${encodeURIComponent(boxId)}/prompt`, { method: "POST", body: JSON.stringify(input) }, 60_000,
+      `/sandboxes/${encodeURIComponent(boxId)}/prompt`, { method: "POST", body: JSON.stringify(input) }, 60_000,
     );
     return { promptId: json.promptId, conversationId: json.conversationId, status: json.status, done: Boolean(json.promptRun?.done) };
   }
 
   async promptRun(boxId: string, promptId: string): Promise<PromptRun> {
     const json = await this.request<{ promptRun: { promptId: string; conversationId: string | null; status: string; done: boolean } }>(
-      `/boxes/${encodeURIComponent(boxId)}/prompts/${encodeURIComponent(promptId)}`,
+      `/sandboxes/${encodeURIComponent(boxId)}/prompts/${encodeURIComponent(promptId)}`,
     );
     return { promptId: json.promptRun.promptId, conversationId: json.promptRun.conversationId ?? "", status: json.promptRun.status, done: json.promptRun.done };
   }
@@ -132,18 +132,18 @@ export class BoxHttpClient implements BoxClient {
     const params = new URLSearchParams({ sort: "asc", limit: String(input.limit ?? 200) });
     if (input.conversationId) params.set("conversation", input.conversationId);
     if (input.cursor) params.set("cursor", input.cursor);
-    const json = await this.request<{ events: BoxEvent[]; pageInfo?: { nextCursor?: string | null } }>(`/boxes/${encodeURIComponent(boxId)}/events?${params}`);
+    const json = await this.request<{ events: BoxEvent[]; pageInfo?: { nextCursor?: string | null } }>(`/sandboxes/${encodeURIComponent(boxId)}/events?${params}`);
     return { events: json.events ?? [], nextCursor: json.pageInfo?.nextCursor ?? null };
   }
 
   async interrupt(boxId: string, conversationId?: string): Promise<void> {
     const qs = conversationId ? `?${new URLSearchParams({ conversation: conversationId })}` : "";
-    await this.request(`/boxes/${encodeURIComponent(boxId)}/interrupt${qs}`, { method: "POST" });
+    await this.request(`/sandboxes/${encodeURIComponent(boxId)}/interrupt${qs}`, { method: "POST" });
   }
 
   /** Live catalog: every harness, its models and the reasoning levels each accepts. Public, no auth. */
   async providerModels(): Promise<Record<string, { models: Array<{ id: string; label: string; provider?: string; credentialIds?: string[]; reasoningEffort?: { supported: string[]; default: string } }>; default: string; cli?: { name: string; description: string; order?: number } }>> {
-    const root = this.baseUrl.replace(/\/api\/box\/v1$/, "");
+    const root = this.baseUrl.replace(/\/api(\/box)?\/v1$/, "");
     const response = await this.fetchImpl(`${root}/api/provider-models`);
     if (!response.ok) throw new BoxApiError(response.status, "provider_models", `GET /api/provider-models -> ${response.status}`);
     return (await response.json()) as never;
@@ -152,7 +152,7 @@ export class BoxHttpClient implements BoxClient {
   // ---------------------------------------------------------------- files, snapshots, desktop (fs panel)
 
   async latestSnapshot(boxId: string): Promise<{ id: string; status: string } | undefined> {
-    const json = await this.request<{ snapshot?: { id: string; status: string } | null }>(`/boxes/${encodeURIComponent(boxId)}/snapshots/latest`);
+    const json = await this.request<{ snapshot?: { id: string; status: string } | null }>(`/sandboxes/${encodeURIComponent(boxId)}/snapshots/latest`);
     return json.snapshot ?? undefined;
   }
 
@@ -166,12 +166,12 @@ export class BoxHttpClient implements BoxClient {
   }
 
   async readFileBytes(boxId: string, path: string): Promise<Buffer> {
-    const json = await this.request<{ content?: string; file?: { content: string } }>(`/boxes/${encodeURIComponent(boxId)}/files?${new URLSearchParams({ path, encoding: "base64" })}`);
+    const json = await this.request<{ content?: string; file?: { content: string } }>(`/sandboxes/${encodeURIComponent(boxId)}/files?${new URLSearchParams({ path, encoding: "base64" })}`);
     return Buffer.from(json.content ?? json.file?.content ?? "", "base64");
   }
 
   async writeFileBytes(boxId: string, path: string, bytes: Buffer): Promise<void> {
-    await this.request(`/boxes/${encodeURIComponent(boxId)}/files`, { method: "PUT", body: JSON.stringify({ path, content: bytes.toString("base64"), encoding: "base64" }) });
+    await this.request(`/sandboxes/${encodeURIComponent(boxId)}/files`, { method: "PUT", body: JSON.stringify({ path, content: bytes.toString("base64"), encoding: "base64" }) });
   }
 
   async desktopStreamUrl(boxId: string, opts: { vnc?: boolean; theme?: "light" | "dark"; publicAccess?: boolean } = {}): Promise<{ desktopUrl?: string; provisioning: boolean; message?: string }> {
@@ -180,7 +180,7 @@ export class BoxHttpClient implements BoxClient {
     else if (opts.theme) params.set("theme", opts.theme);
     const qs = params.size ? `?${params}` : "";
     const json = await this.request<{ desktopUrl?: string | null; provisioning?: boolean; message?: string }>(
-      `/boxes/${encodeURIComponent(boxId)}/desktop${qs}`,
+      `/sandboxes/${encodeURIComponent(boxId)}/desktop${qs}`,
       { method: "POST", body: JSON.stringify(opts.publicAccess ? { publicAccess: true } : {}) },
     );
     return { ...(json.desktopUrl ? { desktopUrl: json.desktopUrl } : {}), provisioning: Boolean(json.provisioning), ...(json.message ? { message: json.message } : {}) };
@@ -202,11 +202,11 @@ export class BoxHttpClient implements BoxClient {
   }
 
   async readFile(boxId: string, path: string): Promise<string> {
-    const json = await this.request<{ content?: string; file?: { content: string } }>(`/boxes/${encodeURIComponent(boxId)}/files?${new URLSearchParams({ path, encoding: "utf8" })}`);
+    const json = await this.request<{ content?: string; file?: { content: string } }>(`/sandboxes/${encodeURIComponent(boxId)}/files?${new URLSearchParams({ path, encoding: "utf8" })}`);
     return json.content ?? json.file?.content ?? "";
   }
 
   async writeFile(boxId: string, path: string, content: string): Promise<void> {
-    await this.request(`/boxes/${encodeURIComponent(boxId)}/files`, { method: "PUT", body: JSON.stringify({ path, content, encoding: "utf8" }) });
+    await this.request(`/sandboxes/${encodeURIComponent(boxId)}/files`, { method: "PUT", body: JSON.stringify({ path, content, encoding: "utf8" }) });
   }
 }

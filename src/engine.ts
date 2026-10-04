@@ -475,6 +475,7 @@ export class Engine {
       provider: pick(given.provider, stored.provider),
       model: pick(given.model, stored.model),
       ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(typeof given.fast === "boolean" ? { fast: given.fast } : {}),
     };
   }
 
@@ -559,9 +560,16 @@ export class Engine {
           if (["archived", "stopped"].includes(state)) {
             events?.push({ type: "lifecycle", boxId: info.id, state: "resuming", note: "resuming private box from disk snapshot" });
             await this.resumeWithUserEnv(userId, info.id, events);
+            await this.wake(userId, "resume");
+            // Boat queues a prompt on a sandbox that is still resuming and delivers it the
+            // moment the agent is up, so waiting here only adds polling time. The one thing
+            // that must land BEFORE the prompt is the user's credential files.
+            if (!(await this.hasAgentFiles(userId))) {
+              events?.push({ type: "lifecycle", boxId: info.id, state: "resuming", note: "prompt sent while the box resumes; Boat delivers it as soon as it is up" });
+              return { ...info, state: "resuming" };
+            }
             const ready = await this.waitUntilReady(info.id);
             await this.afterBringUp(userId, info.id, events);
-            await this.wake(userId, "resume");
             events?.push({ type: "lifecycle", boxId: info.id, state: ready.state, note: "private box resumed from snapshot — no cold start" });
             return ready;
           }
@@ -609,6 +617,11 @@ export class Engine {
     await this.db.q(`update users set env_pending=false where key=$1`, [this.userKey(userId)]);
   }
 
+  private async hasAgentFiles(userId: string): Promise<boolean> {
+    const files = (await this.userAgentsRow(userId)).agentFiles;
+    return Object.values(files).some((v) => typeof v === "string" && v.length > 0);
+  }
+
   /** Every bring-up ends the same way: the user's secret files land before any prompt. */
   private async afterBringUp(userId: string, boxId: string, events?: EventQueue): Promise<void> {
     const written = await this.writeAgentFiles(boxId, userId).catch(() => [] as string[]);
@@ -616,7 +629,7 @@ export class Engine {
   }
 
   private async waitUntilReady(boxId: string): Promise<BoxInfo> {
-    const pollMs = this.opts.readinessPollMs ?? 750;
+    const pollMs = this.opts.readinessPollMs ?? 250;
     const deadline = Date.now() + (this.opts.handoffTimeoutMs ?? 120_000);
     // Readiness = the box executes a command (state strings lag reality badly).
     while (Date.now() < deadline) {
@@ -1000,7 +1013,8 @@ export class Engine {
       const prompt = boxTurnPrompt({ first: !known, transcript, message: input.message, partialShared, ...(scenario ? { scenarioLabel: scenario.label } : {}) });
       push({ type: "context.injected", scope: "user-box", machine, hidden: prompt });
       const run = await this.box.prompt(box.id, {
-        provider: harness, ...(model ? { model } : {}), ...(reasoningEffort ? { reasoningEffort } : {}), prompt,
+        provider: harness, ...(model ? { model } : {}), ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(typeof input.selection.fast === "boolean" ? { fast: input.selection.fast } : {}), prompt,
         ...(known ? { conversationId: known } : { new: true }),
       });
       if (!scenario && run.conversationId !== known) {
@@ -1071,6 +1085,11 @@ export class Engine {
           }
         }
       };
+      // The prompt may have been sent while the box was still resuming. If it never
+      // comes up, nothing would ever arrive: check the box once the handoff window
+      // passes with no event, instead of polling forever.
+      const handoffMs = this.opts.handoffTimeoutMs ?? 120_000;
+      let quietSince = Date.now();
       while (!done) {
         if (signal.aborted) {
           await this.box.interrupt(box.id, run.conversationId).catch(() => undefined);
@@ -1078,10 +1097,18 @@ export class Engine {
         }
         const page = await this.box.events(box.id, { conversationId: run.conversationId, ...(cursor ? { cursor } : {}) });
         consume(page.events);
+        if (page.events.length) quietSince = Date.now();
+        else if (msgs.size === 0 && Date.now() - quietSince > handoffMs) {
+          const state = String((await this.box.get(box.id).catch(() => undefined))?.state ?? "error");
+          if (["error", "deleted", "archived", "stopped"].includes(state)) {
+            return { outcome: "blocked", text: "", diagnostic: `the private box did not come up (state: ${state})`, blockedEmitted: false };
+          }
+          quietSince = Date.now();
+        }
         // The prompt-run status is the first-class completion signal; the
         // events are the content. Ask for it every third poll (or when idle).
         if (!done && (page.events.length === 0 || ++polls % 3 === 0)) done = (await this.box.promptRun(box.id, run.promptId)).done;
-        if (!done) await new Promise((r) => setTimeout(r, this.opts.eventPollMs ?? 700));
+        if (!done) await new Promise((r) => setTimeout(r, this.opts.eventPollMs ?? 250));
       }
       consume((await this.box.events(box.id, { conversationId: run.conversationId, ...(cursor ? { cursor } : {}) })).events); // final drain
       // Stream over: a held tail is either the sentinel (drop) or a partial that never completed (flush).

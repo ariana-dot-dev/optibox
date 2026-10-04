@@ -774,7 +774,12 @@ function addToolEvent(ev,localId){let chain=currentToolChain;if(ev.phase==='tool
 chain=ensureToolChain(localId);const call={id:'tool-'+(++toolSeq),toolName:ev.toolName||'tool',command:ev.command||'',description:ev.description||'',stdout:ev.stdout||'',stderr:ev.stderr||'',isError:Boolean(ev.isError),state:toolStateFromEvent(ev),resultSeen:ev.phase==='tool_result'};chain.calls.push(call);renderToolChain(chain);
 // A tool ran, so the next speak into the current box bubble opens a new paragraph.
 boxBreakPending=true;return chain.el;}
-function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date.now();if(!timer)timer=setInterval(renderTotals,100);}document.body.dataset.billing='1';setWarmingPulse(false);setState('private machine running · tools active · billing live');renderTotals();}
+// One receipt per machine session, printed when the machine really stops (manual stop or
+// auto-stop), never per message: a receipt after each turn read as "session ended"
+// while the machine was still running between messages.
+let sessionStartSeconds=null;
+function showSessionReceipt(){if(sessionStartSeconds===null||replaying)return;const used=activeSeconds()-sessionStartSeconds;sessionStartSeconds=null;if(used<0.1||!(billRate>0))return;const r=document.createElement('div');r.className='receipt';r.textContent='machine stopped · '+used.toFixed(1)+'s this session · '+fmtUsd(used*billRate);const c=$('chat');const stick=chatStick(c);c.appendChild(r);if(stick)c.scrollTop=c.scrollHeight;}
+function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date.now();sessionStartSeconds=totalSeconds;if(!timer)timer=setInterval(renderTotals,100);}document.body.dataset.billing='1';setWarmingPulse(false);setState('private machine running · tools active · billing live');renderTotals();}
 // totalSeconds ownership: the SERVER's cumulative billedSecondsTotal is the one
 // truth (applyRuntimeStatus ASSIGNS it from every snapshot). The += here is only
 // an optimistic bridge so the display doesn't dip in the sub-second gap between
@@ -784,7 +789,7 @@ function startBilling(sinceMs){if(!billing){billing=true;billSince=sinceMs||Date
 // ALREADY contains the just-ended window (it was assigned a line earlier in
 // applyRuntimeStatus) — folding it here too would double-count. SSE events
 // (no snapshot in hand) fold optimistically and the next snapshot overwrites.
-function stopBilling(elapsed,reconciled){if(billing){if(!reconciled)totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;}if(timer){clearInterval(timer);timer=null;}delete document.body.dataset.billing;setWarmingPulse(false);clearAutoStopTimer('stopped');setState('private machine stopped · billing paused');renderTotals();}
+function stopBilling(elapsed,reconciled){if(billing){if(!reconciled)totalSeconds+=(elapsed!=null&&elapsed>0)?elapsed:(Date.now()-billSince)/1000;billing=false;showSessionReceipt();}if(timer){clearInterval(timer);timer=null;}delete document.body.dataset.billing;setWarmingPulse(false);clearAutoStopTimer('stopped');setState('private machine stopped · billing paused');renderTotals();}
 // Reconcile ALL machine counters from the polled runtime snapshot (rides every
 // fs tree poll). This is the ground truth: a machine woken by typing or an
 // upload has no SSE stream, so without this the counter/cost/auto-stop UI
@@ -1378,10 +1383,8 @@ function handle(ev,localId){console.debug('[trace] stream event', ev);const isLa
     // grew past the collapse threshold, and detach the working footer.
     if(activeBoxKey){const fk=activeBoxKey,fb=bubbles.get(fk);activeBoxKey=null;if(fb)applyClamp(fb,fk);}
     if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);renderLinkPreviews(lastAgentMsgEl);lastAgentMsgEl=null;}if(lastSharedMsgEl){renderLinkPreviews(lastSharedMsgEl);lastSharedMsgEl=null;}
-    // Per-turn receipt: the economic argument for per-second billing, made
-    // legible per artifact — "that PDF cost you $0.0041". Only for turns that
-    // actually ran the private machine, and only when a real amount accrued.
-    if(td&&td.boxStarted&&!td.receiptShown){const used=activeSeconds()-(td.startSeconds||0);if(used>=0.1&&billRate>0){td.receiptShown=true;const r=document.createElement('div');r.className='receipt';r.textContent=used.toFixed(1)+'s machine time · '+fmtUsd(used*billRate);const c=$('chat');const stick=chatStick(c);c.appendChild(r);if(stick)c.scrollTop=c.scrollHeight;}}}
+    // The receipt is printed once, when the machine stops (showSessionReceipt).
+    }
   else if(ev.type==='error'){addMsg('assistant','error','Error: '+ev.message);setState('Error · check model credentials or machine state');}}
 if(typeof window!=='undefined')window.addEventListener('resize',paintDiagram);
 if(typeof window!=='undefined')window.__optiboxFs={ctx:function(){return {userId:selectedUser,conversationId:selectedConversation};},onRuntime:applyRuntimeStatus};

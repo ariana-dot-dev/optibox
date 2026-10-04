@@ -22,13 +22,33 @@ export class BoxHttpClient implements BoxClient {
 
   constructor(options: BoxHttpClientOptions) {
     if (!options.apiKey) throw new Error("BoxHttpClient requires a Box API key");
-    this.baseUrl = (options.baseUrl ?? process.env.BOAT_API_URL ?? process.env.BOX_API_URL ?? "https://boat.dev/api/v1").replace(/\/$/, "");
+    this.baseUrl = (options.baseUrl || process.env.BOAT_API_URL || process.env.BOX_API_URL || "https://boat.dev/api/v1").replace(/\/$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.apiKey = options.apiKey;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   }
 
+  /**
+   * Reads (GET) ride out a short API outage: a backend deploy answers 502/503/504 or drops
+   * the connection for a few seconds, and that used to crash a streaming turn
+   * ("box.round.crashed: Bad Gateway"). Writes are never retried: a repeated POST /prompt
+   * would run the prompt twice.
+   */
   private async request<T>(path: string, init: RequestInit = {}, timeoutOverrideMs?: number): Promise<T> {
+    const isRead = !init.method || init.method === "GET";
+    const deadline = Date.now() + 60_000;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.requestOnce<T>(path, init, timeoutOverrideMs);
+      } catch (error) {
+        const transient = error instanceof BoxApiError ? [502, 503, 504].includes(error.status) : !(error instanceof Error && /timed out/.test(error.message));
+        if (!isRead || !transient || Date.now() > deadline) throw error;
+        await new Promise((r) => setTimeout(r, Math.min(4_000, 500 * 2 ** attempt)));
+      }
+    }
+  }
+
+  private async requestOnce<T>(path: string, init: RequestInit = {}, timeoutOverrideMs?: number): Promise<T> {
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${this.apiKey}`);
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");

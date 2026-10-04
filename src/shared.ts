@@ -5,15 +5,15 @@ import type { TranscriptMessage } from "./types.js";
  * The two prompts of the product, and the shared no-tools stream.
  *
  * Shared surface (rules 1+3): one direct, stateless provider call — nothing to
- * install, nothing to wedge, an interrupt just drops that request. Box surface
- * (rules 2+6): the Box's own harness reads the standing rules from AGENTS.md /
+ * install, nothing to wedge, an interrupt just drops that request. Boat surface
+ * (rules 2+6): the sandbox's own harness reads the standing rules from AGENTS.md /
  * CLAUDE.md in the user's home (written once per machine), remembers the
  * conversation itself, and only receives the latest request per turn.
  */
 
 const PRODUCT = [
   "You are the user's personal assistant in a consumer product with two surfaces: a fast shared surface (chat, knowledge, opinions, public web facts) and the assistant's own private computer (shell, files, browser, desktop, hosting) that the user can watch live.",
-  "Never mention Boxes, sandboxes, machines, resumes, routing, billing, hidden XML, harness or CLI product names, or orchestration internals unless the user explicitly asks about the product architecture. If asked who you are: the user's personal assistant.",
+  "Never mention sandboxes, sandboxes, machines, resumes, routing, billing, hidden XML, harness or CLI product names, or orchestration internals unless the user explicitly asks about the product architecture. If asked who you are: the user's personal assistant.",
   "THE MACHINE IS YOURS: speak of it in the first person ('my machine', 'my files'), never 'your machine'.",
 ];
 
@@ -32,8 +32,8 @@ export function sharedInstructions(directive?: string): string {
   ].join("\n");
 }
 
-/** Standing rules for the Box harnesses, written once per machine as AGENTS.md and CLAUDE.md. */
-export function boxRules(): string {
+/** Standing rules for the sandbox harnesses, written once per machine as AGENTS.md and CLAUDE.md. */
+export function sandboxRules(): string {
   return [
     ...PRODUCT,
     "You run on the private machine with real tools. For machine facts (IP: `curl -4 -s https://api.ipify.org`, cores: `nproc`, hostname, files) run the command and report what you observed; never guess.",
@@ -50,7 +50,7 @@ export function boxRules(): string {
 
 /** The full shared prompt: instructions + hidden context + latest request. */
 export function sharedPrompt(transcript: TranscriptMessage[], message: string, directive?: string): string {
-  const hidden = buildHiddenContext({ transcript, machine: { location: "shared-box", tools: false, status: "provisioning" } });
+  const hidden = buildHiddenContext({ transcript, machine: { location: "shared-sandbox", tools: false, status: "provisioning" } });
   return [
     "<consumer-agent-system-instructions>", sharedInstructions(directive), "</consumer-agent-system-instructions>", "",
     hidden, "",
@@ -60,15 +60,15 @@ export function sharedPrompt(transcript: TranscriptMessage[], message: string, d
 }
 
 /**
- * What the Box harness receives per turn. The conversation memory is the Box's
- * own, so only the FIRST prompt of a Box conversation carries the prior
+ * What the sandbox harness receives per turn. The conversation memory is the sandbox's
+ * own, so only the FIRST prompt of a sandbox conversation carries the prior
  * transcript (turns the shared surface answered alone). Every turn carries the
  * shared text already shown, so the harness answers on top of it (rule 2).
  */
-export function boxTurnPrompt(input: { first: boolean; transcript: TranscriptMessage[]; message: string; partialShared: string; scenarioLabel?: string }): string {
+export function sandboxTurnPrompt(input: { first: boolean; transcript: TranscriptMessage[]; message: string; partialShared: string; scenarioLabel?: string }): string {
   const parts: string[] = [];
   if (input.first && input.transcript.length > 1) {
-    parts.push(buildHiddenContext({ transcript: input.transcript.slice(0, -1), machine: { location: "user-box", tools: true, status: "live" } }), "");
+    parts.push(buildHiddenContext({ transcript: input.transcript.slice(0, -1), machine: { location: "user-sandbox", tools: true, status: "live" } }), "");
   }
   if (input.partialShared.trim()) {
     parts.push(`<partial-shared-response note="already shown to the user by the shared assistant; continue from it, never repeat it verbatim; if it fully answered the request output exactly <end>">${escapeXml(input.partialShared.trim())}</partial-shared-response>`, "");
@@ -117,7 +117,7 @@ export function directProviderStream(providerEnv: Record<string, string>, modelS
       headers = { "content-type": "application/json", authorization: "Bearer " + key };
       // Kimi's models think before they speak, which costs the bridge its whole reason to exist:
       // measured 8.2 s to the first token on k3, 2.4 s with thinking off, and 17 s under load.
-      // The box's own turn keeps thinking; this surface is the instant one.
+      // The sandbox's own turn keeps thinking; this surface is the instant one.
       const noThinking = providerID === "kimi" || providerID === "moonshot" ? { thinking: { type: "disabled" } } : {};
       body = JSON.stringify({ model: modelID, stream: true, messages, ...noThinking });
       delta = (j) => String(j?.choices?.[0]?.delta?.content ?? "");

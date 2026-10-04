@@ -1,4 +1,4 @@
-// Note: the hosted preview's auto-redeploy poller (deploy/redeploy.sh, box-side
+// Note: the hosted preview's auto-redeploy poller (deploy/redeploy.sh, sandbox-side
 // only, not in this repo) is what picks up changes to this file within ~20s of
 // a push to main.
 // Mobile horizontal pager glue. The paging itself is native CSS scroll-snap on

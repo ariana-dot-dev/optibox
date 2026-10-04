@@ -1,37 +1,37 @@
 import type { TranscriptMessage } from "./types.js";
 
 /**
- * Box pricing (verified from box.ascii.dev landing page):
+ * Boat pricing (verified from sandbox.ascii.dev landing page):
  *   "$20 buys 2,000,000 VM-seconds of dedicated 4 vCPU / 8 GB VM-time"
- *   billed by the second; "box stop — snapshot and pause billing".
- * => $0.00001 per VM-second. Billing pauses entirely while a box is stopped.
+ *   billed by the second; "sandbox stop — snapshot and pause billing".
+ * => $0.00001 per VM-second. Billing pauses entirely while a sandbox is stopped.
  */
-export const BOX_SECONDS_PER_20_USD = 2_000_000;
-export const BOX_PRICE_USD_PER_SECOND = 20 / BOX_SECONDS_PER_20_USD; // 0.00001
-export const BOX_PRICE_LABEL = "$20 / 2,000,000 VM-sec · 4 vCPU · 8 GB";
-/** Active box-seconds you can run per month and still stay under $1. */
-export const SECONDS_UNDER_1_USD_PER_MONTH = Math.floor(1 / BOX_PRICE_USD_PER_SECOND); // 100,000s ≈ 27.7h
+export const SANDBOX_SECONDS_PER_20_USD = 2_000_000;
+export const SANDBOX_PRICE_USD_PER_SECOND = 20 / SANDBOX_SECONDS_PER_20_USD; // 0.00001
+export const SANDBOX_PRICE_LABEL = "$20 / 2,000,000 VM-sec · 4 vCPU · 8 GB";
+/** Active sandbox-seconds you can run per month and still stay under $1. */
+export const SECONDS_UNDER_1_USD_PER_MONTH = Math.floor(1 / SANDBOX_PRICE_USD_PER_SECOND); // 100,000s ≈ 27.7h
 
-export const BOX_PRICING = {
-  ratePerSecond: BOX_PRICE_USD_PER_SECOND,
+export const SANDBOX_PRICING = {
+  ratePerSecond: SANDBOX_PRICE_USD_PER_SECOND,
   monthlyMinUsd: 20,
-  secondsPer20Usd: BOX_SECONDS_PER_20_USD,
-  label: BOX_PRICE_LABEL,
+  secondsPer20Usd: SANDBOX_SECONDS_PER_20_USD,
+  label: SANDBOX_PRICE_LABEL,
   secondsUnder1UsdPerMonth: SECONDS_UNDER_1_USD_PER_MONTH,
-  note: "Billed per second; billing pauses on stop. The shared always-on box is platform-amortized across all users, so per-user it is effectively free and gives zero cold start. A user pays only for their private box's running seconds.",
+  note: "Billed per second; billing pauses on stop. The shared always-on sandbox is platform-amortized across all users, so per-user it is effectively free and gives zero cold start. A user pays only for their private sandbox's running seconds.",
 } as const;
 
 export interface MachineState {
   /** Which substrate the agent is currently executing on. */
-  location: "shared-box" | "user-box";
+  location: "shared-sandbox" | "user-sandbox";
   /** Whether real machine tools (bash/files) are available right now. */
   tools: boolean;
-  boxId?: string;
+  sandboxId?: string;
   /**
    * Lifecycle phase relevant to routing decisions:
-   *  - provisioning: private box is being created for the first time (cold)
-   *  - resuming: private box exists but was archived; being woken from snapshot
-   *  - live: agent is executing inside a ready private box right now
+   *  - provisioning: private sandbox is being created for the first time (cold)
+   *  - resuming: private sandbox exists but was archived; being woken from snapshot
+   *  - live: agent is executing inside a ready private sandbox right now
    * Used by the shared bridge agent to phrase an accurate "coming online" reply
    * and by the UI to show precise state instead of a coarse "busy".
    */
@@ -42,7 +42,7 @@ export const HIDDEN_CONTEXT_TAG = "consumer-context";
 
 /**
  * Build the hidden context envelope injected into EVERY agent prompt (shared and
- * user-box). It carries the full prior transcript, the current machine/tool
+ * user-sandbox). It carries the full prior transcript, the current machine/tool
  * state, and any partial shared-agent response, so context is impossible to lose
  * when we change machines or start a fresh agent session. The host UI strips
  * this block from anything shown to the user — see {@link stripHiddenContext}.
@@ -75,7 +75,7 @@ export function buildHiddenContext(input: {
     : "";
   return [
     `<${HIDDEN_CONTEXT_TAG}>`,
-    `  <machine-state location="${input.machine.location}" tools="${input.machine.tools}"${input.machine.status ? ` status="${input.machine.status}"` : ""}${input.machine.boxId ? ` boxId="${input.machine.boxId}"` : ""}/>`,
+    `  <machine-state location="${input.machine.location}" tools="${input.machine.tools}"${input.machine.status ? ` status="${input.machine.status}"` : ""}${input.machine.sandboxId ? ` sandboxId="${input.machine.sandboxId}"` : ""}/>`,
     `  <prior-transcript count="${input.transcript.length}">`,
     turns,
     `  </prior-transcript>${partial}${staleDuplicate}${directive}`,

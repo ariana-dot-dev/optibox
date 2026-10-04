@@ -1,74 +1,74 @@
-# Optibox Shared-First / Box Handoff Technical Report
+# Optibox Shared-First / sandbox Handoff Technical Report
 
 Date: 2026-06-06  
 Scope: Optibox demo/library code in this repository, especially `src/orchestrator.ts`, `examples/shared.ts`, `src/capabilities.ts`, `src/types.ts`, `src/runtimeMatrix.ts`, and `scripts/interactive-proof-server.ts`.
 
-> Update (2026-06-07): the provider fallback (`src/providerClient.ts` / `streamSharedAnswer`) has been **removed**. The shared surface now runs the same CLI harness as the Box, locally on shared infra, with the harness' own structural no-tool flags. See `docs/shared-vs-box-harness-gap-report.md` for the per-harness API evidence. Sections below that describe the old asymmetric provider-client behavior are retained only as historical context.
+> Update (2026-06-07): the provider fallback (`src/providerClient.ts` / `streamSharedAnswer`) has been **removed**. The shared surface now runs the same CLI harness as the sandbox, locally on shared infra, with the harness' own structural no-tool flags. See `docs/shared-vs-sandbox-harness-gap-report.md` for the per-harness API evidence. Sections below that describe the old asymmetric provider-client behavior are retained only as historical context.
 
 ## Executive summary
 
-Optibox now handles the archived/archiving/not-ready Box case as a **state-dependent shared-first + parallel private-resume** turn:
+Optibox now handles the archived/archiving/not-ready sandbox case as a **state-dependent shared-first + parallel private-resume** turn:
 
 1. A user message is accepted immediately and the UI receives a trace event.
-2. If the private Box is not immediately warm/ready, or if a private lock is busy because a stop/archive/turn is in progress, the shared assistant responds first.
-3. In parallel, the orchestrator starts/resumes/recovers the private Box behind the per-conversation private lock.
-4. The Box harness receives hidden history that includes the visible shared response and is instructed to either complete the task, add useful private evidence, or suppress itself if the shared answer already handled the request.
-5. If the Box is already warm and not locked, the orchestrator skips the shared bridge and routes directly to the private runtime.
+2. If the private sandbox is not immediately warm/ready, or if a private lock is busy because a stop/archive/turn is in progress, the shared assistant responds first.
+3. In parallel, the orchestrator starts/resumes/recovers the private sandbox behind the per-conversation private lock.
+4. The sandbox harness receives hidden history that includes the visible shared response and is instructed to either complete the task, add useful private evidence, or suppress itself if the shared answer already handled the request.
+5. If the sandbox is already warm and not locked, the orchestrator skips the shared bridge and routes directly to the private runtime.
 
-During this report pass I found and corrected one mismatch: the shared hidden machine context was being created before the precise Box status resolved, so an archiving/resume case could be described internally as `provisioning`. The orchestrator now waits for precise status before injecting shared hidden machine state while still emitting an immediate `shared.reasoning.start` trace. The regression test now asserts the CPU-during-archiving shared context says `resuming`.
+During this report pass I found and corrected one mismatch: the shared hidden machine context was being created before the precise sandbox status resolved, so an archiving/resume case could be described internally as `provisioning`. The orchestrator now waits for precise status before injecting shared hidden machine state while still emitting an immediate `shared.reasoning.start` trace. The regression test now asserts the CPU-during-archiving shared context says `resuming`.
 
 ## Grounding in current code
 
 | Area | Current implementation |
 |---|---|
-| Main orchestration | `ConsumerBoxAgentOrchestrator.runTurn()` and `runAdaptiveTurn()` in `src/orchestrator.ts` |
+| Main orchestration | `ConsumerSandboxAgentOrchestrator.runTurn()` and `runAdaptiveTurn()` in `src/orchestrator.ts` |
 | Shared restricted surface | `createRestrictedSharedCapabilities()` in `src/capabilities.ts`; `HarnessAdapter.shared(ctx)` in `src/types.ts` |
-| Box/private surface | `createUserBoxCapabilities()` and `UserBoxCapabilities.runHarness()` in `src/capabilities.ts`; `HarnessAdapter.userBox(ctx)` in `src/types.ts` |
+| Sandbox/private surface | `createUserSandboxCapabilities()` and `UserSandboxCapabilities.runHarness()` in `src/capabilities.ts`; `HarnessAdapter.userSandbox(ctx)` in `src/types.ts` |
 | Default real CLI adapter | `realCliHarness()` in `examples/shared.ts` |
-| Shared harness streaming | `createSharedInfraCapabilities()` in `src/capabilities.ts` (same CLI harness as the Box, tools structurally disabled) |
+| Shared harness streaming | `createSharedInfraCapabilities()` in `src/capabilities.ts` (same CLI harness as the sandbox, tools structurally disabled) |
 | Demo UI SSE | `sse()`, `/api/send`, and browser `drain()`/`handle()` in `scripts/interactive-proof-server.ts` |
 | Runtime streaming matrix | `RUNTIME_FEASIBILITY` in `src/runtimeMatrix.ts` |
 
-## How the Box decides to answer, add, or suppress
+## How the Boat decides to answer, add, or suppress
 
 The duplicate-avoidance decision is currently **agentic and prompt-mediated**, not a deterministic semantic comparator in the framework.
 
-### Data passed to the Box
+### Data passed to the sandbox
 
-When the private runtime starts, `runPrivateRuntime()` builds a user-box hidden context that includes:
+When the private runtime starts, `runPrivateRuntime()` builds a user-sandbox hidden context that includes:
 
 - prior transcript,
-- current machine state (`location="user-box"`, `tools="true"`, `boxId`),
+- current machine state (`location="user-sandbox"`, `tools="true"`, `sandboxId`),
 - a recap,
 - the latest user request,
 - `partialShared`, the visible shared text already streamed to the user.
 
-`examples/shared.ts` then builds Box-side instructions with this key rule:
+`examples/shared.ts` then builds Sandbox-side instructions with this key rule:
 
 > If a shared assistant already sent visible text and it was only a brief bridge, complete the latest request. If it already materially answered the request and no tool/private evidence is needed, do not duplicate it; output exactly `<end>` to produce no additional user-visible text. If the hidden context marks the turn with `<stale-duplicate-request>`, treat it as a queued duplicate and output exactly `<end>` unless the latest request clearly asks for new work.
 
-Because the user explicitly wanted the shared assistant to sometimes fully answer and sometimes bridge, the system does not force every shared response into fixed bridge text. The shared side can answer general/contextual requests fully. The Box side receives that shared response and should stay silent if further private evidence is unnecessary.
+Because the user explicitly wanted the shared assistant to sometimes fully answer and sometimes bridge, the system does not force every shared response into fixed bridge text. The shared side can answer general/contextual requests fully. The sandbox side receives that shared response and should stay silent if further private evidence is unnecessary.
 
 ### Decision table
 
-| Shared visible response | User request needs private tools? | Box behavior intended by prompt | Example |
+| Shared visible response | User request needs private tools? | sandbox behavior intended by prompt | Example |
 |---|---:|---|---|
-| Brief bridge | Yes | Run tools and answer | “what's your CPU count” while Box archived → shared: “I’m checking…” → Box runs `nproc` and reports count |
-| Full answer | No | Return `<end>` | “what can you do?” while Box cold → shared fully explains capabilities → Box returns `<end>` so no private text is surfaced |
-| Full answer but stale/uncertain | Maybe | Add only useful correction/evidence | Shared gives general answer; Box later sees private repo facts and adds a concise correction |
-| Duplicate queued request already answered by Box | No | Return `<end>` | Same request is queued twice → first Box round answers → second sees `<stale-duplicate-request>` and declines |
-| Bridge plus partial details | Yes | Complete the missing tool-backed part | Shared says “I’ll look that up”; Box executes commands and reports result |
+| Brief bridge | Yes | Run tools and answer | “what's your CPU count” while sandbox archived → shared: “I’m checking…” → sandbox runs `nproc` and reports count |
+| Full answer | No | Return `<end>` | “what can you do?” while sandbox cold → shared fully explains capabilities → sandbox returns `<end>` so no private text is surfaced |
+| Full answer but stale/uncertain | Maybe | Add only useful correction/evidence | Shared gives general answer; sandbox later sees private repo facts and adds a concise correction |
+| Duplicate queued request already answered by sandbox | No | Return `<end>` | Same request is queued twice → first sandbox round answers → second sees `<stale-duplicate-request>` and declines |
+| Bridge plus partial details | Yes | Complete the missing tool-backed part | Shared says “I’ll look that up”; sandbox executes commands and reports result |
 
 ### Diagram: answer/add/suppress decision
 
 ```mermaid
 flowchart TD
-    A[Box harness starts after handoff] --> B[Read hidden context]
+    A[sandbox harness starts after handoff] --> B[Read hidden context]
     B --> C[Read latest user request]
     B --> D[Read partialShared]
     C --> E{Does latest request need private evidence/tools?}
     D --> F{Did shared materially answer?}
-    E -- yes --> G[Use Box tools]
+    E -- yes --> G[Use sandbox tools]
     G --> H[Answer with observed result]
     E -- no --> F
     F -- yes --> I[Return exact <end>]
@@ -88,18 +88,18 @@ This is intentionally flexible but not mathematically guaranteed. The framework 
 Two mechanisms work together:
 
 1. **Shared answer/bridge instructions** (`buildSharedSystem(ctx)`): the shared assistant decides whether it can answer completely. If it can, it answers normally. If private machine state/tool work is required, it emits a short natural bridge and a hidden `<shared-routing>{"needsPrivate":true}</shared-routing>` tag.
-2. **Parallel Box handoff** (`runAdaptiveTurn()`): in a not-ready/private-lock-busy state the framework still starts or resumes the Box in parallel even if the shared text looks complete. This is deliberate for the requested architecture: the private runtime should later read the shared answer and decide whether to add or stay silent.
-3. **Box handoff instructions** (`buildUserBoxInstructions(ctx)`): the Box harness is told to inspect `partialShared`; complete if it was a bridge, return exactly `<end>` if the shared response materially handled the latest request, or add only useful information.
-4. **Duplicate private-answer marker** (`<stale-duplicate-request>`): once a private runtime has emitted an answer for a normalized user request, a later queued private round for the same request receives this hidden marker. The host still hands off to the Box agent; the agent itself can safely decline the stale duplicate by returning exactly `<end>`.
+2. **Parallel sandbox handoff** (`runAdaptiveTurn()`): in a not-ready/private-lock-busy state the framework still starts or resumes the sandbox in parallel even if the shared text looks complete. This is deliberate for the requested architecture: the private runtime should later read the shared answer and decide whether to add or stay silent.
+3. **sandbox handoff instructions** (`buildUserSandboxInstructions(ctx)`): the sandbox harness is told to inspect `partialShared`; complete if it was a bridge, return exactly `<end>` if the shared response materially handled the latest request, or add only useful information.
+4. **Duplicate private-answer marker** (`<stale-duplicate-request>`): once a private runtime has emitted an answer for a normalized user request, a later queued private round for the same request receives this hidden marker. The host still hands off to the sandbox agent; the agent itself can safely decline the stale duplicate by returning exactly `<end>`.
 
-The user-visible control tag is stripped by `visibleSharedText()`/`stripSharedControl()` before the UI sees it. The not-ready path does not use `needsPrivate=false` to skip Box startup because that would reintroduce the possibility that the private runtime never reads the handoff history. A future structured handoff API should make this explicit instead of leaving `needsPrivate` as mostly advisory.
+The user-visible control tag is stripped by `visibleSharedText()`/`stripSharedControl()` before the UI sees it. The not-ready path does not use `needsPrivate=false` to skip sandbox startup because that would reintroduce the possibility that the private runtime never reads the handoff history. A future structured handoff API should make this explicit instead of leaving `needsPrivate` as mostly advisory.
 
 ```mermaid
 sequenceDiagram
     participant U as User
     participant O as Orchestrator
     participant S as Shared harness
-    participant B as Box harness
+    participant B as sandbox harness
     U->>O: Ask latest question
     O->>S: hidden transcript + restricted capabilities
     S-->>O: Visible text + hidden routing tag
@@ -125,7 +125,7 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> SubmitAccepted
-    SubmitAccepted --> StatusResolving: start userBoxStatus async
+    SubmitAccepted --> StatusResolving: start userSandboxStatus async
     SubmitAccepted --> SharedReasoningReady: immediate trace
 
     StatusResolving --> DirectPrivate: status=ready AND no lock busy
@@ -145,8 +145,8 @@ stateDiagram-v2
     PrivateReady --> WaitPrivateReady
     WaitPrivateReady --> PrivateRun
 
-    PrivateRun --> BoxMayAnswer
-    BoxMayAnswer --> TurnDone
+    PrivateRun --> SandboxMayAnswer
+    SandboxMayAnswer --> TurnDone
     TurnDone --> IdleWarmWindow
     IdleWarmWindow --> AutoStopCancelled: newer turn
     IdleWarmWindow --> AutoStopArchive: no newer turn
@@ -155,12 +155,12 @@ stateDiagram-v2
     Archived --> [*]
 ```
 
-### Private Box lifecycle state machine
+### Private sandbox lifecycle state machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> NoSession
-    NoSession --> Provisioning: ensureUserBox create
+    NoSession --> Provisioning: ensureUserSandbox create
     Provisioning --> Ready: poll ready/idle/running
     Provisioning --> Blocked: handoff timeout
 
@@ -171,19 +171,19 @@ stateDiagram-v2
     IdleWarm --> Stopping: auto/manual stop
 
     Stopping --> Archiving
-    Archiving --> Archived: Box stop completes
+    Archiving --> Archived: Sandbox stop completes
     Archived --> Resuming: next private-needed turn
     Resuming --> Ready: resume succeeds
     Resuming --> ResumeTimeout: resume stuck
-    ResumeTimeout --> Provisioning: recover fresh Box
+    ResumeTimeout --> Provisioning: recover fresh sandbox
 
-    Ready --> Error: Box reports error
+    Ready --> Error: Sandbox reports error
     Error --> Provisioning: recovery path
 ```
 
 ### Concurrent/superposed states
 
-Optibox has two partially independent state axes during not-ready turns: the shared response stream and the private Box lifecycle. They are intentionally overlapped.
+Optibox has two partially independent state axes during not-ready turns: the shared response stream and the private sandbox lifecycle. They are intentionally overlapped.
 
 ```mermaid
 stateDiagram-v2
@@ -198,8 +198,8 @@ stateDiagram-v2
         [*] --> StatusKnown
         StatusKnown --> WaitingForLock
         WaitingForLock --> StartingOrResuming
-        StartingOrResuming --> BoxReady
-        BoxReady --> HarnessRunning
+        StartingOrResuming --> SandboxReady
+        SandboxReady --> HarnessRunning
         HarnessRunning --> PrivateComplete
       }
     }
@@ -207,30 +207,30 @@ stateDiagram-v2
     SharedComplete --> HarnessRunning: handoff uses partialShared
 ```
 
-### Warm Box direct response
+### Warm sandbox direct response
 
 ```mermaid
 sequenceDiagram
     participant UI as Browser UI
     participant O as Orchestrator
-    participant Box as User Box
-    participant H as In-Box harness
+    participant sandbox as User sandbox
+    participant H as In-Sandbox harness
     UI->>O: /api/send message
     O-->>UI: trace turn.submit.accepted
     O-->>UI: trace shared.reasoning.start
-    O->>O: userBoxStatus = ready, lock not busy
+    O->>O: userSandboxStatus = ready, lock not busy
     O->>O: acquire private lock and recheck status
     O-->>UI: shared.larp note: skipping shared bridge
-    O->>Box: extend TTL / mark billing
-    O->>H: run real harness in Box
-    H-->>O: streamed user-box.delta chunks
+    O->>Sandbox: extend TTL / mark billing
+    O->>H: run real harness in sandbox
+    H-->>O: streamed user-sandbox.delta chunks
     O-->>UI: assistant · user machine chunks
     O-->>UI: turn.done
 ```
 
 There is no unnecessary shared bridge in the warm path. The shared trace may exist for audit/diagnostics, but no user-visible `shared.delta` is emitted.
 
-### Cold / never-started Box
+### Cold / never-started sandbox
 
 ```mermaid
 sequenceDiagram
@@ -238,8 +238,8 @@ sequenceDiagram
     participant UI as Browser UI
     participant O as Orchestrator
     participant S as Shared assistant
-    participant Box as Box API
-    participant H as In-Box harness
+    participant sandbox as Boat API
+    participant H as In-Sandbox harness
     U->>UI: asks task needing tools
     UI->>O: /api/send
     O-->>UI: turn.submit.accepted
@@ -249,12 +249,12 @@ sequenceDiagram
       S-->>O: short bridge chunks + hidden routing
       O-->>UI: shared.delta chunks
     and private boot
-      O->>Box: create user Box
-      Box-->>O: provisioning/ready
+      O->>Sandbox: create user sandbox
+      Sandbox-->>O: provisioning/ready
     end
     O->>H: run harness with partialShared bridge
     H-->>O: private answer chunks
-    O-->>UI: user-box.delta chunks
+    O-->>UI: user-sandbox.delta chunks
 ```
 
 ### Archived/archiving CPU-count bug reproduction path
@@ -265,11 +265,11 @@ sequenceDiagram
     participant UI as Browser UI
     participant O as Orchestrator
     participant S as Shared assistant
-    participant Box as Box API
+    participant sandbox as Boat API
     participant H as Private harness
-    UI->>O: stopUserBox
-    O->>Box: stop
-    Box-->>O: archiving
+    UI->>O: stopUserSandbox
+    O->>Sandbox: stop
+    Sandbox-->>O: archiving
     U->>UI: "what's your CPU count"
     UI->>O: /api/send while archiving/private lock busy
     O-->>UI: trace: private runtime busy/stopping; shared first
@@ -280,23 +280,23 @@ sequenceDiagram
       O-->>UI: shared assistant responds immediately
     and private resume behind lock
       O->>O: wait stop lock
-      O->>Box: resume archived Box
-      Box-->>O: ready
+      O->>Sandbox: resume archived sandbox
+      Sandbox-->>O: ready
     end
     O->>H: hidden context includes shared bridge
-    H->>Box: run nproc or lscpu
-    Box-->>H: observed CPU count
+    H->>Sandbox: run nproc or lscpu
+    Sandbox-->>H: observed CPU count
     H-->>O: "4 CPUs." or equivalent
-    O-->>UI: user-box.delta final result
+    O-->>UI: user-sandbox.delta final result
 ```
 
 Validated visible run before this report:
 
 - User/conv: `qa-archive-1780771213` / `visible-cpu`
-- Box: `bx_mseswb6q`
+- Sandbox: `bx_mseswb6q`
 - Submit while status was archiving: `2026-06-06T18:43:01.349Z`
 - Shared streamed first: `2026-06-06T18:43:02.276Z` and `18:43:02.860Z`
-- Private Box resumed: `2026-06-06T18:43:15.972Z`
+- Private sandbox resumed: `2026-06-06T18:43:15.972Z`
 - Private harness ran `nproc`: `2026-06-06T18:43:23.375Z`
 - Private answer: `4 CPUs.`
 
@@ -306,36 +306,36 @@ Validated visible run before this report:
 sequenceDiagram
     participant UI as Browser UI
     participant O as Orchestrator
-    participant Box as Box API
+    participant sandbox as Boat API
     participant T as New Turn
-    UI->>O: Pause Box
+    UI->>O: Pause sandbox
     O->>O: acquire private lock
     O-->>UI: lifecycle stopping
-    O->>Box: stop(boxId)
+    O->>Sandbox: stop(sandboxId)
     O-->>UI: lifecycle archiving
     T->>O: user asks during archiving
     O-->>T: immediate trace + shared-first path
     Note over T,O: New turn does not wait silently.
-    Box-->>O: archived
+    Sandbox-->>O: archived
     O-->>UI: lifecycle archived + billing.stop
     O->>O: release lock
     T->>O: acquire private lock
-    T->>Box: resume/recover
+    T->>Sandbox: resume/recover
 ```
 
 ### Stale/archived recovery
 
 ```mermaid
 flowchart TD
-    A[Need private runtime] --> B{Known session box?}
-    B -- no --> C[Create named user Box]
-    B -- yes --> D{Box state}
-    D -- ready/idle/running --> E[Use warm Box]
-    D -- archived/archiving --> F[Resume same Box]
+    A[Need private runtime] --> B{Known session sandbox?}
+    B -- no --> C[Create named user sandbox]
+    B -- yes --> D{sandbox state}
+    D -- ready/idle/running --> E[Use warm sandbox]
+    D -- archived/archiving --> F[Resume same sandbox]
     F --> G{Ready before resumeTimeoutMs?}
     G -- yes --> E
     G -- no --> H[Emit resume-timeout]
-    H --> I[Provision fresh named Box]
+    H --> I[Provision fresh named sandbox]
     I --> E
     D -- provisioning/cloning --> J[Poll readiness]
     J --> K{Ready before handoffTimeoutMs?}
@@ -353,7 +353,7 @@ The demo server writes each orchestrator event as SSE:
 res.write(`data: ${JSON.stringify(event)}\n\n`)
 ```
 
-Headers include `content-type: text/event-stream`, `cache-control: no-cache`, and `x-accel-buffering: no`. The browser reads `res.body.getReader()` and handles each SSE record as it arrives. `shared.delta` and `user-box.delta` append text to existing assistant bubbles keyed by `turnId`.
+Headers include `content-type: text/event-stream`, `cache-control: no-cache`, and `x-accel-buffering: no`. The browser reads `res.body.getReader()` and handles each SSE record as it arrives. `shared.delta` and `user-sandbox.delta` append text to existing assistant bubbles keyed by `turnId`.
 
 ```mermaid
 sequenceDiagram
@@ -371,28 +371,28 @@ sequenceDiagram
 ### Shared-machine streaming
 
 `createSharedInfraCapabilities()` in `src/capabilities.ts` runs the **same CLI
-harness binary as the Box** as a local `node:child_process` process on shared
+harness binary as the sandbox** as a local `node:child_process` process on shared
 infra, with the harness' structural no-tool flags engaged. Its stdout is streamed
-through the identical `parseHarnessOutput` parser the Box uses, so shared and Box
+through the identical `parseHarnessOutput` parser the sandbox uses, so shared and sandbox
 share message/chunk semantics exactly. There is no provider API call on this path.
 
 `visibleSharedText(rawSharedText)` strips hidden routing tags. This can buffer or withhold text around the control tag boundary, but normal bridge/answer text is yielded progressively as `shared.delta` events.
 
-### Box/private streaming
+### Sandbox/private streaming
 
-The Box side launches the real harness detached inside the Box and redirects stdout/stderr to a log. The host polls the log (`cat out.log`) and parses new bytes. Therefore private streaming latency is bounded by:
+The sandbox side launches the real harness detached inside the sandbox and redirects stdout/stderr to a log. The host polls the log (`cat out.log`) and parses new bytes. Therefore private streaming latency is bounded by:
 
 - the harness/LLM's own flush behavior,
 - the parser mode,
-- Box command round-trip latency,
+- Sandbox command round-trip latency,
 - `pollMs` (default 250ms; `realCliHarness` passes 150ms).
 
 ```mermaid
 flowchart LR
-    A[In-Box harness process] -->|stdout/stderr| B[out.log]
+    A[In-Sandbox harness process] -->|stdout/stderr| B[out.log]
     C[Host poll loop] -->|cat log every pollMs| B
     C --> D[parseHarnessOutput]
-    D --> E[user-box.delta]
+    D --> E[user-sandbox.delta]
     E --> F[SSE to browser]
 ```
 
@@ -408,7 +408,7 @@ flowchart LR
 
 `src/runtimeMatrix.ts` documents this explicitly as `native-token`, `native-json-events`, `stdout-chunks`, or `final-only` rather than pretending all harnesses stream identically.
 
-## Do shared and Box use the same harness?
+## Do shared and sandbox use the same harness?
 
 ### Current state
 
@@ -416,14 +416,14 @@ The public abstraction is one `HarnessAdapter` with two methods:
 
 ```ts
 shared(ctx: SharedContext): AsyncIterable<string>
-userBox(ctx: UserBoxContext): AsyncIterable<string>
+userSandbox(ctx: UserSandboxContext): AsyncIterable<string>
 ```
 
 So library users provide one harness adapter that owns both sides, and the
 default `realCliHarness()` is now **symmetric**:
 
 - `shared()` runs the same CLI harness binary on shared infra via `createSharedInfraCapabilities()`, with `runHarnessTurn(spec, runtime, ctx, {toolsAllowed:false})`.
-- `userBox()` runs the same binary inside the private Box via `capabilities.runHarness()`, with `runHarnessTurn(spec, ctx.capabilities, ctx, {toolsAllowed:true})`.
+- `userSandbox()` runs the same binary inside the private sandbox via `capabilities.runHarness()`, with `runHarnessTurn(spec, ctx.capabilities, ctx, {toolsAllowed:true})`.
 
 Both sides call the identical `runHarnessTurn`, identical `buildHarnessPromptBundle`,
 and identical `parseHarnessOutput`. The selected provider/model and common product
@@ -436,7 +436,7 @@ harness' own structural no-tool flags vs its tool-enabled flags through
 ```mermaid
 flowchart TD
     G[User harness adapter spec] --> H[shared: same binary, tools structurally disabled]
-    G --> I[Box: same binary, tools enabled]
+    G --> I[sandbox: same binary, tools enabled]
     J[buildHarnessPromptBundle] --> H
     J --> I
     K[toolsAllowed=false -> buildArgv/buildEnv no-tool flags] --> H
@@ -449,24 +449,24 @@ Remaining (separate) limitations not addressed by this change:
 
 - demo backend is Claude-only (`scripts/interactive-proof-server.ts` imports only `examples/claude-sdk/adapter.js` and requires `ANTHROPIC_API_KEY`),
 - shared capabilities' web search is a placeholder delegated string unless a custom capability is supplied,
-- Box duplicate suppression is prompt-mediated, not first-class structured policy.
+- Sandbox duplicate suppression is prompt-mediated, not first-class structured policy.
 
 ## Customization map
 
 | Capability | Current API / implementation | Control level today | Gap / ideal |
 |---|---|---:|---|
-| System prompt | `buildSharedSystem()`, `buildUserBoxInstructions()`, custom `HarnessAdapter` | Medium for custom adapters; low for default helper | First-class prompt composer: user base prompt + framework side additions |
-| Shared agentic loop | `HarnessAdapter.shared(ctx)` → same `runHarnessTurn` as Box on shared infra | High; default helper runs the same CLI harness with tools structurally disabled | Expose reusable default loop hooks instead of replacing whole method |
-| Box agentic loop | `HarnessAdapter.userBox(ctx)` and `runHarness()` | High | Add structured handoff/suppression result contract |
-| Tools enable/disable | `SafeSharedCapabilities` denies machine actions; `UserBoxCapabilities` full tools | High structural split | More granular policies per tool/category and user approval rules |
+| System prompt | `buildSharedSystem()`, `buildUserSandboxInstructions()`, custom `HarnessAdapter` | Medium for custom adapters; low for default helper | First-class prompt composer: user base prompt + framework side additions |
+| Shared agentic loop | `HarnessAdapter.shared(ctx)` → same `runHarnessTurn` as sandbox on shared infra | High; default helper runs the same CLI harness with tools structurally disabled | Expose reusable default loop hooks instead of replacing whole method |
+| Sandbox agentic loop | `HarnessAdapter.userSandbox(ctx)` and `runHarness()` | High | Add structured handoff/suppression result contract |
+| Tools enable/disable | `SafeSharedCapabilities` denies machine actions; `UserSandboxCapabilities` full tools | High structural split | More granular policies per tool/category and user approval rules |
 | Web search | `SafeSharedCapabilities.webSearch()` placeholder/delegated | Medium only via custom capability/adapter | First-class searchable tool policy and safety hooks |
 | Message filtering/mapping | Hidden context builders and transcript storage internal; custom adapter can transform | Medium-low | First-class `mapMessages`, `filterTranscript`, redaction hooks |
-| Chunk/event hooks | Orchestrator yields events; `onExec`, `onHarnessEvent` internal option for Box capabilities | Medium | Public `onChunk`, `onEvent`, `mapEvent`, backpressure hooks |
+| Chunk/event hooks | Orchestrator yields events; `onExec`, `onHarnessEvent` internal option for sandbox capabilities | Medium | Public `onChunk`, `onEvent`, `mapEvent`, backpressure hooks |
 | Harness/model hot-swap | `HarnessSelection` per turn; `models` in adapter | Medium-high | Policy hooks for compatible session migration and prompt reminders |
 | Context reminders | Hidden XML and recap injection | Medium | User-provided reminder composer and structured memory APIs |
-| Tool safety | Shared structural denial; Box gets full command/file primitives | Medium | Per-side allow/deny/audit policy DSL |
+| Tool safety | Shared structural denial; sandbox gets full command/file primitives | Medium | Per-side allow/deny/audit policy DSL |
 | Streaming | `AsyncIterable<string>` on both methods; SSE relay | High conceptually | Declare streaming capability metadata per harness and UI labels automatically |
-| Shared/Box same harness | Default helper now runs the **exact same CLI harness** on both surfaces (`runHarnessTurn`); only `toolsAllowed` differs | High structural identity | Built-in two-surface harness runner with same loop and policy-injected tools — done |
+| Shared/sandbox same harness | Default helper now runs the **exact same CLI harness** on both surfaces (`runHarnessTurn`); only `toolsAllowed` differs | High structural identity | Built-in two-surface harness runner with same loop and policy-injected tools — done |
 
 ## Current API shape
 
@@ -477,17 +477,17 @@ interface HarnessAdapter {
   requiredEnv: string[];
   models: ModelOption[];
   shared(ctx: SharedContext): AsyncIterable<string>;
-  userBox(ctx: UserBoxContext): AsyncIterable<string>;
+  userSandbox(ctx: UserSandboxContext): AsyncIterable<string>;
 }
 
 interface OrchestratorOptions {
-  box: BoxClient;
+  sandbox: SandboxClient;
   harnesses: HarnessAdapter[];
   sessions?: SessionStore;
   recapper?: Recapper;
-  sharedBoxName?: string;
-  userBoxName?: (userId: string) => string;
-  userBoxTtlSeconds?: number;
+  sharedSandboxName?: string;
+  userSandboxName?: (userId: string) => string;
+  userSandboxTtlSeconds?: number;
   readinessPollMs?: number;
   handoffTimeoutMs?: number;
   resumeTimeoutMs?: number;
@@ -509,28 +509,28 @@ type HandoffDecision =
   | { action: "add"; reason?: string };
 
 interface OptiboxAgentConfig {
-  box: {
+  sandbox: {
     apiKey: string;
-    client?: BoxClient;
-    userBoxName?: (userId: string) => string;
+    client?: SandboxClient;
+    userSandboxName?: (userId: string) => string;
     ttlSeconds?: number;
   };
   harness: {
     name: string;
     models: ModelOption[];
     loop: AgenticLoopHandler;
-    runLocation?: "host" | "shared-box" | "user-box";
+    runLocation?: "host" | "shared-sandbox" | "user-sandbox";
     supportsStreaming?: StreamingSupport;
   };
   prompts: {
     baseSystem: PromptComposer;
     sharedSystem?: PromptComposer;
-    boxSystem?: PromptComposer;
+    sandboxSystem?: PromptComposer;
     reminders?: PromptComposer;
   };
   policies: {
     sharedTools: ToolPolicy;
-    boxTools: ToolPolicy;
+    sandboxTools: ToolPolicy;
     webSearch?: WebSearchPolicy;
     safety?: ToolSafetyPolicy;
     handoff?: {
@@ -545,12 +545,12 @@ interface OptiboxAgentConfig {
   messages?: {
     mapToHarness?: MessageMapper;
     filterForShared?: MessageFilter;
-    filterForBox?: MessageFilter;
+    filterForSandbox?: MessageFilter;
     redactHidden?: Redactor;
   };
   streaming?: {
     onSharedChunk?: ChunkHook;
-    onBoxChunk?: ChunkHook;
+    onSandboxChunk?: ChunkHook;
     mapEvent?: EventMapper;
     onToolEvent?: ToolEventHook;
   };
@@ -572,8 +572,8 @@ flowchart LR
     U --> E[Chunk/event hooks]
 
     F[Optibox framework] --> G[Shared-first when not ready]
-    F --> H[Parallel Box resume/start]
-    F --> I[Warm Box direct]
+    F --> H[Parallel sandbox resume/start]
+    F --> I[Warm sandbox direct]
     F --> J[Handoff duplicate suppression scaffolding]
     F --> K[Billing/stop/archive lifecycle]
 
@@ -583,7 +583,7 @@ flowchart LR
     D --> L
     G --> L
 
-    A --> M[Box agent instance]
+    A --> M[sandbox agent instance]
     B --> M
     C --> M
     D --> M
@@ -599,17 +599,17 @@ flowchart LR
 `runAdaptiveTurn()` previously built the shared hidden context immediately with:
 
 ```ts
-const sharedMachine = { location: "shared-box", tools: false, status: "provisioning" };
+const sharedMachine = { location: "shared-sandbox", tools: false, status: "provisioning" };
 ```
 
-This happened before `await statusPromise`, so even when the actual user Box was `archiving` and the shared UI was correctly covering a resume, the hidden context passed to the shared LLM could say `provisioning`.
+This happened before `await statusPromise`, so even when the actual user sandbox was `archiving` and the shared UI was correctly covering a resume, the hidden context passed to the shared LLM could say `provisioning`.
 
 ### Fix
 
 The orchestrator now:
 
 1. emits `shared.reasoning.start` immediately, preserving the no-silent-wait property;
-2. awaits precise Box status;
+2. awaits precise sandbox status;
 3. preserves the warm-ready direct path;
 4. computes `bridgeStatus` (`resuming` for archived/archiving, otherwise `provisioning`);
 5. builds and injects the shared hidden context only after the precise status is known.
@@ -619,7 +619,7 @@ sequenceDiagram
     participant O as Orchestrator
     participant Status as statusPromise
     O-->>UI: shared.reasoning.start immediately
-    O->>Status: await precise userBoxStatus
+    O->>Status: await precise userSandboxStatus
     Status-->>O: archiving
     O->>O: bridgeStatus=resuming
     O-->>UI: context.injected machine.status=resuming
@@ -639,16 +639,16 @@ The test `CPU request during archiving gets shared response before private resum
 
 ## Current gaps / future work
 
-1. **Default shared path is not the exact same in-Box harness binary.** The adapter abstraction allows this, but `realCliHarness.shared()` currently uses host-side provider streaming.
-2. **Duplicate suppression is prompt-mediated.** Add a structured shared result / Box handoff decision contract for deterministic suppression.
-3. **Tool policies are coarse.** Shared has structural denials; Box has broad full capabilities. Add granular allow/deny/audit policies.
+1. **Default shared path is not the exact same in-Sandbox harness binary.** The adapter abstraction allows this, but `realCliHarness.shared()` currently uses host-side provider streaming.
+2. **Duplicate suppression is prompt-mediated.** Add a structured shared result / sandbox handoff decision contract for deterministic suppression.
+3. **Tool policies are coarse.** Shared has structural denials; sandbox has broad full capabilities. Add granular allow/deny/audit policies.
 4. **Demo is Claude-only.** The library supports multiple adapters, but the interactive proof server imports only Claude and requires `ANTHROPIC_API_KEY`.
 5. **Web search is not a real shared tool by default.** `webSearch()` is a delegated placeholder unless customized.
-6. **Streaming varies by harness.** The UI streams all events immediately, but token granularity depends on provider/harness output and Box log polling.
+6. **Streaming varies by harness.** The UI streams all events immediately, but token granularity depends on provider/harness output and sandbox log polling.
 7. **Prompt/message mapping is not first-class.** Advanced users can replace adapters, but a composable prompt/message/event API would be cleaner.
 
 ## Validation summary
 
 - Automated: `npm test` → 26/26 passing.
-- Visible Chrome QA from the behavior fix: asking CPU count while the private Box was archiving produced immediate shared text, resumed the Box in parallel, ran `nproc`, and streamed the private answer `4 CPUs.`
+- Visible Chrome QA from the behavior fix: asking CPU count while the private sandbox was archiving produced immediate shared text, resumed the sandbox in parallel, ran `nproc`, and streamed the private answer `4 CPUs.`
 - Regression added in this report pass: hidden shared machine state for archiving CPU path is now asserted as `resuming`, not generic `provisioning`.

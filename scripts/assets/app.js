@@ -1,9 +1,9 @@
-// Per-device identity. Boxes are named per userId server-side, so a shared link
-// with a fixed id would put every visitor on ONE box (shared files, one billing
+// Per-device identity. Sandboxes are named per userId server-side, so a shared link
+// with a fixed id would put every visitor on ONE sandbox (shared files, one billing
 // meter, colliding turns). Derive a stable id from a browser fingerprint plus a
 // persisted random suffix — the fingerprint separates device models even when
 // storage is wiped; the random suffix separates two identical devices; the
-// localStorage cache keeps the SAME device on the SAME box (and its files)
+// localStorage cache keeps the SAME device on the SAME sandbox (and its files)
 // across reloads. Every branch is guarded so the headless client test (no
 // navigator/screen/localStorage/crypto) still falls back to a random id.
 function fnv1a(s){let h=0x811c9dc5>>>0;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,0x01000193)>>>0;}return h.toString(36);}
@@ -32,14 +32,14 @@ function loadConversationId(){
 }
 let H=[]; let PRICING=null; let HARNESS_META={serverKeysAllowed:false,credentialMode:'byok-required',env:{}}; let selectedHarness='', selectedProvider='', selectedModel='', selectedUser=deviceUserId(), selectedConversation=loadConversationId();
 let timer=null, billSince=0, billRate=0, billing=false, totalSeconds=0;
-let autoStopInterval=null, autoStopDeadline=0, autoStopBoxId=null;
+let autoStopInterval=null, autoStopDeadline=0, autoStopSandboxId=null;
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 // Reasoning levels arrive as the wire ids ("low"/"medium"/"high"); the panel
 // shows them the way every other label in it reads.
 function titleCase(s){return String(s).charAt(0).toUpperCase()+String(s).slice(1);}
 // ---- dropdown -------------------------------------------------------------
-// The app's ONE picker. A native <select> is unstylable past its own box (the
+// The app's ONE picker. A native <select> is unstylable past its own sandbox (the
 // menu is the operating system's), so every picker is a trigger plus a floating
 // panel drawn in the app's language. State lives on the element, so the single
 // call `dropdown(el, options, value, onChange)` both creates and updates one.
@@ -174,7 +174,7 @@ let clearedCreds={};
 function readSettings(){try{return JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}')||{};}catch{return {};}}
 function writeSettings(next){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(next));}catch(_){}}
 function rememberSelection(){writeSettings({harness:selectedHarness,provider:selectedProvider,model:selectedModel,reasoningEffort:selectedReasoning});}
-function boxAccountReady(){return Boolean(HARNESS_META.env&&HARNESS_META.env.BOX_API_KEY);}
+function sandboxAccountReady(){return Boolean(HARNESS_META.env&&HARNESS_META.env.BOAT_API_KEY);}
 function selectedModelOption(){const h=H.find(x=>x.name===selectedHarness);return h&&h.models.find(m=>m.provider===selectedProvider&&m.model===selectedModel);}
 // The server decides what a model needs and whether THIS user can reach it
 // (their own credentials first, the preview's as the fallback) — the page just
@@ -193,7 +193,7 @@ function runsOn(){
 }
 function currentSettingsStatus(){
   const model=selectedModelOption();
-  if(!boxAccountReady())return {ok:false,msg:'This preview has no Box account configured.'};
+  if(!sandboxAccountReady())return {ok:false,msg:'This preview has no Boat account configured.'};
   if(model&&!modelUnlocked(model))return {ok:false,msg:'Add your '+(model.requiredEnv||'provider key')+' below to use '+(model.label||model.model)+'.'};
   return {ok:true,msg:'Runs on '+runsOn()+' · '+(AGENTS.envPending?'applies at next start':'applied now')};
 }
@@ -227,10 +227,10 @@ function renderSettingsControls(){
   renderCredentialFields();
   updateSettingsStatus();
 }
-// ---- Sign in: the subscriptions, connected the way the Box dashboard does it.
+// ---- Sign in: the subscriptions, connected the way the Boat dashboard does it.
 // Claude prints a code the user pastes back; ChatGPT and Kimi show a short code
 // the user confirms in their browser while we poll. All apply to the user's own
-// box the moment they land, through the same route a typed key takes.
+// sandbox the moment they land, through the same route a typed key takes.
 function renderSignin(){
   const wrap=$('agentsSignin');if(!wrap)return;
   wrap.innerHTML=SUBSCRIPTIONS.map(function(p){
@@ -400,23 +400,23 @@ const hiddenContextPattern=new RegExp('<consumer-context>[\s\S]*?</consumer-cont
 // "them.Good,"). Trim only the display copy, recomputed from full raw anyway.
 function stripHidden(s){return String(s).replace(hiddenContextPattern,'');}
 function fmtUsd(n){return '$'+n.toFixed(6);}
-const routeState={phase:'idle',boxId:null,billing:false,finalRoute:null,done:false};
+const routeState={phase:'idle',sandboxId:null,billing:false,finalRoute:null,done:false};
 function setRoute(route,text){const r=$('routeStatus');if(r)r.textContent=text||'';}
 // The Backend diagram is painted from routeState alone: one function decides which
 // node is lit, whether it is "processing", where the packet sits, and when the
 // answer is delivered back to You. A single message emoji travels the arrows.
-function diagramStage(){const p=routeState.phase,box=routeState.boxId;
-  if(routeState.done)return {owner:box?'private':'shared',packet:'you',deliver:true};
+function diagramStage(){const p=routeState.phase,sandbox=routeState.sandboxId;
+  if(routeState.done)return {owner:sandbox?'private':'shared',packet:'you',deliver:true};
   if(p==='error')return {owner:'private',packet:'private',error:true};
-  if(!p||(p==='idle'&&!box))return {owner:null,packet:'you',hidden:true};
+  if(!p||(p==='idle'&&!sandbox))return {owner:null,packet:'you',hidden:true};
   if(p==='accepted')return {owner:'shared',packet:'shared',proc:true,traveling:true};
   if(p==='shared-bridge'||p==='shared')return {owner:'shared',packet:'shared',proc:true};
   if(p==='shared-delta')return {owner:'shared',packet:'you',deliver:true};
   if(p==='handoff')return {owner:'private',packet:'private',traveling:true};
   if(['starting','provisioning','provisioned','cloning','resuming','resume-timeout'].includes(p))return {owner:'private',packet:'private',proc:true};
   if(p==='tools')return {owner:'private',packet:'private',proc:true,tools:true};
-  if(p==='user-box')return {owner:'private',packet:'you',deliver:true};
-  if(['ready','running','billing','runtime-proof'].includes(p)||(p==='idle'&&box))return {owner:'private',packet:'private',proc:true};
+  if(p==='user-sandbox')return {owner:'private',packet:'you',deliver:true};
+  if(['ready','running','billing','runtime-proof'].includes(p)||(p==='idle'&&sandbox))return {owner:'private',packet:'private',proc:true};
   return {owner:'shared',packet:'shared',proc:true};}
 function paintDiagram(){const s=$('schematic'),packet=$('packet');if(!s||!packet||!packet.style)return;const d=diagramStage();
   const nodes={you:s.querySelector('.user-node'),shared:s.querySelector('.shared-node'),private:s.querySelector('.private-node')};
@@ -432,36 +432,36 @@ ok:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentC
 warn:'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M236.8,188.09,149.35,36.22h0a24.76,24.76,0,0,0-42.7,0L19.2,188.09a23.51,23.51,0,0,0,0,23.72A24.35,24.35,0,0,0,40.55,224h174.9a24.35,24.35,0,0,0,21.33-12.19A23.51,23.51,0,0,0,236.8,188.09ZM222.93,203.8a8.5,8.5,0,0,1-7.48,4.2H40.55a8.5,8.5,0,0,1-7.48-4.2,7.59,7.59,0,0,1,0-7.72L120.52,44.21a8.75,8.75,0,0,1,15,0l87.45,151.87A7.59,7.59,0,0,1,222.93,203.8ZM120,144V104a8,8,0,0,1,16,0v40a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,180Z"/></svg>'};
 function setState(text){$('machineState').textContent=text;}
 function fmtAutoStopRemaining(ms){return Math.max(0,Math.ceil(ms/1000))+'s';}
-function clearAutoStopTimer(label){autoStopDeadline=0;autoStopBoxId=null;if(autoStopInterval){clearInterval(autoStopInterval);autoStopInterval=null;}$('autoStopTimer').textContent=label||'idle';}
+function clearAutoStopTimer(label){autoStopDeadline=0;autoStopSandboxId=null;if(autoStopInterval){clearInterval(autoStopInterval);autoStopInterval=null;}$('autoStopTimer').textContent=label||'idle';}
 function renderAutoStopTimer(){if(!autoStopDeadline){$('autoStopTimer').textContent='idle';return;}const remaining=Math.max(0,autoStopDeadline-Date.now());$('autoStopTimer').textContent=remaining<=0?'stopping…':fmtAutoStopRemaining(remaining);if(remaining<=0&&autoStopInterval){clearInterval(autoStopInterval);autoStopInterval=null;}}
-function startAutoStopTimer(ev){autoStopDeadline=ev.deadlineEpochMs||(Date.now()+Math.max(0,ev.remainingMs||0));autoStopBoxId=ev.boxId||autoStopBoxId;renderAutoStopTimer();if(autoStopInterval)clearInterval(autoStopInterval);autoStopInterval=setInterval(renderAutoStopTimer,200);}
-function describeAutoStop(ev){const remaining=fmtAutoStopRemaining(ev.remainingMs||0);if(ev.phase==='started'||ev.phase==='tick')return 'Assistant done · user idle · Box auto-stops in '+remaining;if(ev.phase==='held')return 'Auto-stop paused · Box still needed (uploading / composing)';if(ev.phase==='stopping')return 'Auto-stop countdown reached 0s · stopping Box now';if(ev.phase==='canceled')return 'Auto-stop timer reset · new message is using the Box';return ev.note||'Auto-stop timer updated';}
-function boxLabel(id){return id&&id!=='pending'?' · '+id:'';}
-function resetRouteForTurn(){clearAutoStopTimer('paused');routeState.phase='accepted';routeState.boxId=null;routeState.billing=false;routeState.finalRoute=null;routeState.done=false;setRoute('shared','message accepted · checking Box state, opening the shared bridge');paintDiagram();}
-function routeIsPrivate(){return Boolean(routeState.boxId)||['billing','starting','provisioning','provisioned','cloning','resuming','ready','idle','running','handoff','runtime-proof','tools','user-box'].includes(routeState.phase);}
+function startAutoStopTimer(ev){autoStopDeadline=ev.deadlineEpochMs||(Date.now()+Math.max(0,ev.remainingMs||0));autoStopSandboxId=ev.sandboxId||autoStopSandboxId;renderAutoStopTimer();if(autoStopInterval)clearInterval(autoStopInterval);autoStopInterval=setInterval(renderAutoStopTimer,200);}
+function describeAutoStop(ev){const remaining=fmtAutoStopRemaining(ev.remainingMs||0);if(ev.phase==='started'||ev.phase==='tick')return 'Assistant done · user idle · sandbox auto-stops in '+remaining;if(ev.phase==='held')return 'Auto-stop paused · sandbox still needed (uploading / composing)';if(ev.phase==='stopping')return 'Auto-stop countdown reached 0s · stopping sandbox now';if(ev.phase==='canceled')return 'Auto-stop timer reset · new message is using the sandbox';return ev.note||'Auto-stop timer updated';}
+function sandboxLabel(id){return id&&id!=='pending'?' · '+id:'';}
+function resetRouteForTurn(){clearAutoStopTimer('paused');routeState.phase='accepted';routeState.sandboxId=null;routeState.billing=false;routeState.finalRoute=null;routeState.done=false;setRoute('shared','message accepted · checking sandbox state, opening the shared bridge');paintDiagram();}
+function routeIsPrivate(){return Boolean(routeState.sandboxId)||['billing','starting','provisioning','provisioned','cloning','resuming','ready','idle','running','handoff','runtime-proof','tools','user-sandbox'].includes(routeState.phase);}
 function routeEvent(ev){_routeEvent(ev);if(ev.type==='turn.done')routeState.done=true;paintDiagram();}
 function _routeEvent(ev){
   if(ev.type==='stream.end')return;
   if(ev.type==='error'||ev.type==='turn.blocked'){routeState.phase='error';setRoute('error','Route error: private runtime did not complete; see trace for the real event.');return;}
-  if(ev.type==='trace'&&/backend|submit/.test(ev.stage||'')){routeState.phase='accepted';setRoute('shared','Route: backend accepted the message; shared bridge is live while Box status resolves.');return;}
-  if(ev.type==='trace'&&ev.stage==='route.direct'){routeState.phase='user-box';setRoute('private','Route: private Box is warm; message routed directly to it (no shared bridge).');return;}
-  if(ev.type==='trace'&&ev.stage==='shared.bridge.start'){if(routeIsPrivate()){setRoute('private','Route: shared agent is answering first while private Box status continues'+boxLabel(routeState.boxId)+'.');return;}routeState.phase='shared-bridge';setRoute('shared','Route: shared agent answers first while the private Box starts/resumes.');return;}
-  if(ev.type==='context.injected'&&ev.scope==='shared'){if(routeIsPrivate()){setRoute('private','Route: private Box is active'+boxLabel(routeState.boxId)+'; shared bridge is only covering latency.');return;}routeState.phase='shared';setRoute('shared','Route: shared infra is answering while the private Box boots in parallel.');return;}
-  if(ev.type==='shared.delta'&&routeState.phase!=='handoff'&&routeState.phase!=='user-box'){if(routeIsPrivate()){setRoute('private','Route: private Box path is active'+boxLabel(routeState.boxId)+'; shared text is just the bridge response.');return;}routeState.phase='shared-delta';setRoute('shared','Route: shared infra is streaming the bridge response; private Box events will take over when ready.');return;}
-  if(ev.type==='billing.start'){routeState.boxId=ev.boxId||routeState.boxId;routeState.billing=true;routeState.phase='billing';setRoute('private','Route: private Box billing is live'+boxLabel(routeState.boxId)+'; handoff/runtime events are active.');return;}
-  if(ev.type==='lifecycle'){routeState.boxId=ev.boxId||routeState.boxId;const state=String(ev.state||'');
-    if(['starting','provisioning','provisioned','cloning','resuming'].includes(state)){routeState.phase=state;setRoute('private','Route: private Box is '+state+boxLabel(routeState.boxId)+'; waiting for ready/handoff events.');return;}
-    if(['ready','idle','running'].includes(state)){routeState.phase=state;setRoute('private','Route: private Box is '+state+boxLabel(routeState.boxId)+'; user-machine runtime is taking this turn.');return;}
-    if(state==='resume-timeout'){routeState.phase=state;setRoute('private','Route: previous Box resume timed out; starting a fresh private Box.');return;}
-    if(['stopping','archiving','archived','none'].includes(state)){routeState.phase=state;setRoute('private','Route: private Box is '+state+boxLabel(routeState.boxId)+'; billing state is being reconciled.');return;}
+  if(ev.type==='trace'&&/backend|submit/.test(ev.stage||'')){routeState.phase='accepted';setRoute('shared','Route: backend accepted the message; shared bridge is live while sandbox status resolves.');return;}
+  if(ev.type==='trace'&&ev.stage==='route.direct'){routeState.phase='user-sandbox';setRoute('private','Route: private sandbox is warm; message routed directly to it (no shared bridge).');return;}
+  if(ev.type==='trace'&&ev.stage==='shared.bridge.start'){if(routeIsPrivate()){setRoute('private','Route: shared agent is answering first while private sandbox status continues'+sandboxLabel(routeState.sandboxId)+'.');return;}routeState.phase='shared-bridge';setRoute('shared','Route: shared agent answers first while the private sandbox starts/resumes.');return;}
+  if(ev.type==='context.injected'&&ev.scope==='shared'){if(routeIsPrivate()){setRoute('private','Route: private sandbox is active'+sandboxLabel(routeState.sandboxId)+'; shared bridge is only covering latency.');return;}routeState.phase='shared';setRoute('shared','Route: shared infra is answering while the private sandbox boots in parallel.');return;}
+  if(ev.type==='shared.delta'&&routeState.phase!=='handoff'&&routeState.phase!=='user-sandbox'){if(routeIsPrivate()){setRoute('private','Route: private sandbox path is active'+sandboxLabel(routeState.sandboxId)+'; shared text is just the bridge response.');return;}routeState.phase='shared-delta';setRoute('shared','Route: shared infra is streaming the bridge response; private sandbox events will take over when ready.');return;}
+  if(ev.type==='billing.start'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;routeState.billing=true;routeState.phase='billing';setRoute('private','Route: private sandbox billing is live'+sandboxLabel(routeState.sandboxId)+'; handoff/runtime events are active.');return;}
+  if(ev.type==='lifecycle'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;const state=String(ev.state||'');
+    if(['starting','provisioning','provisioned','cloning','resuming'].includes(state)){routeState.phase=state;setRoute('private','Route: private sandbox is '+state+sandboxLabel(routeState.sandboxId)+'; waiting for ready/handoff events.');return;}
+    if(['ready','idle','running'].includes(state)){routeState.phase=state;setRoute('private','Route: private sandbox is '+state+sandboxLabel(routeState.sandboxId)+'; user-machine runtime is taking this turn.');return;}
+    if(state==='resume-timeout'){routeState.phase=state;setRoute('private','Route: previous sandbox resume timed out; starting a fresh private sandbox.');return;}
+    if(['stopping','archiving','archived','none'].includes(state)){routeState.phase=state;setRoute('private','Route: private sandbox is '+state+sandboxLabel(routeState.sandboxId)+'; billing state is being reconciled.');return;}
   }
-  if(ev.type==='handoff.started'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='handoff';setRoute('private','Route: handoff started on the user machine'+boxLabel(routeState.boxId)+'; tools are available.');return;}
-  if(ev.type==='runtime.proof'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='runtime-proof';setRoute('private','Route: confirmed in-Box '+ev.harness+' runtime'+boxLabel(routeState.boxId)+'; streaming='+String(ev.streaming||'unknown')+'.');return;}
-  if(ev.type==='exec'||ev.type==='harness.tool'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='tools';setRoute('private','Route: private Box runtime is using tools'+boxLabel(routeState.boxId)+'.');return;}
-  if(ev.type==='user-box.delta'){routeState.boxId=ev.boxId||routeState.boxId;routeState.phase='user-box';setRoute('private','Route: user-machine answer is streaming'+boxLabel(routeState.boxId)+'.');return;}
-  if(ev.type==='billing.stop'){routeState.boxId=ev.boxId||routeState.boxId;routeState.billing=false;setRoute('private','Route: billing paused for private Box'+boxLabel(routeState.boxId)+'.');return;}
-  if(ev.type==='autostop.timer'){routeState.boxId=ev.boxId||routeState.boxId;if(ev.phase==='canceled'){setRoute('private','Route: auto-stop reset because a newer message arrived; countdown restarts after the active answer.');}else if(ev.phase==='stopping'){setRoute('private','Route: visible auto-stop countdown reached zero; stopping private Box'+boxLabel(routeState.boxId)+'.');}else{setRoute('private','Route: assistant finished and user is idle; auto-stop in '+fmtAutoStopRemaining(ev.remainingMs||0)+boxLabel(routeState.boxId)+'.');}return;}
-  if(ev.type==='turn.done'){routeState.boxId=ev.boxId||routeState.boxId;routeState.finalRoute=ev.route||null;const route=ev.route||((ev.boxId||routeState.phase==='user-box'||routeState.phase==='handoff')?'user-box':'shared');const routeLabel=route==='bridge'?'private Box bridge':route==='direct'?'warm private Box':route==='user-box'?'user-machine':route;setRoute(route==='shared'?'shared':'private',route==='shared'?'Route: turn completed on shared infra; no stale private waiting state.':'Route: turn completed via '+routeLabel+' runtime'+boxLabel(routeState.boxId)+'.');return;}
+  if(ev.type==='handoff.started'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;routeState.phase='handoff';setRoute('private','Route: handoff started on the user machine'+sandboxLabel(routeState.sandboxId)+'; tools are available.');return;}
+  if(ev.type==='runtime.proof'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;routeState.phase='runtime-proof';setRoute('private','Route: confirmed in-Sandbox '+ev.harness+' runtime'+sandboxLabel(routeState.sandboxId)+'; streaming='+String(ev.streaming||'unknown')+'.');return;}
+  if(ev.type==='exec'||ev.type==='harness.tool'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;routeState.phase='tools';setRoute('private','Route: private sandbox runtime is using tools'+sandboxLabel(routeState.sandboxId)+'.');return;}
+  if(ev.type==='user-sandbox.delta'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;routeState.phase='user-sandbox';setRoute('private','Route: user-machine answer is streaming'+sandboxLabel(routeState.sandboxId)+'.');return;}
+  if(ev.type==='billing.stop'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;routeState.billing=false;setRoute('private','Route: billing paused for private sandbox'+sandboxLabel(routeState.sandboxId)+'.');return;}
+  if(ev.type==='autostop.timer'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;if(ev.phase==='canceled'){setRoute('private','Route: auto-stop reset because a newer message arrived; countdown restarts after the active answer.');}else if(ev.phase==='stopping'){setRoute('private','Route: visible auto-stop countdown reached zero; stopping private sandbox'+sandboxLabel(routeState.sandboxId)+'.');}else{setRoute('private','Route: assistant finished and user is idle; auto-stop in '+fmtAutoStopRemaining(ev.remainingMs||0)+sandboxLabel(routeState.sandboxId)+'.');}return;}
+  if(ev.type==='turn.done'){routeState.sandboxId=ev.sandboxId||routeState.sandboxId;routeState.finalRoute=ev.route||null;const route=ev.route||((ev.sandboxId||routeState.phase==='user-sandbox'||routeState.phase==='handoff')?'user-sandbox':'shared');const routeLabel=route==='bridge'?'private sandbox bridge':route==='direct'?'warm private sandbox':route==='user-sandbox'?'user-machine':route;setRoute(route==='shared'?'shared':'private',route==='shared'?'Route: turn completed on shared infra; no stale private waiting state.':'Route: turn completed via '+routeLabel+' runtime'+sandboxLabel(routeState.sandboxId)+'.');return;}
 }
 function activeSeconds(){return totalSeconds+(billing?(Date.now()-billSince)/1000:0);}
 function renderTotals(){const seconds=activeSeconds();$('totalSeconds').textContent=seconds.toFixed(1)+'s';$('totalCost').textContent=fmtUsd(seconds*billRate);}
@@ -485,7 +485,7 @@ function chooseDefaultModel(){
   if(!preferred){setState('No harnesses available');return;}
   const model=preferred.models.find(modelUnlocked)||preferred.models[0];
   selectedHarness=preferred.name;selectedProvider=model.provider;selectedModel=model.model;selectedReasoning='';
-  if(!modelUnlocked(model)||!boxAccountReady())setState('Waiting for your Agents setup · private machine stopped');
+  if(!modelUnlocked(model)||!sandboxAccountReady())setState('Waiting for your Agents setup · private machine stopped');
 }
 const bubbles=new Map();
 // ONE working indicator, owned by the latest turn. Concurrent/superseded turns
@@ -499,10 +499,10 @@ let workingEl=null;
 function chatStick(c){return (c.scrollHeight||0)-(c.scrollTop||0)-(c.clientHeight||0)<90;}
 function showWorking(){const c=$('chat');const stick=chatStick(c);$('empty')?.remove();if(!workingEl){workingEl=document.createElement('div');workingEl.className='working';workingEl.textContent='working';}moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;}
 // The "working…" indicator lives in the FOOTER of the message currently streaming
-// (activeBoxKey), so it reads as "this message is still being written". When no
+// (activeSandboxKey), so it reads as "this message is still being written". When no
 // message is streaming — a fresh turn, or the last message is already finalized —
 // it falls back to a standalone line at the bottom of the chat.
-function moveWorkingToBottom(){if(!workingEl)return;const host=activeBoxKey?bubbles.get(activeBoxKey):null;if(host){workingEl.classList.add('inMsg');host.appendChild(workingEl);}else{workingEl.classList.remove('inMsg');$('chat').appendChild(workingEl);}}
+function moveWorkingToBottom(){if(!workingEl)return;const host=activeSandboxKey?bubbles.get(activeSandboxKey):null;if(host){workingEl.classList.add('inMsg');host.appendChild(workingEl);}else{workingEl.classList.remove('inMsg');$('chat').appendChild(workingEl);}}
 function clearWorking(){if(workingEl){workingEl.remove();workingEl=null;}}
 let showTraces=false;
 function syncTraceVisibility(){document.body.classList.toggle('hide-traces',!showTraces);}
@@ -544,10 +544,10 @@ s=s.replace(new RegExp('^[ ]*(?:[-*]|[0-9]+[.])[ ]+(.+)$','gm'),'<span class="md
 s=s.replace(new RegExp('\\n?(<pre>)','g'),'$1').replace(new RegExp('(</pre>)\\n?','g'),'$1');
 return s;}
 // One live desktop widget per reply loop: the FIRST desktop-touching tool call
-// of a turn embeds the box's desktop stream (view-only until clicked); later
+// of a turn embeds the sandbox's desktop stream (view-only until clicked); later
 // desktop calls in the same turn reuse it; a new turn's widget ends the old
 // one. (Cross-origin iframes cannot be recorded client-side, so no replay.)
-// Default mode is the box's OWN desktop stream (Moonlight, 60fps), embedded at
+// Default mode is the sandbox's OWN desktop stream (Moonlight, 60fps), embedded at
 // 480p via moonlight-web's width/height URL params (verified in
 // /opt/moonlight-web/static/stream.js). noVNC is the fallback behind "switch to
 // VNC" — plain websockets, for networks that block WebRTC/UDP where Moonlight
@@ -556,7 +556,7 @@ return s;}
 function capStreamRes(url,vnc){
   if(vnc){
     // The API's noVNC URL bakes resize=remote (ask the SERVER to resize the X
-    // session), which the box's VNC server doesn't honor — the desktop then
+    // session), which the sandbox's VNC server doesn't honor — the desktop then
     // renders 1:1 native pixels inside the 540px preview: zoomed-in AND
     // cropped. resize=scale scales the remote framebuffer client-side to fit
     // the iframe (letterboxed, whole desktop visible).
@@ -569,10 +569,10 @@ var desktopWidget=null;
 var DESKTOP_MARKS=['xdotool','wmctrl','xdg-open','ydotool','wtype','scrot','DISPLAY=','chromium','google-chrome','firefox','lux '];
 function isDesktopCommand(cmd){cmd=String(cmd||'');for(var i=0;i<DESKTOP_MARKS.length;i++)if(cmd.indexOf(DESKTOP_MARKS[i])>=0)return true;return false;}
 function endDesktopWidget(){if(!desktopWidget)return;try{if(desktopWidget.frame)desktopWidget.frame.src='about:blank';}catch(_){}desktopWidget.el.classList.add('ended');var tag=desktopWidget.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · session ended';desktopWidget=null;}
-// A finished desktop session recording (box-side ffmpeg, emitted at round end).
+// A finished desktop session recording (sandbox-side ffmpeg, emitted at round end).
 // Swaps the live stream widget for a seekable <video> IN PLACE — or, on replay
 // (where the live widget was never created), makes a fresh one. Reads the mp4
-// via /api/fs/read, which serves it from the box OR its snapshot, so playback
+// via /api/fs/read, which serves it from the sandbox OR its snapshot, so playback
 // works long after the machine parked. Not gated by isLatest/replaying: the
 // recording should render live AND on reopen.
 async function renderDesktopRecording(ev,localId){
@@ -615,7 +615,7 @@ function ensureDesktopWidget(localId){
   const el=document.createElement('div');el.className='msg desktop';
   el.innerHTML='<div class="desktopTag"><span>desktop · connecting</span><span class="dtLinks"><a href="#" class="dtVnc" style="display:none">switch to VNC</a><a href="#" class="dtOpen" target="_blank" rel="noopener" style="display:none">open in tab</a></span></div><div class="desktopWrap"><div class="desktopNote">starting desktop stream…</div></div>';
   c.appendChild(el);moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;
-  // The box's own stream first; VNC stays one click away for networks that
+  // The sandbox's own stream first; VNC stays one click away for networks that
   // block WebRTC.
   desktopWidget={localId:localId,el:el,frame:null,vnc:false};
   el.querySelector('a.dtVnc').addEventListener('click',function(e){e.preventDefault();swapDesktopMode(desktopWidget);});
@@ -632,10 +632,10 @@ async function swapDesktopMode(w){
   var target=w.vnc?'VNC':'stream';
   var tag=w.el.querySelector('.desktopTag span');if(tag)tag.textContent='desktop · switching to '+target+'…';
   try{
-    // Cold VNC provisioning: the box's noVNC server is started on first switch
+    // Cold VNC provisioning: the sandbox's noVNC server is started on first switch
     // and can take ~30-60s to come up (measured). Poll patiently (~90s) and
     // surface the API's live status ("Preparing VNC desktop…") so the wait
-    // never looks frozen. Each poll also renews the server-side box hold, so
+    // never looks frozen. Each poll also renews the server-side sandbox hold, so
     // the machine can't park out from under a switch in progress.
     for(var i=0;i<45;i++){
       if(desktopWidget!==w)return;
@@ -677,13 +677,13 @@ async function attachDesktopStream(w){
         // Heartbeat: renew the server-side desktop hold while this widget's
         // turn is still running, so the machine stays up under the stream.
         // Renew ONLY while the agent's turn is still producing its answer. Keying
-        // off boxDone (set on turn.done), not the SSE lifetime: the stream stays
+        // off sandboxDone (set on turn.done), not the SSE lifetime: the stream stays
         // open after the answer to carry auto-stop ticks, and renewing across
-        // that window pins the box forever (the desktop hold keeps the turn
-        // "active", which keeps renewing the hold — the box never stops). Once
-        // renewal ceases the 45s TTL lapses and the countdown/reaper stop the box.
+        // that window pins the sandbox forever (the desktop hold keeps the turn
+        // "active", which keeps renewing the hold — the sandbox never stops). Once
+        // renewal ceases the 45s TTL lapses and the countdown/reaper stop the sandbox.
         (async function(){
-          const alive=function(){const t=activeTurns.get(w.localId);return desktopWidget===w&&t&&!t.boxDone;};
+          const alive=function(){const t=activeTurns.get(w.localId);return desktopWidget===w&&t&&!t.sandboxDone;};
           while(alive()){
             await new Promise(function(r){setTimeout(r,20000);});
             if(!alive())return;
@@ -698,7 +698,7 @@ async function attachDesktopStream(w){
   }
   var n2=w.el.querySelector('.desktopNote');if(n2)n2.textContent='desktop stream did not start';
 }
-function addMsg(cls,tag,text,key){const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);const isNew=!el;const isBox=cls==='assistant'&&!!tag&&/machine/.test(tag);
+function addMsg(cls,tag,text,key){const c=$('chat');const stick=cls==='user'||chatStick(c);$('empty')?.remove();key=key||('seq:'+Date.now()+Math.random()+':'+cls);let el=bubbles.get(key);const isNew=!el;const isSandbox=cls==='assistant'&&!!tag&&/machine/.test(tag);
 // Reset the running tool chain only when a genuinely NEW bubble appears. A message
 // that keeps streaming (same key) then keeps stacking its interleaved tool calls
 // into ONE chain, instead of spawning a fresh numbered chain every speak/tool loop.
@@ -709,18 +709,18 @@ const body=el.querySelector('.body');
 // between speaks) starts a fresh paragraph, so successive speaks in one message
 // don't run together into an unreadable wall of text.
 let incoming=String(text==null?'':text);
-if(isBox&&!isNew&&boxBreakPending&&body.dataset.raw)incoming='\n\n'+incoming;
-if(isBox)boxBreakPending=false;
+if(isSandbox&&!isNew&&sandboxBreakPending&&body.dataset.raw)incoming='\n\n'+incoming;
+if(isSandbox)sandboxBreakPending=false;
 const raw=stripHidden((body.dataset.raw||'')+incoming);body.dataset.raw=raw;const shown=stripEndSentinel(stripFileDecl(raw)).trim();body.textContent=shown;if(cls==='assistant'||cls==='user')body.innerHTML=md(shown);
-// Rule 6: a box round that emits ONLY the <end> silence sentinel must render
+// Rule 6: a sandbox round that emits ONLY the <end> silence sentinel must render
 // NOTHING — no empty "user machine" bubble. Collapse it; it re-shows if real
 // text streams in later (reversible per render).
-if(isBox&&el.style)el.style.display=shown.trim()?'':'none';
+if(isSandbox&&el.style)el.style.display=shown.trim()?'':'none';
 if(cls==='assistant'||cls==='user')applyClamp(el,key);
 moveWorkingToBottom();if(stick)c.scrollTop=c.scrollHeight;return el;}
 // Long messages collapse to COLLAPSE_LINES with a Show more / Show less toggle,
 // so a chatty streamed message doesn't bury the rest of the conversation. The
-// bubble that is still actively streaming (activeBoxKey) is never clamped, so the
+// bubble that is still actively streaming (activeSandboxKey) is never clamped, so the
 // user always sees the live tail; it collapses once the turn moves on.
 const COLLAPSE_LINES=7;
 function applyClamp(el,key){const body=el&&el.querySelector('.body');if(!body)return;const lh=parseFloat(getComputedStyle(body).lineHeight)||20;
@@ -739,11 +739,11 @@ else{el.classList.add('clamped');btn.textContent=clampMoreLabel(el);}}
 // on every render, so a message that keeps growing while collapsed shows it is
 // still growing without the reader having to expand it.
 function clampMoreLabel(el){const n=parseInt(el.dataset.hiddenLines||'0',10)||0;return 'Show '+n+' more line'+(n===1?'':'s');}
-// The box agent declares files it created/modified in a trailing tag
+// The sandbox agent declares files it created/modified in a trailing tag
 // <optibox-files>a, b</optibox-files> (see the FILE MANIFEST instruction). Strip
 // it from the visible chat (even a partial one mid-stream) and parse the names.
 function stripFileDecl(s){s=String(s);const i=s.indexOf('<optibox');return (i>=0?s.slice(0,i):s).trimEnd();}
-// Rule 6: <end> is the box agent's intentional-silence sentinel — the host must
+// Rule 6: <end> is the sandbox agent's intentional-silence sentinel — the host must
 // NEVER show it. The server now withholds any trailing partial while streaming
 // ("<", "<end" — see engine.ts), so it should never arrive; strip BOTH a
 // complete trailing sentinel and a trailing partial prefix here anyway, as a
@@ -755,12 +755,12 @@ function parseFileDecl(s){s=String(s);const a=s.indexOf('<optibox-files');if(a<0
 const toolChains=[];
 let currentToolChain=null;
 let toolSeq=0;
-// Set when a tool call runs; the next box speak that lands in the same bubble
-// inserts a paragraph break before its text (see addMsg). activeBoxKey is the key
-// of the box message currently streaming — it is never clamped and it hosts the
+// Set when a tool call runs; the next sandbox speak that lands in the same bubble
+// inserts a paragraph break before its text (see addMsg). activeSandboxKey is the key
+// of the sandbox message currently streaming — it is never clamped and it hosts the
 // "working…" footer.
-let boxBreakPending=false;
-let activeBoxKey=null;
+let sandboxBreakPending=false;
+let activeSandboxKey=null;
 function toolLabel(count){return count+' tool call'+(count===1?'':'s');}
 function isToolFinished(call){return call.state==='finished'||call.state==='error';}
 function compactToolText(value,limit){const text=String(value||'').trim();if(!text)return '';return text.length>limit?text.slice(0,limit)+'…':text;}
@@ -772,8 +772,8 @@ function toggleToolChain(chain){chain.open=!chain.open;chain.el.classList.toggle
 function renderToolChain(chain){const cc=$('chat');const stick=chatStick(cc);const count=chain.calls.length;chain.label.textContent=toolLabel(count);if(count!==chain.lastCount){chain.label.classList.remove('bump');void chain.label.offsetWidth;chain.label.classList.add('bump');setTimeout(()=>chain.label.classList.remove('bump'),180);chain.lastCount=count;}const running=chain.calls.some(c=>!isToolFinished(c));chain.el.classList.toggle('running',running);chain.details.innerHTML=chain.calls.map((call,idx)=>{const status=call.state==='error'?'error':(isToolFinished(call)?'finished':'running');const bits=[];if(call.command)bits.push('command: '+compactToolText(call.command,300));if(call.description)bits.push('description: '+compactToolText(call.description,300));if(call.stderr)bits.push('stderr: '+compactToolText(call.stderr,800));const out=call.stdout?'<pre class="toolCallOutput">'+esc(compactToolText(call.stdout,2000))+'</pre>':'';return '<div class="toolCallDetail"><div class="toolCallHead">'+(idx+1)+'. '+esc(toolTitle(call))+' · '+esc(status)+'</div>'+(bits.length?'<div class="toolCallMeta">'+esc(bits.join('\n'))+'</div>':'')+out+'</div>';}).join('');if(stick)cc.scrollTop=cc.scrollHeight;}
 function addToolEvent(ev,localId){let chain=currentToolChain;if(ev.phase==='tool_result'){const running=findRunningTool();if(running){Object.assign(running,{state:toolStateFromEvent(ev),stdout:ev.stdout||running.stdout||'',stderr:ev.stderr||running.stderr||'',isError:Boolean(ev.isError),resultSeen:true});const owner=toolChains.find(ch=>ch.calls.includes(running));if(owner)renderToolChain(owner);return owner&&owner.el;}}
 chain=ensureToolChain(localId);const call={id:'tool-'+(++toolSeq),toolName:ev.toolName||'tool',command:ev.command||'',description:ev.description||'',stdout:ev.stdout||'',stderr:ev.stderr||'',isError:Boolean(ev.isError),state:toolStateFromEvent(ev),resultSeen:ev.phase==='tool_result'};chain.calls.push(call);renderToolChain(chain);
-// A tool ran, so the next speak into the current box bubble opens a new paragraph.
-boxBreakPending=true;return chain.el;}
+// A tool ran, so the next speak into the current sandbox bubble opens a new paragraph.
+sandboxBreakPending=true;return chain.el;}
 // One receipt per machine session, printed when the machine really stops (manual stop or
 // auto-stop), never per message: a receipt after each turn read as "session ended"
 // while the machine was still running between messages.
@@ -795,7 +795,7 @@ function stopBilling(elapsed,reconciled){if(billing){if(!reconciled)totalSeconds
 // upload has no SSE stream, so without this the counter/cost/auto-stop UI
 // simply never learns it is running. SSE turn events still land first and
 // faster; this corrects drift and covers the streams that don't exist.
-// Hosting indicator: the box is intentionally staying up because it exposes a
+// Hosting indicator: the sandbox is intentionally staying up because it exposes a
 // hosted service (host CLI). Badge + stop button live in the header; state
 // arrives on the same runtime snapshot as every other counter.
 // Hosting bar: one uncluttered strip under the header. One service -> its URL
@@ -865,7 +865,7 @@ function applyRuntimeStatus(rt){
     if(rt.holds&&rt.holds.length){clearAutoStopTimer('held');setState('private machine held · '+rt.holds.join(', '));return;}
     if(rt.activeTurn||turnActiveClient)return; // the live turn stream owns the display
     if(rt.idleStopEtaEpochMs&&(!autoStopDeadline||Math.abs(autoStopDeadline-rt.idleStopEtaEpochMs)>2000)){
-      startAutoStopTimer({deadlineEpochMs:rt.idleStopEtaEpochMs,boxId:rt.boxId});
+      startAutoStopTimer({deadlineEpochMs:rt.idleStopEtaEpochMs,sandboxId:rt.sandboxId});
       setState('private machine idle · auto-stop counting down');
     }
   }else if(billing&&!turnActiveClient){
@@ -879,13 +879,13 @@ const activeTurns=new Map();
 let latestLocalId=null;
 let lastAgentMsgEl=null;
 let lastSharedMsgEl=null;
-function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.boxStarted)t.controller.abort();}}
+function abortInterruptibleSharedTurns(){for(const [id,t] of activeTurns){if(t.interruptible&&!t.sandboxStarted)t.controller.abort();}}
 function newTurnId(){try{return (globalThis.crypto&&globalThis.crypto.randomUUID)?globalThis.crypto.randomUUID():String(Date.now()+Math.random());}catch{return String(Date.now()+Math.random());}}
-async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,boxStarted:false,boxDone:false,startSeconds:activeSeconds()});document.body.dataset.busy='1';
+async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused');abortInterruptibleSharedTurns();const localId=newTurnId();latestLocalId=localId;const controller=new AbortController();activeTurns.set(localId,{controller,interruptible:false,sandboxStarted:false,sandboxDone:false,startSeconds:activeSeconds()});document.body.dataset.busy='1';
   const userEl=addMsg('user','',msg,'user:'+localId);
   let atts=[];
   if(files&&files.length){
-    // Files staged while composing are already in the box — send just their
+    // Files staged while composing are already in the sandbox — send just their
     // name (alreadyUploaded); only un-staged ones ship bytes with the message.
     atts=await Promise.all(files.map(async f=>({name:f.name.replace(/[\/\\]/g,'_'),b64:f.__uploaded?'':await readAsB64(f),bytes:new Uint8Array(await f.arrayBuffer()),uploaded:Boolean(f.__uploaded)})));
     renderAttachDeck(userEl,atts,'right');
@@ -896,28 +896,28 @@ async function runTurn(msg,files,opts){opts=opts||{};clearAutoStopTimer('paused'
   // Files still upload silently so they show in chat and the panel.
   const sendMsg=(atts.length&&!opts.silent)?msg+'\n\n[Attached files, saved in /home/user/attachments/: '+atts.map(a=>a.name).join(', ')+']':msg;
   const attachPayload=atts.map(a=>a.uploaded?{name:a.name,alreadyUploaded:true}:{name:a.name,contentB64:a.b64});
-  showWorking();setState('shared bridge starting · private Box boot requested');resetRouteForTurn();
+  showWorking();setState('shared bridge starting · private sandbox boot requested');resetRouteForTurn();
   try{const res=await fetch('/api/send',{method:'POST',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation,message:sendMsg,harness:selectedHarness,provider:selectedProvider,model:selectedModel,reasoningEffort:selectedReasoning,attachments:attachPayload})});await drain(res,localId);}catch(e){if(e.name!=='AbortError'){addMsg('assistant','error','Something went wrong: '+String(e&&e.message||e));setState('Error · private machine state unchanged');}}finally{if(localId===latestLocalId)clearWorking();activeTurns.delete(localId);if(activeTurns.size===0)delete document.body.dataset.busy;}}
 const composer=$('composer'), msgEl=$('msg'), sendBtn=$('send');
-const stopBtn=$('stopBox');
+const stopBtn=$('stopSandbox');
 const diagnosticsBtn=$('downloadDiagnostics');
 const showTracesEl=$('showTraces');
 if(showTracesEl){showTracesEl.checked=false;showTracesEl.addEventListener('change',()=>{showTraces=Boolean(showTracesEl.checked);syncTraceVisibility();});}
-// ONE entry point to the Agents panel: the sliders button in the prompt box.
+// ONE entry point to the Agents panel: the sliders button in the prompt sandbox.
 // The pickers report through their own onChange, so nothing listens for
 // 'change' here any more.
 $('agentsOpen')?.addEventListener('click',openSettings);$('settingsClose')?.addEventListener('click',closeSettings);$('settingsSave')?.addEventListener('click',saveSettings);$('settingsBackdrop')?.addEventListener('click',e=>{if(e.target===$('settingsBackdrop'))closeSettings();});
 $('agentsKeysToggle')?.addEventListener('click',function(){
-  const box=$('agentsKeysBox');if(!box)return;
-  const open=box.classList.toggle('open');
+  const sandbox=$('agentsKeysSandbox');if(!sandbox)return;
+  const open=sandbox.classList.toggle('open');
   $('agentsKeysToggle').setAttribute('aria-expanded',open?'true':'false');
 });
 syncTraceVisibility();
 let lastSubmitAt=0;
 // ---- attachments ----------------------------------------------------------
 // Files the user attached to the NEXT message. Each carries its bytes so the
-// chat deck previews and opens them locally (no box needed to view), and they
-// upload into the box under attachments/ so the panel and the agent see them.
+// chat deck previews and opens them locally (no sandbox needed to view), and they
+// upload into the sandbox under attachments/ so the panel and the agent see them.
 let pendingFiles=[];
 const IMG_RE=/\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
 const VID_RE=/\.(mp4|m4v|mov|ogv)$/i;
@@ -928,10 +928,10 @@ function isAudioName(n){return AUD_RE.test(n)||/^voice-/i.test(n)||(/\.webm$/i.t
 function fileExt(n){const p=(n.split('.').pop()||'').toLowerCase();return p.length>4?'file':p;}
 function readAsB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(',')[1]||'');r.onerror=()=>rej(new Error('read failed'));r.readAsDataURL(file);});}
 function addPendingFiles(list){for(const f of list){if(pendingFiles.length>=12)break;if(f.size>150*1024*1024){addMsg('trace','attachment','"'+f.name+'" is over the 150MB message-attachment limit — drop it on the Files panel instead (larger uploads allowed there)\n');continue;}pendingFiles.push(f);stageAttachment(f);}renderPending();notifyComposing();}
-// Eagerly stage the attachment into the box the moment it lands in the
+// Eagerly stage the attachment into the sandbox the moment it lands in the
 // composer (raw binary, wakes a parked machine). Send then just references it
 // (alreadyUploaded) instead of re-shipping the bytes; removing it before send
-// deletes it from the box again.
+// deletes it from the sandbox again.
 function stageAttachment(f){
   f.__dest='attachments/'+f.name.replace(/[\/\\]/g,'_');
   f.__uploading=true;f.__uploaded=false;
@@ -988,7 +988,7 @@ function makeCarousel(deck,side){
     return wrap;
   }catch(_){return deck;}
 }
-// A deck card shows the real picture, not its file extension. Bytes for a box
+// A deck card shows the real picture, not its file extension. Bytes for a sandbox
 // file are fetched through the fs panel's reader and swapped in over the
 // placeholder icon; a Blob must carry its MIME type or a blob: URL is served
 // with none, which <video> refuses to render (the empty rectangle).
@@ -1001,9 +1001,9 @@ function thumbElement(name,bytes){
   }
   const img=document.createElement('img');img.src=url;img.alt=name;return img;
 }
-// Replace a card's extension icon with a thumbnail of the box file at `path`.
+// Replace a card's extension icon with a thumbnail of the sandbox file at `path`.
 // Silent on failure: the icon it started with is a fine fallback.
-async function thumbFromBox(card,path,name,size){
+async function thumbFromSandbox(card,path,name,size){
   try{
     if(!(IMG_RE.test(name)||VID_RE.test(name)))return;
     if(size!==undefined&&size>THUMB_MAX_BYTES)return;
@@ -1031,7 +1031,7 @@ function renderAttachDeck(el,atts,side){
       // show its pictures again instead of a wall of extension cards.
       if(IMG_RE.test(a.name)||VID_RE.test(a.name)){
         const dest='attachments/'+a.name.replace(/[/\\]/g,'_');
-        void thumbFromBox(card,dest,a.name).then(()=>{
+        void thumbFromSandbox(card,dest,a.name).then(()=>{
           if(card.querySelector('img,video'))card.addEventListener('click',()=>{try{window.__optiboxFs.openPath(dest);}catch(_){}});
         });
       }
@@ -1042,7 +1042,7 @@ function renderAttachDeck(el,atts,side){
   });
   el.parentNode.insertBefore(makeCarousel(deck,side),el);
 }
-// Agent "attachments": files the box agent produced this turn, shown as a
+// Agent "attachments": files the sandbox agent produced this turn, shown as a
 // left-aligned deck BELOW its last bubble. Primary signal is its explicit
 // <optibox-files>…</optibox-files> manifest; as a fallback (models sometimes
 // forget the tag) we also resolve files it NAMES in prose to a single tree file.
@@ -1087,10 +1087,10 @@ async function renderAgentAttachments(el){
     if(isAudioName(name)){const ic=document.createElement('div');ic.className='cardIcon cardAudio';ic.innerHTML=MIC_SVG+'<span>voice</span>';card.appendChild(ic);}
     else{
       const ic=document.createElement('div');ic.className='cardIcon';ic.textContent=fileExt(name);card.appendChild(ic);
-      // The agent's own files live in the box, so the deck has to go and get
+      // The agent's own files live in the sandbox, so the deck has to go and get
       // them. Without this every picture the agent made rendered as the word
       // "PNG" in a grey rectangle.
-      void thumbFromBox(card,path,name,sizeOf[path]);
+      void thumbFromSandbox(card,path,name,sizeOf[path]);
     }
     const nm=document.createElement('div');nm.className='cardName';nm.textContent=name;card.appendChild(nm);
     card.addEventListener('click',()=>{try{if(window.__optiboxFs&&window.__optiboxFs.openPath)window.__optiboxFs.openPath(path);}catch(_){}});
@@ -1133,18 +1133,18 @@ async function renderLinkPreviews(el){
     const body=el.querySelector('.body');if(!body)return;
     const shown=stripEndSentinel(stripFileDecl(body.dataset.raw||''));
     const links=extractLinks(shown);if(!links.length)return;
-    // Sites hosted from the box itself (host CLI → *.on.ascii.dev) get a LIVE
+    // Sites hosted from the sandbox itself (host CLI → *.on.ascii.dev) get a LIVE
     // iframe embed the size of the screen-share widget, not a small card.
     const framed=links.filter(u=>/[.]on[.]ascii[.]dev/i.test(u));
     const rest=links.filter(u=>framed.indexOf(u)<0);
     framed.slice(0,2).forEach(u=>{
-      const box=document.createElement('div');box.className='siteEmbed';
+      const sandbox=document.createElement('div');sandbox.className='siteEmbed';
       const bar=document.createElement('div');bar.className='siteEmbedBar';
       const nm=document.createElement('span');nm.textContent=u.replace(/^https?:[/][/]/i,'');bar.appendChild(nm);
       const open=document.createElement('a');open.href=u;open.target='_blank';open.rel='noopener noreferrer';open.textContent='open in tab';bar.appendChild(open);
-      box.appendChild(bar);
-      const fr=document.createElement('iframe');fr.src=u;fr.loading='lazy';fr.setAttribute('sandbox','allow-scripts allow-same-origin allow-forms allow-popups');box.appendChild(fr);
-      el.parentNode.insertBefore(box,el.nextSibling);
+      sandbox.appendChild(bar);
+      const fr=document.createElement('iframe');fr.src=u;fr.loading='lazy';fr.setAttribute('sandbox','allow-scripts allow-same-origin allow-forms allow-popups');sandbox.appendChild(fr);
+      el.parentNode.insertBefore(sandbox,el.nextSibling);
     });
     if(!rest.length)return;
     const metas=await Promise.all(rest.map(u=>fetch('/api/og?url='+encodeURIComponent(u)).then(r=>r.json()).catch(()=>null)));
@@ -1197,7 +1197,7 @@ msgEl.addEventListener('beforeinput',e=>{if((e.inputType==='insertLineBreak'||e.
 msgEl.addEventListener('input',()=>{updateComposerMode();notifyComposing();});
 msgEl.addEventListener('focus',()=>notifyComposing(true));
 msgEl.addEventListener('pointerdown',()=>notifyComposing(true));
-// "Box still needed" flag: typing or staged attachments ping the server every
+// "Sandbox still needed" flag: typing or staged attachments ping the server every
 // few seconds — the rolling hold pauses any countdown at full and wakes a
 // parked machine so it's warm by the time the message is sent. Stop typing
 // and the hold expires in ~15s; the countdown resumes on its own.
@@ -1207,7 +1207,7 @@ let lastComposePing=0;
 // until billing confirms the machine is actually up (startBilling clears it).
 function setWarmingPulse(on){const st=$('machineState');if(st&&st.classList){if(on)st.classList.add('warming');else st.classList.remove('warming');}}
 function notifyComposing(force){
-  // force=true: focus/click in the prompt box counts as compose intent even
+  // force=true: focus/click in the prompt sandbox counts as compose intent even
   // before any text exists — the machine starts warming on the very first
   // gesture toward writing, not the first character.
   const composing=Boolean(force)||((msgEl&&msgEl.value||'').trim().length>0)||pendingFiles.length>0;
@@ -1222,7 +1222,7 @@ function notifyComposing(force){
   fetch('/api/fs/activity',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:selectedUser,conversationId:selectedConversation})}).then(r=>r.json()).then(j=>{if(j&&j.runtime)applyRuntimeStatus(j.runtime);}).catch(()=>{});
 }
 // ---- voice messages -------------------------------------------------------
-// Telegram-style: mic shows when the box is empty; press it to record with a
+// Telegram-style: mic shows when the sandbox is empty; press it to record with a
 // live waveform, pause/resume, trash, or send. Send transcribes via Whisper
 // (server key) and posts the transcript AND the audio file as an attachment.
 function updateComposerMode(){if(!composer||!composer.classList)return;composer.classList.toggle('hasText',((msgEl&&msgEl.value||'').trim().length>0)||pendingFiles.length>0);}
@@ -1356,32 +1356,32 @@ function keyFor(ev,localId,cls){return (ev.turnId||localId)+':'+cls+(ev.messageI
 let replaying=false;
 function handle(ev,localId){console.debug('[trace] stream event', ev);const isLatest=(localId===latestLocalId);
   // Only the latest turn's events drive the side diagram — otherwise a still-draining
-  // older turn's box/billing events fight the newest turn's route and the graph desyncs.
+  // older turn's sandbox/billing events fight the newest turn's route and the graph desyncs.
   if(isLatest)routeEvent(ev);
   if(!replaying&&['billing.start','billing.stop','exec','turn.done','lifecycle'].includes(ev.type)){try{if(window.__optiboxFs&&window.__optiboxFs.poke)window.__optiboxFs.poke();}catch(_){}}
-  const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-box.delta','exec'].includes(ev.type)){t.boxStarted=true;t.interruptible=false;}
+  const t=activeTurns.get(localId);if(t&&['handoff.started','billing.start','user-sandbox.delta','exec'].includes(ev.type)){t.sandboxStarted=true;t.interruptible=false;}
   // "working…" stays until the LATEST turn is fully finished: both surfaces answered
-  // (or the box chose <end>) and the stream reached its terminal event. An older
+  // (or the sandbox chose <end>) and the stream reached its terminal event. An older
   // turn reaching a terminal event must NOT clear the newest turn's indicator.
   if(isLatest&&(ev.type==='turn.done'||ev.type==='turn.blocked'||ev.type==='error'||ev.type==='stream.end'))clearWorking();
-  if(ev.type==='trace'){addMsg('trace','trace · '+(ev.stage||'event'),(ev.message||JSON.stringify(ev))+'\n',keyFor(ev,localId,'trace')+':'+(ev.stage||Math.random()));if(/bridge/.test(ev.stage||''))setState('Shared bridge active · private Box booting');else if(/backend|submit/.test(ev.stage||''))setState('Request received · shared bridge starting');}
+  if(ev.type==='trace'){addMsg('trace','trace · '+(ev.stage||'event'),(ev.message||JSON.stringify(ev))+'\n',keyFor(ev,localId,'trace')+':'+(ev.stage||Math.random()));if(/bridge/.test(ev.stage||''))setState('Shared bridge active · private sandbox booting');else if(/backend|submit/.test(ev.stage||''))setState('Request received · shared bridge starting');}
   else if(ev.type==='turn.blocked'){addMsg('assistant','error',(ev.stage?'['+ev.stage+'] ':'')+(ev.message||'private runtime failed'),keyFor(ev,localId,'blocked')+':'+(ev.stage||Math.random()));setState('Private runtime error · see message');}
   else if(ev.type==='shared.delta'){lastSharedMsgEl=addMsg('assistant','shared infra · no tools',ev.text,keyFor(ev,localId,'shared'));}
-  else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private Box booting in parallel');}
+  else if(ev.type==='context.injected'){if(ev.scope==='shared')setState('Shared bridge ready · private sandbox booting in parallel');}
   else if(ev.type==='billing.start'){if(!replaying)startBilling(ev.sinceEpochMs);}
   else if(ev.type==='lifecycle'){if(ev.state==='resume-timeout')setState('Resume timed out · starting a fresh machine');else if(ev.state==='stopping')setState('Private machine stopping · wrapping up');else if(ev.state==='archiving')setState('Private machine archiving · billing about to pause');else if(ev.state==='archived')setState('Private machine archived · billing paused');else setState('Private machine '+String(ev.state).replace(/-/g,' '));}
   else if(ev.type==='handoff.started'){setState('Private machine running · assistant has tools');}
-  else if(ev.type==='runtime.proof'){addMsg('trace','proof · no Box prompt/API','boxPromptApiUsed='+ev.boxPromptApiUsed+' · boxBuiltInAgentUsed='+ev.boxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\n',keyFor(ev,localId,'proof'));}
+  else if(ev.type==='runtime.proof'){addMsg('trace','proof · no sandbox prompt/API','sandboxPromptApiUsed='+ev.sandboxPromptApiUsed+' · sandboxBuiltInAgentUsed='+ev.sandboxBuiltInAgentUsed+' · hostAsciiAgentUsed='+ev.hostAsciiAgentUsed+' · continuation='+ev.continuation+' · streaming='+(ev.streaming||'unknown')+(ev.blocker?' · limitation: '+ev.blocker:'' )+'\n',keyFor(ev,localId,'proof'));}
   else if(ev.type==='exec'){setState('Private machine running · using tools');if(ev.kind==='harness')addMsg('trace','source path','Started real '+((ev.argv&&ev.argv[0])||'agent')+' harness inside the user machine; stdout/SSE relays native chunks as emitted.',keyFor(ev,localId,'exec'));}
   else if(ev.type==='harness.tool'){setState('Private machine running · using tools');if(isDesktopCommand(ev.command)){if(ev.phase==='tool_use'&&localId===latestLocalId)ensureDesktopWidget(localId);}else{addToolEvent(ev,localId);}}
-  else if(ev.type==='user-box.delta'){const k=keyFor(ev,localId,'box');if(activeBoxKey&&activeBoxKey!==k){const prevKey=activeBoxKey,prev=bubbles.get(prevKey);activeBoxKey=null;if(prev)applyClamp(prev,prevKey);}activeBoxKey=k;lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,k);}
+  else if(ev.type==='user-sandbox.delta'){const k=keyFor(ev,localId,'sandbox');if(activeSandboxKey&&activeSandboxKey!==k){const prevKey=activeSandboxKey,prev=bubbles.get(prevKey);activeSandboxKey=null;if(prev)applyClamp(prev,prevKey);}activeSandboxKey=k;lastAgentMsgEl=addMsg('assistant','user machine · tools active',ev.text,k);}
   else if(ev.type==='desktop.recording'){renderDesktopRecording(ev,localId);}
   else if(ev.type==='billing.stop'){if(!replaying){stopBilling(ev.elapsedSeconds);endDesktopWidget();}}
   else if(ev.type==='autostop.timer'){if(!replaying){if(ev.phase==='started'||ev.phase==='tick'){startAutoStopTimer(ev);}else if(ev.phase==='held'){clearAutoStopTimer('held');}else if(ev.phase==='stopping'){clearAutoStopTimer('stopping…');}else if(ev.phase==='canceled'){clearAutoStopTimer('reset');}}addMsg('trace','auto-stop',describeAutoStop(ev)+' · '+(ev.note||'')+'\n',keyFor(ev,localId,'autostop')+':'+ev.phase+':'+Math.ceil((ev.remainingMs||0)/1000));if(!replaying)setState(describeAutoStop(ev));}
-  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.boxDone=true;
+  else if(ev.type==='turn.done'){setState('Turn complete · waiting for visible auto-stop countdown');const td=activeTurns.get(localId);if(td)td.sandboxDone=true;
     // The streaming target is finalized: drop the active marker and clamp it if it
     // grew past the collapse threshold, and detach the working footer.
-    if(activeBoxKey){const fk=activeBoxKey,fb=bubbles.get(fk);activeBoxKey=null;if(fb)applyClamp(fb,fk);}
+    if(activeSandboxKey){const fk=activeSandboxKey,fb=bubbles.get(fk);activeSandboxKey=null;if(fb)applyClamp(fb,fk);}
     if(lastAgentMsgEl){renderAgentAttachments(lastAgentMsgEl);renderLinkPreviews(lastAgentMsgEl);lastAgentMsgEl=null;}if(lastSharedMsgEl){renderLinkPreviews(lastSharedMsgEl);lastSharedMsgEl=null;}
     // The receipt is printed once, when the machine stops (showSessionReceipt).
     }

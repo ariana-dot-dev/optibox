@@ -1,6 +1,6 @@
-// Filesystem panel: live tree when the box is up, latest-snapshot tree when it
+// Filesystem panel: live tree when the sandbox is up, latest-snapshot tree when it
 // is down. Click a file -> viewer dialog (pdf / image / table editors / code
-// editor). Drag-and-drop upload onto any folder (live box only).
+// editor). Drag-and-drop upload onto any folder (live sandbox only).
 // Loaded as an ES module; the inline page script exposes window.__optiboxFs.
 const $ = (id) => document.getElementById(id);
 const panel = $("fsPanel");
@@ -24,7 +24,7 @@ let displayedPaths = []; // what is currently rendered (server + upload overlay)
 let entryByPath = new Map();
 let fsLive = false;
 let fsState = "none";
-// Have we seen the box actually LIVE since it started billing? Once true, a
+// Have we seen the sandbox actually LIVE since it started billing? Once true, a
 // single failed live-tree poll (find deadline, transient FUSE/exec miss) is a
 // hiccup, not the machine "starting" — so we neither relabel it "machine
 // starting…" nor wipe the tree. Reset only when the machine is gone/parked.
@@ -373,7 +373,7 @@ const MIME_BY_EXT = { svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm"
 const mimeFor = (name) => MIME_BY_EXT[(name.split(".").pop() || "").toLowerCase()] || "";
 
 // Dispatch already-loaded bytes to the right renderer. path is null for bytes
-// that don't live in the box (chat attachments opened from a local blob), which
+// that don't live in the sandbox (chat attachments opened from a local blob), which
 // forces canSave off.
 function dispatchViewer(name, bytes, canSave, path) {
   if (/\.pdf$/i.test(name)) return showPdf(path, name, bytes);
@@ -408,7 +408,7 @@ async function openViewer(path, size) {
   return dispatchViewer(name, bytes, live, path);
 }
 
-// Open bytes we already hold (chat attachment preview) with no box round trip.
+// Open bytes we already hold (chat attachment preview) with no sandbox round trip.
 function openBytes(name, bytes) {
   return dispatchViewer(name, bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes), false, null);
 }
@@ -779,17 +779,17 @@ async function showText(path, name, text, canSave) {
 }
 
 // Public surface for the chat script (attachments): open local bytes in the
-// viewer, and upload attachment bytes into the box under attachments/.
+// viewer, and upload attachment bytes into the sandbox under attachments/.
 (function () {
   const host = (window.__optiboxFs = window.__optiboxFs || {});
   host.openBytes = openBytes;
   host.openPath = (path) => openViewer(path);
-  // Bytes of one box file, for callers that want to RENDER it rather than open
+  // Bytes of one sandbox file, for callers that want to RENDER it rather than open
   // the viewer (the chat's file decks thumbnail images and videos this way).
   host.readBytes = async (path) => (await api("/api/fs/read", { path }, true)).bytes;
   // The MIME a name implies. A Blob built without one is served from its
   // blob: URL with no Content-Type: <img> usually sniffs its way through,
-  // <video> just shows an empty box — which is exactly what a .mp4 or .gif
+  // <video> just shows an empty sandbox — which is exactly what a .mp4 or .gif
   // thumbnail did.
   host.mimeFor = mimeFor;
   host.uploadAttachment = async function (name, b64) {

@@ -5,14 +5,14 @@ import { codexAuthJson, type OAuthProvider, type OAuthTokens } from "./oauth.js"
  * their private turns, and the credentials those harnesses authenticate with.
  *
  * ONE list describes every credential: its id (the wire name), where it lands on
- * the box (an env var, or a home-relative file), and how the UI labels it. The
+ * the sandbox (an env var, or a home-relative file), and how the UI labels it. The
  * engine, the HTTP routes and the browser panel all read this list, so adding a
  * provider is a one-line change here.
  *
  * Two shapes exist because the harnesses take two shapes of secret:
  *   env  - API keys, the Claude subscription token (Claude Code reads it
  *          ONLY from CLAUDE_CODE_OAUTH_TOKEN) and the Kimi Code subscription
- *          pair (KIMI_CODE_ACCESS_TOKEN + KIMI_CODE_REFRESH_TOKEN: the box
+ *          pair (KIMI_CODE_ACCESS_TOKEN + KIMI_CODE_REFRESH_TOKEN: the sandbox
  *          turns them into ~/.kimi-code/credentials/kimi-code.json itself).
  *   file - a Codex ChatGPT subscription, which is the contents of
  *          ~/.codex/auth.json; codex resolves that path itself, nothing else.
@@ -26,9 +26,9 @@ export interface AgentCredentialSpec {
   id: string;
   label: string;
   hint: string;
-  /** Env var this credential becomes inside the box. */
+  /** Env var this credential becomes inside the sandbox. */
   env?: string;
-  /** Home-relative file this credential becomes inside the box. */
+  /** Home-relative file this credential becomes inside the sandbox. */
   file?: string;
   /** Set when the credential is obtained by signing in, not by typing a key. */
   oauth?: OAuthProvider;
@@ -63,8 +63,8 @@ export interface UserAgentSelection {
 
 /**
  * What we keep server-side for one connected subscription. The access token
- * itself lives with the other credentials (it is what the box runs on); this is
- * the part the box never sees.
+ * itself lives with the other credentials (it is what the sandbox runs on); this is
+ * the part the sandbox never sees.
  */
 export interface AgentOAuthRecord {
   refreshToken?: string;
@@ -99,14 +99,14 @@ export interface UserAgentsView {
   credentials: AgentCredentialState[];
   /** true when the user has at least one credential of their own. */
   usingOwnKeys: boolean;
-  /** true when new keys are stored but the (parked) box has not picked them up yet. */
+  /** true when new keys are stored but the (parked) sandbox has not picked them up yet. */
   envPending: boolean;
 }
 
 /** A patch of secret values: "" clears a field, an absent field is unchanged. */
 export type AgentCredentialPatch = Record<string, string>;
 
-/** Split a credential patch into the box's env vars and its home-relative files. */
+/** Split a credential patch into the sandbox's env vars and its home-relative files. */
 export function splitCredentialPatch(patch: AgentCredentialPatch): {
   providerEnv: Record<string, string>;
   agentFiles: Record<string, string>;
@@ -124,14 +124,14 @@ export function splitCredentialPatch(patch: AgentCredentialPatch): {
 }
 
 /**
- * What a freshly signed-in subscription becomes on the box.
+ * What a freshly signed-in subscription becomes on the sandbox.
  *
  * Claude Code authenticates from CLAUDE_CODE_OAUTH_TOKEN. Codex authenticates
  * from ~/.codex/auth.json and nothing else, so the token is written as that
- * file; CHATGPT_ACCOUNT_ID rides along because the box's own bring-up helper
+ * file; CHATGPT_ACCOUNT_ID rides along because the sandbox's own bring-up helper
  * reads it when it rewrites the file. Kimi Code takes the token pair as env
  * (KIMI_CODE_ACCESS_TOKEN / KIMI_CODE_REFRESH_TOKEN, expiry in unix seconds);
- * the box writes ~/.kimi-code/credentials/kimi-code.json from them itself.
+ * the sandbox writes ~/.kimi-code/credentials/kimi-code.json from them itself.
  */
 export function subscriptionCredentials(provider: OAuthProvider, tokens: OAuthTokens): {
   providerEnv: Record<string, string>;
@@ -157,7 +157,7 @@ export function subscriptionCredentials(provider: OAuthProvider, tokens: OAuthTo
   };
 }
 
-/** Clearing a subscription clears everything it put on the box. */
+/** Clearing a subscription clears everything it put on the sandbox. */
 export function subscriptionClear(provider: OAuthProvider): {
   providerEnv: Record<string, string>;
   agentFiles: Record<string, string>;

@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
-<title>Box chat demo</title>
+<title>Sandbox chat demo</title>
 <link rel="stylesheet" href="/static/app.css"/><link rel="stylesheet" href="/static/fs-panel.css"/>
 <script type="module" src="/static/fs-panel.js"></script>
 <script defer src="/static/mobile.js"></script></head><body class="hide-traces"><div class="shell">
@@ -45,7 +45,7 @@
     <div class="recDeviceMenu" id="recDeviceMenu" aria-label="Microphone devices"></div>
   </form>
   <footer class="composerBar" aria-label="controls">
-    <button id="stopBox" type="button">Pause Box now</button>
+    <button id="stopSandbox" type="button">Pause sandbox now</button>
     <button id="downloadDiagnostics" type="button">Download diagnostics</button>
     <label class="traceToggle"><input id="showTraces" type="checkbox"/> Show traces</label>
   </footer>
@@ -58,7 +58,7 @@
     <div class="path to-shared"><span class="arrow"></span><span class="pathLabel">fast path</span></div>
     <div class="node shared-node" data-node="shared"><span class="nodeTitle">Shared infra</span><span class="nodeSub">instant answer, or a holding line while tools warm up</span></div>
     <div class="path to-private"><span class="arrow"></span><span class="pathLabel">handoff</span></div>
-    <div class="node private-node" data-node="private"><span class="nodeTitle">User machine</span><span class="nodeSub">private Box · tools + billing</span><span class="toolsLine">using tools</span></div>
+    <div class="node private-node" data-node="private"><span class="nodeTitle">User machine</span><span class="nodeSub">private sandbox · tools + billing</span><span class="toolsLine">using tools</span></div>
   </div>
   <div class="routeCaption" id="routeStatus" aria-live="polite"></div>
 </aside>
@@ -81,7 +81,7 @@
       <h3 id="agentsSigninHead">Sign in</h3>
       <div class="agentsSignin" id="agentsSignin"></div>
     </section>
-    <section class="agentsKeys" id="agentsKeysBox">
+    <section class="agentsKeys" id="agentsKeysSandbox">
       <button type="button" class="agentsKeysHead" id="agentsKeysToggle" aria-expanded="false" aria-controls="agentsKeysBody"><span>API keys</span><svg class="ddChevron" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z"/></svg></button>
       <div class="agentsKeysBody" id="agentsKeysBody"><div><div class="agentsCreds" id="agentsCreds"></div></div></div>
     </section>

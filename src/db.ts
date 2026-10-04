@@ -1,7 +1,7 @@
 import { Pool, type PoolClient } from "pg";
 
 /**
- * THE state layer. Every piece of coordination state — users, boxes, billing,
+ * THE state layer. Every piece of coordination state — users, sandboxes, billing,
  * turns, holds, hosting, sessions, transcripts, templates — lives in Postgres
  * and nowhere else. No in-memory maps, no name-based inference, no promise
  * plumbing between callers: processes coordinate through rows and advisory
@@ -15,11 +15,35 @@ create table if not exists instances (
   id text primary key,
   heartbeat_at timestamptz not null default now()
 );
+-- 2026-10-04 rename Box -> Boat: the machine is a "sandbox". Carry a database made
+-- under the old names over in place (idempotent: each step runs only while the old
+-- name still exists), so no user, conversation or billing row is lost.
+do $$ begin
+  if to_regclass('public.boxes') is not null and to_regclass('public.sandboxes') is null then
+    alter table boxes rename to sandboxes;
+  end if;
+  if to_regclass('public.one_active_user_box') is not null then
+    alter index one_active_user_box rename to one_active_user_sandbox;
+  end if;
+  if exists (select 1 from information_schema.columns where table_name = 'conversations' and column_name = 'box_conversations')
+     and not exists (select 1 from information_schema.columns where table_name = 'conversations' and column_name = 'sandbox_conversations') then
+    alter table conversations rename column box_conversations to sandbox_conversations;
+  end if;
+  if exists (select 1 from information_schema.columns where table_name = 'hosting' and column_name = 'box_id') then
+    alter table hosting rename column box_id to sandbox_id;
+  end if;
+  -- the render journal replays old events: give them the new event names and keys
+  if to_regclass('public.events') is not null then
+    update events set body = replace(replace(replace(replace(body::text,
+      '"user-box.delta"', '"user-sandbox.delta"'), '"boxId"', '"sandboxId"'), '"user-box"', '"user-sandbox"'), '"shared-box"', '"shared-sandbox"')::jsonb
+    where body::text like '%"user-box%' or body::text like '%"boxId"%' or body::text like '%"shared-box"%';
+  end if;
+end $$;
 -- provider_env / agent_files / agent_selection: the user's OWN Agents setup —
--- the provider keys their box runs on, the home-relative secret files written
--- into it after every bring-up (a no-env box's resume scrubs them off disk), and
--- their default harness/model. env_pending marks keys saved while the box was
--- parked: the next resume passes them as the box's new env.
+-- the provider keys their sandbox runs on, the home-relative secret files written
+-- into it after every bring-up (a no-env sandbox's resume scrubs them off disk), and
+-- their default harness/model. env_pending marks keys saved while the sandbox was
+-- parked: the next resume passes them as the sandbox's new env.
 create table if not exists users (
   key text primary key,
   billed_seconds double precision not null default 0,
@@ -29,12 +53,12 @@ alter table users add column if not exists provider_env jsonb not null default '
 alter table users add column if not exists agent_files jsonb not null default '{}';
 alter table users add column if not exists agent_selection jsonb not null default '{}';
 alter table users add column if not exists env_pending boolean not null default false;
--- agent_oauth: the half of a connected subscription the box never sees, per
+-- agent_oauth: the half of a connected subscription the sandbox never sees, per
 -- provider ({"claude":{"refreshToken":…,"expiresAt":…}}). The access token
--- itself lives in provider_env / agent_files because that is what the box runs
+-- itself lives in provider_env / agent_files because that is what the sandbox runs
 -- on; the refresh token stays here and is spent just before a bring-up.
 alter table users add column if not exists agent_oauth jsonb not null default '{}';
-create table if not exists boxes (
+create table if not exists sandboxes (
   id text primary key,
   user_key text not null,
   instance_id text not null,
@@ -44,17 +68,17 @@ create table if not exists boxes (
   retired_at timestamptz,
   created_at timestamptz not null default now()
 );
-create unique index if not exists one_active_user_box on boxes(user_key)
+create unique index if not exists one_active_user_sandbox on sandboxes(user_key)
   where purpose = 'user' and retired_at is null;
--- box_conversations: {"<boxId>": "<Box conversation id>"} — the Box keeps the memory,
+-- sandbox_conversations: {"<sandboxId>": "<sandbox conversation id>"} — the Boat keeps the memory,
 -- we keep the pointer (a fresh machine starts a fresh conversation).
 create table if not exists conversations (
   user_key text not null,
   id text not null,
-  box_conversations jsonb not null default '{}',
+  sandbox_conversations jsonb not null default '{}',
   primary key (user_key, id)
 );
-alter table conversations add column if not exists box_conversations jsonb not null default '{}';
+alter table conversations add column if not exists sandbox_conversations jsonb not null default '{}';
 create table if not exists transcripts (
   seq bigserial primary key,
   user_key text not null,
@@ -86,7 +110,7 @@ create table if not exists hosting (
   user_key text not null,
   port int not null,
   conversation_id text not null,
-  box_id text not null,
+  sandbox_id text not null,
   mode text not null check (mode in ('public','private')),
   url text,
   started_at timestamptz not null default now(),
@@ -111,7 +135,7 @@ create table if not exists events (
   at timestamptz not null default now()
 );
 create index if not exists events_conv on events(user_key, conversation_id, seq);
--- Parallel scenarios run as parallel conversations on the user's own box; their
+-- Parallel scenarios run as parallel conversations on the user's own sandbox; their
 -- transcripts carry scenario_id so they stay out of the main-line model context.
 alter table transcripts add column if not exists scenario_id text;
 `;
@@ -123,8 +147,8 @@ export interface Db {
   /**
    * Cross-process mutex via a session-scoped advisory lock held on a dedicated
    * connection for the duration of fn. Two lock classes exist in the system:
-   * ('user', userKey) — box lifecycle (ensure/stop/sweep) — and
-   * ('conv', userKey:convId) — box-round ordering within a conversation.
+   * ('user', userKey) — sandbox lifecycle (ensure/stop/sweep) — and
+   * ('conv', userKey:convId) — sandbox-round ordering within a conversation.
    */
   withLock<T>(cls: "user" | "conv", key: string, fn: () => Promise<T>): Promise<T>;
   close(): Promise<void>;

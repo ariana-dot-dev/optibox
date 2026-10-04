@@ -1,9 +1,9 @@
 {
-  "name": "@ascii-prototypes/consumer-box-agents",
+  "name": "@ascii-prototypes/consumer-boat-agents",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Prototype orchestration library for consumer agents on top of Box: shared prewarm, restricted safe mode, per-user Box handoff, and lifecycle control.",
+  "description": "Prototype orchestration library for consumer agents on top of Boat: shared prewarm, restricted safe mode, per-user sandbox handoff, and lifecycle control.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --env-file=.env --test dist/test/engine.test.js dist/test/client.test.js dist/test/http.test.js",

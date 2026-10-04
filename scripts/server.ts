@@ -4,8 +4,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { URL, fileURLToPath } from "node:url";
 import path from "node:path";
 import {
-  BoxHttpClient,
-  BOX_PRICING,
+  BoatHttpClient,
+  SANDBOX_PRICING,
   Engine,
   openDb,
   databaseUrlFromEnv,
@@ -17,20 +17,20 @@ import {
 const port = Number(process.env.PORT ?? 4178);
 
 /**
- * Stable per-DEPLOYMENT identity, embedded in every Box this process creates
- * and in the orphan-reaper's own-box predicate below. Without this, two
- * separate optibox deployments sharing one Box account (a hosted preview and
- * someone's local dev server, say) create IDENTICALLY-named boxes
+ * Stable per-DEPLOYMENT identity, embedded in every sandbox this process creates
+ * and in the orphan-reaper's own-sandbox predicate below. Without this, two
+ * separate optibox deployments sharing one Boat account (a hosted preview and
+ * someone's local dev server, say) create IDENTICALLY-named sandboxes
  * (`consumer-agent-user-<userId>-<hash>` depended only on the API key/provider
  * env, not on which machine/checkout is running), so each one's orphan sweep
- * — which force-stops any running box matching its naming that IT isn't
- * currently billing — reaps the OTHER deployment's boxes as if they were its
+ * — which force-stops any running sandbox matching its naming that IT isn't
+ * currently billing — reaps the OTHER deployment's sandboxes as if they were its
  * own leaked orphans. Confirmed in production: a hosted instance's reaper
- * stopped a developer's own dev-box mid-session with zero warning.
+ * stopped a developer's own dev-sandbox mid-session with zero warning.
  *
  * Persisted next to this checkout (co-located with the script, not affected by
  * invocation cwd), untracked by git, survives `git reset --hard` from the
- * redeploy poller — so restarts of THIS deployment keep the same id (box
+ * redeploy poller — so restarts of THIS deployment keep the same id (sandbox
  * adoption-by-name across restarts still works), while any other checkout,
  * anywhere, mints its own id on first run and can never collide.
  */
@@ -51,19 +51,19 @@ function instanceId(): string {
 const INSTANCE_ID = instanceId();
 
 // Public task-agent previews must never reuse the task agent's real LLM keys:
-// there, every user brings their own in the Agents panel and each box runs on
+// there, every user brings their own in the Agents panel and each sandbox runs on
 // them alone. Alfred/private previews opt into server keys as the FALLBACK with
 // OPTIBOX_ALLOW_SERVER_KEYS=1; non-agent private runtimes keep it by default.
-// The Box API key is always the operator's — a user is handed a machine from
-// that account, they never bring a Box account of their own.
+// The Boat API key is always the operator's — a user is handed a machine from
+// that account, they never bring a Boat account of their own.
 const allowServerKeys =
   process.env.OPTIBOX_ALLOW_SERVER_KEYS === "1" ||
   (process.env.PRODUCT_MODE !== "agent" &&
     process.env.OPTIBOX_ALLOW_SERVER_KEYS !== "0");
 
 /**
- * The harness catalog is the Box's own (GET /api/provider-models): every
- * harness a Box ships with, its models and the reasoning levels each accepts.
+ * The harness catalog is the sandbox's own (GET /api/provider-models): every
+ * harness a Boat ships with, its models and the reasoning levels each accepts.
  * A model's key family (which BYOK key it bills to) comes from the credentials
  * that unlock it; that is all the settings UI needs to grey models out.
  */
@@ -82,7 +82,7 @@ let catalogCache: { at: number; harnesses: HarnessInfo[] } | undefined;
 /** `unlocks` holds every env var name and secret-file path the viewer has. */
 async function harnessCatalog(unlocks: Set<string>): Promise<HarnessInfo[]> {
   if (!catalogCache || Date.now() - catalogCache.at > 10 * 60_000) {
-    const client = new BoxHttpClient({ apiKey: serverBoxApiKey ?? "catalog" });
+    const client = new BoatHttpClient({ apiKey: serverBoatApiKey ?? "catalog" });
     const config = await client.providerModels();
     const harnesses: HarnessInfo[] = [];
     for (const [name, p] of Object.entries(config)) {
@@ -102,7 +102,7 @@ async function harnessCatalog(unlocks: Set<string>): Promise<HarnessInfo[]> {
 /** Env names + secret-file paths a user can reach: their own first, the server's as fallback. */
 async function unlocksFor(userId: string | undefined): Promise<Set<string>> {
   const unlocks = new Set(Object.keys(serverProviderEnv).filter((k) => serverProviderEnv[k]));
-  if (!userId || !serverBoxApiKey) return unlocks;
+  if (!userId || !serverBoatApiKey) return unlocks;
   try {
     for (const c of (await engine().getUserAgents(userId)).credentials) if (c.connected) unlocks.add(c.target);
   } catch { /* no row yet: server keys only */ }
@@ -124,10 +124,10 @@ function sharedModelFor(providerEnv: Record<string, string>): string {
 }
 
 const serverProviderEnv = allowServerKeys ? providerEnvFromProcess() : {};
-const serverBoxApiKey = process.env.BOX_API_KEY;
+const serverBoatApiKey = process.env.BOAT_API_KEY;
 // ONE Postgres pool and ONE engine for the process. Provider keys are no longer
 // part of the engine's identity: they are per USER (users.provider_env), applied
-// to that user's own box. All coordination state lives in the DB.
+// to that user's own sandbox. All coordination state lives in the DB.
 const db: Db = await openDb(databaseUrlFromEnv());
 let engineSingleton: Engine | undefined;
 const ogCache = new Map<string, { at: number; data: unknown }>();
@@ -168,7 +168,7 @@ function envForProvider(provider: string): string {
  * server's as the fallback — and a subscription counts as well as an API key.
  */
 async function credentialError(selection: { harness: string; provider: string; model: string }, userId: string): Promise<string | undefined> {
-  if (!serverBoxApiKey) return "BOX_API_KEY is not configured on this preview.";
+  if (!serverBoatApiKey) return "BOAT_API_KEY is not configured on this preview.";
   const unlocks = await unlocksFor(userId);
   const alt = HARNESS_ALT_UNLOCKS[selection.harness] ?? [];
   const required = envForProvider(selection.provider);
@@ -177,23 +177,23 @@ async function credentialError(selection: { harness: string; provider: string; m
 }
 
 /**
- * The ONE engine. Its credHash keeps the historical spelling (a hash of the Box
- * API key plus the SERVER provider env) so every user row, box name and billing
+ * The ONE engine. Its credHash keeps the historical spelling (a hash of the sandbox
+ * API key plus the SERVER provider env) so every user row, sandbox name and billing
  * ledger written before per-user credentials keeps working unchanged.
  */
 function engine(): Engine {
-  if (!serverBoxApiKey) throw new Error("BOX_API_KEY is required");
+  if (!serverBoatApiKey) throw new Error("BOAT_API_KEY is required");
   if (engineSingleton) return engineSingleton;
   engineSingleton = new Engine({
     db,
-    box: new BoxHttpClient({ apiKey: serverBoxApiKey }),
+    sandbox: new BoatHttpClient({ apiKey: serverBoatApiKey }),
     instanceId: INSTANCE_ID,
-    credHash: createHash("sha256").update(JSON.stringify({ box: serverBoxApiKey, providerEnv: serverProviderEnv })).digest("hex").slice(0, 8),
+    credHash: createHash("sha256").update(JSON.stringify({ sandbox: serverBoatApiKey, providerEnv: serverProviderEnv })).digest("hex").slice(0, 8),
     // Fallback only: a user who set no keys of their own runs on these.
     providerEnv: serverProviderEnv,
     sharedModel: sharedModelFor(serverProviderEnv),
     sharedModelForEnv: sharedModelFor,
-    userBoxTtlSeconds: 900,
+    userSandboxTtlSeconds: 900,
     readinessPollMs: 750,
     handoffTimeoutMs: 120_000,
     // 15s after the assistant finishes (product decision 2026-07-08).
@@ -325,34 +325,34 @@ function auditEvent(event: ConsumerTurnEvent, input: { userId: string; conversat
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem panel backend. The browser cannot hold the Box API key, so these
-// endpoints proxy: live boxes serve their real disk (files API + find), stopped
-// boxes serve their latest snapshot (tree + file download endpoints) — same
-// features either way except writes, which need a live box.
+// Filesystem panel backend. The browser cannot hold the Boat API key, so these
+// endpoints proxy: live sandboxes serve their real disk (files API + find), stopped
+// sandboxes serve their latest snapshot (tree + file download endpoints) — same
+// features either way except writes, which need a live sandbox.
 // ---------------------------------------------------------------------------
 
 /** Latest desktop-connect hold release per user (renewed on every poll). */
 const desktopHolds = new Map<string, () => void>();
 // Rolling "user is composing" holds: typing or staging attachments raises the
-// box-still-needed flag (countdown pauses at full); the client pings every few
+// sandbox-still-needed flag (countdown pauses at full); the client pings every few
 // seconds while composing, so a short TTL drops the flag soon after they stop.
 const composingHolds = new Map<string, () => void>();
-// Users with a cold box-boot (fork on first keystroke) in flight — dedupes the
+// Users with a cold sandbox-boot (fork on first keystroke) in flight — dedupes the
 // 4s composing pings so typing spawns at most one fork, not one per ping.
 const coldBooting = new Set<string>();
 
-function fsBoxClient(): BoxHttpClient {
-  if (!serverBoxApiKey) throw new Error("BOX_API_KEY is required");
-  return new BoxHttpClient({ apiKey: serverBoxApiKey });
+function fsSandboxClient(): BoatHttpClient {
+  if (!serverBoatApiKey) throw new Error("BOAT_API_KEY is required");
+  return new BoatHttpClient({ apiKey: serverBoatApiKey });
 }
 
-// Box resolution is a ROW LOOKUP, never a name guess: the engine's boxes table
+// Sandbox resolution is a ROW LOOKUP, never a name guess: the engine's sandboxes table
 // is the single source of truth for "which machine is this user's". The old
 // name-based fallback (list + sort by state/updatedAt) existed only because
 // in-memory state died on restart — with durable rows it is dead code.
 
 /**
- * Write raw bytes to one box file — reliably, at any size and any boot age.
+ * Write raw bytes to one sandbox file — reliably, at any size and any boot age.
  *
  * The files API is unreliable for our case in three ways: one write caps at
  * 5MB; a PUT to a path with a not-yet-existing parent dir can return 200 without
@@ -363,7 +363,7 @@ function fsBoxClient(): BoxHttpClient {
  * and can `mkdir -p` the dir), verify the byte count, and RETRY the whole thing
  * through the settling window. Same path for a 200KB image and a 90MB video.
  */
-async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: string, bytes: Buffer): Promise<void> {
+async function writeSandboxFile(client: BoatHttpClient, sandboxId: string, filePath: string, bytes: Buffer): Promise<void> {
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
   const dir = filePath.includes("/") ? filePath.replace(/\/[^/]*$/, "") : ".";
   let lastErr: unknown;
@@ -373,11 +373,11 @@ async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: stri
       const parts: string[] = [];
       for (let off = 0, i = 0; off < bytes.length || i === 0; off += 4_000_000, i++) {
         const part = `${tmp}.${i}`;
-        await client.writeFileBytes(boxId, part, bytes.subarray(off, off + 4_000_000));
+        await client.writeFileBytes(sandboxId, part, bytes.subarray(off, off + 4_000_000));
         parts.push(part);
       }
       const list = parts.map(q).join(" ");
-      const assembled = await client.command(boxId, {
+      const assembled = await client.command(sandboxId, {
         command: `cd /home/user && mkdir -p ${q(dir)} && cat ${list} > ${q(filePath)} && rm -f ${list} && stat -c %s ${q(filePath)}`,
         timeoutMs: 60_000,
       });
@@ -394,40 +394,40 @@ async function writeBoxFile(client: BoxHttpClient, boxId: string, filePath: stri
 }
 
 /**
- * Write bytes into the user's box, waking it first if parked. The one write
+ * Write bytes into the user's sandbox, waking it first if parked. The one write
  * path shared by the JSON (base64) route and the raw-binary upload route.
  * Logs every attempt — uploads failing silently is how we ended up debugging
  * a browser ERR_CONNECTION_RESET with an empty server log.
  */
-async function fsWriteIntoBox(userId: string, filePath: string, bytes: Buffer): Promise<{ status: number; payload: { ok: boolean; message?: string } }> {
+async function fsWriteIntoSandbox(userId: string, filePath: string, bytes: Buffer): Promise<{ status: number; payload: { ok: boolean; message?: string } }> {
   const t0 = Date.now();
-  let resolvedBoxId = "";
+  let resolvedSandboxId = "";
   const done = (status: number, payload: { ok: boolean; message?: string }) => {
-    fsLog({ route: "write", userId, boxId: resolvedBoxId, path: filePath, bytes: bytes.length, ms: Date.now() - t0, status, ...(payload.message ? { message: payload.message } : {}) });
+    fsLog({ route: "write", userId, sandboxId: resolvedSandboxId, path: filePath, bytes: bytes.length, ms: Date.now() - t0, status, ...(payload.message ? { message: payload.message } : {}) });
     return { status, payload };
   };
   try {
-    const { box, live } = await fsResolveBox(userId);
-    const client = fsBoxClient();
-    if (!box) return done(409, { ok: false, message: "no machine yet — send a message first" });
-    resolvedBoxId = box.id;
-    // Keep the box up for the duration of the upload: the hold cancels a
-    // running auto-stop countdown and the reaper skips held boxes.
-    const releaseHold = engine().holdUserBox(userId, "upload", 300_000);
+    const { sandbox, live } = await fsResolveSandbox(userId);
+    const client = fsSandboxClient();
+    if (!sandbox) return done(409, { ok: false, message: "no machine yet — send a message first" });
+    resolvedSandboxId = sandbox.id;
+    // Keep the sandbox up for the duration of the upload: the hold cancels a
+    // running auto-stop countdown and the reaper skips held sandboxes.
+    const releaseHold = engine().holdUserSandbox(userId, "upload", 300_000);
     try {
       // Machine off? Boot it and wait until it actually executes a command,
-      // so a drop while parked just wakes the box and completes the upload.
+      // so a drop while parked just wakes the sandbox and completes the upload.
       // The wake registers real billing, so every counter and reaper sees it.
       await engine().wake(userId, "fs");
       if (!live) {
-        try { await client.resume(box.id); } catch { /* may already be resuming */ }
+        try { await client.resume(sandbox.id); } catch { /* may already be resuming */ }
         let up = false;
         for (let i = 0; i < 40 && !up; i++) {
-          try { const p = await client.command(box.id, { command: "echo ready", timeoutMs: 30_000 }); if ((p.stdout || "").includes("ready")) up = true; } catch { /* still booting */ }
+          try { const p = await client.command(sandbox.id, { command: "echo ready", timeoutMs: 30_000 }); if ((p.stdout || "").includes("ready")) up = true; } catch { /* still booting */ }
         }
         if (!up) return done(502, { ok: false, message: "machine did not wake up for the upload" });
       }
-      await writeBoxFile(client, box.id, filePath, bytes);
+      await writeSandboxFile(client, sandbox.id, filePath, bytes);
       return done(200, { ok: true });
     } finally {
       releaseHold();
@@ -437,26 +437,26 @@ async function fsWriteIntoBox(userId: string, filePath: string, bytes: Buffer): 
   }
 }
 
-async function fsResolveBox(userId: string): Promise<{ box?: { id: string; state: string }; live: boolean }> {
-  const activeId = await engine().activeUserBoxId(userId);
+async function fsResolveSandbox(userId: string): Promise<{ sandbox?: { id: string; state: string }; live: boolean }> {
+  const activeId = await engine().activeUserSandboxId(userId);
   if (!activeId) return { live: false };
-  const active = await fsBoxClient().get(activeId).catch(() => undefined);
+  const active = await fsSandboxClient().get(activeId).catch(() => undefined);
   if (!active) return { live: false };
   const state = String((active as { state?: string; status?: string }).state ?? (active as { status?: string }).status ?? "");
   // "live" means "worth TRYING the live path": the state string lags the
   // machine badly (starting/resuming for seconds while commands already
   // execute), so anything not clearly parked counts; callers fall back to the
   // snapshot when the live attempt fails.
-  return { box: { id: active.id, state }, live: !["archived", "archiving", "stopped", "stopping"].includes(state) };
+  return { sandbox: { id: active.id, state }, live: !["archived", "archiving", "stopped", "stopping"].includes(state) };
 }
 
 /**
  * Live tree: one `find` over the home directory, home-relative paths — the
  * SAME path space the snapshot tree uses, so the panel behaves identically
- * whether the box is up or down. (/tmp is tmpfs and never in snapshots.)
+ * whether the sandbox is up or down. (/tmp is tmpfs and never in snapshots.)
  */
-async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<{ entries: Array<{ path: string; kind: string; size?: number; mtime?: number }>; hosting: Array<{ port: number; mode: "public" | "private" }> }> {
-  const out = await client.command(boxId, {
+async function fsLiveTree(client: BoatHttpClient, sandboxId: string): Promise<{ entries: Array<{ path: string; kind: string; size?: number; mtime?: number }>; hosting: Array<{ port: number; mode: "public" | "private" }> }> {
+  const out = await client.command(sandboxId, {
     // %T@ = mtime as epoch seconds (float): lets the chat surface files the
     // agent created/modified during a turn by comparing against a turn-start
     // baseline, no per-command path parsing needed.
@@ -475,7 +475,7 @@ async function fsLiveTree(client: BoxHttpClient, boxId: string): Promise<{ entri
       `-o -name .vscode-server -o -name snap -o -name .bun -o -name .pnpm-store \\) -prune ` +
       `-o -printf '%y\\t%s\\t%T@\\t%P\\n' 2>/dev/null | head -c 8000000; ` +
       // GROUND-TRUTH hosting probe riding the same round trip. `host list` is
-      // the box's own authoritative registry of publicly-exposed ports — the
+      // the sandbox's own authoritative registry of publicly-exposed ports — the
       // real source of truth in BOTH directions (a port present IS hosting; its
       // absence IS not-hosting). This REPLACES the old `pgrep -af 'host [0-9]'`
       // probe, which matched any process whose command line merely CONTAINED
@@ -522,8 +522,8 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     res.end(JSON.stringify(payload));
   };
   try {
-    const { box, live } = await fsResolveBox(userId);
-    const client = fsBoxClient();
+    const { sandbox, live } = await fsResolveSandbox(userId);
+    const client = fsSandboxClient();
 
     if (pathname === "/api/fs/tree") {
       // One coherent runtime snapshot rides every tree poll: the page
@@ -531,34 +531,34 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       // (typing, uploads) are never invisible to the UI.
       const orch = engine();
       const runtime = await orch.userRuntimeStatus(userId);
-      if (!box) return json(200, { ok: true, live: false, state: "none", entries: [], runtime }), true;
+      if (!sandbox) return json(200, { ok: true, live: false, state: "none", entries: [], runtime }), true;
       if (live) {
         // Try live even while the state string still says starting/resuming —
-        // but with a hard 3.5s deadline: commands against a still-booting box
+        // but with a hard 3.5s deadline: commands against a still-booting sandbox
         // HANG until it is up (observed 30s tree loads), and the panel repolls
         // every 4s anyway, so serving the snapshot now beats blocking.
         try {
           const { entries, hosting } = await Promise.race([
-            fsLiveTree(client, box.id),
+            fsLiveTree(client, sandbox.id),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error("live-tree deadline")), 6000)),
           ]);
           // Ground-truth hosting reconcile: a live host process is authoritative
           // in BOTH directions (starts hosting the badge saw nothing about;
           // clears it when the process is gone). Recompute the runtime AFTER so
           // this very response carries the corrected hosting/holds state.
-          await orch.reconcileObservedHosting(userId, box.id, hosting);
-          return json(200, { ok: true, live: true, state: box.state, boxId: box.id, entries, runtime: await orch.userRuntimeStatus(userId) }), true;
+          await orch.reconcileObservedHosting(userId, sandbox.id, hosting);
+          return json(200, { ok: true, live: true, state: sandbox.state, sandboxId: sandbox.id, entries, runtime: await orch.userRuntimeStatus(userId) }), true;
         } catch { /* fall through to snapshot */ }
       }
-      // Parked box: hosting is de-facto over (nothing can be reachable on an
+      // Parked sandbox: hosting is de-facto over (nothing can be reachable on an
       // archived machine) — clear a stale entry so the badge/hold don't pin a
-      // dead box forever.
-      if (box.state === "archived") await orch.reconcileObservedHosting(userId, box.id, [], { boxLive: false });
-      const snapshot = await client.latestSnapshot(box.id);
-      if (!snapshot) return json(200, { ok: true, live: false, state: box.state, boxId: box.id, entries: [], runtime }), true;
+      // dead sandbox forever.
+      if (sandbox.state === "archived") await orch.reconcileObservedHosting(userId, sandbox.id, [], { sandboxLive: false });
+      const snapshot = await client.latestSnapshot(sandbox.id);
+      if (!snapshot) return json(200, { ok: true, live: false, state: sandbox.state, sandboxId: sandbox.id, entries: [], runtime }), true;
       const tree = await client.snapshotTree(snapshot.id);
       return json(200, {
-        ok: true, live: false, state: box.state, boxId: box.id, snapshotId: snapshot.id, runtime,
+        ok: true, live: false, state: sandbox.state, sandboxId: sandbox.id, snapshotId: snapshot.id, runtime,
         treeAvailable: tree.treeAvailable, truncated: tree.truncated,
         entries: (tree.entries ?? []).map((e) => ({ ...e, path: e.path.replace(/^\//, "") })),
         ...(tree.reason ? { reason: tree.reason } : {}),
@@ -566,36 +566,36 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     }
 
     if (pathname === "/api/fs/read") {
-      if (!box || !filePath) return json(404, { ok: false, message: "no box or path" }), true;
+      if (!sandbox || !filePath) return json(404, { ok: false, message: "no sandbox or path" }), true;
       let bytes: Buffer | undefined;
       let servedLive = false;
       if (live) {
-        // Live files API rejects absolute paths ("relative to the Box work
+        // Live files API rejects absolute paths ("relative to the sandbox work
         // directory" = the home dir), so home-relative tree paths pass as-is.
         try {
           try {
-            bytes = await client.readFileBytes(box.id, filePath);
+            bytes = await client.readFileBytes(sandbox.id, filePath);
           } catch (e) {
             // Reads are capped at 5MB like writes (verified: 410 under the 502).
-            // Fallback: split into 4MB parts in the box, read each, reassemble.
+            // Fallback: split into 4MB parts in the sandbox, read each, reassemble.
             const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
             const tmp = `.cba-dl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-            const prep = await client.command(box.id, {
+            const prep = await client.command(sandbox.id, {
               command: `cd /home/user && mkdir -p ${q(tmp)} && split -b 4000000 -d -a 4 ${q(filePath)} ${q(tmp + "/p")} && ls ${q(tmp)} | wc -l`,
               timeoutMs: 60_000,
             });
             const n = Number(prep.stdout.trim());
             if (!n) throw e;
             const chunks: Buffer[] = [];
-            for (let i = 0; i < n; i++) chunks.push(await client.readFileBytes(box.id, `${tmp}/p${String(i).padStart(4, "0")}`));
-            void client.command(box.id, { command: `rm -rf /home/user/${tmp}`, timeoutMs: 30_000 }).catch(() => undefined);
+            for (let i = 0; i < n; i++) chunks.push(await client.readFileBytes(sandbox.id, `${tmp}/p${String(i).padStart(4, "0")}`));
+            void client.command(sandbox.id, { command: `rm -rf /home/user/${tmp}`, timeoutMs: 30_000 }).catch(() => undefined);
             bytes = Buffer.concat(chunks);
           }
           servedLive = true;
         } catch { /* machine not actually up -> snapshot below */ }
       }
       if (!bytes) {
-        const snapshot = await client.latestSnapshot(box.id);
+        const snapshot = await client.latestSnapshot(sandbox.id);
         if (!snapshot) return json(404, { ok: false, message: "no snapshot" }), true;
         // Snapshot paths are home-relative (verified: ".bashrc" 200, "/.bashrc" 404).
         bytes = (await client.snapshotFileBytes(snapshot.id, filePath)).bytes;
@@ -609,55 +609,55 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
     }
 
     if (pathname === "/api/fs/desktop") {
-      if (!box || !live) return json(409, { ok: false, message: "machine is off" }), true;
+      if (!sandbox || !live) return json(409, { ok: false, message: "machine is off" }), true;
       // Rolling keep-alive: VNC provisioning takes ~20s (longer than the idle
       // window), and a stream the user is about to watch shouldn't die under
       // them. Each poll renews a 45s hold; the TTL is the release.
       desktopHolds.get(userId)?.();
-      desktopHolds.set(userId, engine().holdUserBox(userId, "desktop-connect", 45_000));
+      desktopHolds.set(userId, engine().holdUserSandbox(userId, "desktop-connect", 45_000));
       // Moonlight (60fps WebRTC) by default; body.vnc=true returns the noVNC
       // stream instead — plain websockets, which load on networks where the
       // WebRTC stream never connects (the widget offers an in-place switch).
       // publicAccess: the tokened URL suits iframes (no cookie dance); the
-      // host stays unguessable per-box.
-      const desktop = await client.desktopStreamUrl(box.id, { theme: "light", publicAccess: true, ...(body.vnc ? { vnc: true } : {}) });
+      // host stays unguessable per-sandbox.
+      const desktop = await client.desktopStreamUrl(sandbox.id, { theme: "light", publicAccess: true, ...(body.vnc ? { vnc: true } : {}) });
       return json(200, { ok: true, provisioning: desktop.provisioning, ...(desktop.desktopUrl ? { desktopUrl: desktop.desktopUrl } : {}), ...(desktop.message ? { message: desktop.message } : {}) }), true;
     }
 
     if (pathname === "/api/fs/write") {
       if (!filePath || typeof body.contentB64 !== "string") return json(400, { ok: false, message: "path and contentB64 required" }), true;
-      const r = await fsWriteIntoBox(userId, filePath, Buffer.from(body.contentB64, "base64"));
+      const r = await fsWriteIntoSandbox(userId, filePath, Buffer.from(body.contentB64, "base64"));
       return json(r.status, r.payload), true;
     }
 
     // "User is composing": typing or staging attachments raises the flag —
     // renew a rolling hold (pauses any running countdown at full) and wake the
-    // box if it's parked so it's warm by the time the message is sent.
+    // sandbox if it's parked so it's warm by the time the message is sent.
     if (pathname === "/api/fs/activity") {
       const orch = engine();
       composingHolds.get(userId)?.();
-      composingHolds.set(userId, orch.holdUserBox(userId, "composing", 15_000));
-      if (box) {
+      composingHolds.set(userId, orch.holdUserSandbox(userId, "composing", 15_000));
+      if (sandbox) {
         // Wake + bill through the one shared machinery: the counter, reaper
         // and status endpoint all see this machine like a turn-started one.
         await orch.wake(userId, "composing");
         if (!live) {
-          fsLog({ route: "activity", userId, note: "composing wake", boxId: box.id, state: box.state });
-          void client.resume(box.id).catch(() => undefined);
+          fsLog({ route: "activity", userId, note: "composing wake", sandboxId: sandbox.id, state: sandbox.state });
+          void client.resume(sandbox.id).catch(() => undefined);
         }
       } else if (!coldBooting.has(userId)) {
-        // No box exists yet (fresh account / post-reset): typing must still
+        // No sandbox exists yet (fresh account / post-reset): typing must still
         // "start the machine". Fork/boot one now — ONCE per user (deduped), fired
-        // and forgotten — and start billing the instant the box id is known
+        // and forgotten — and start billing the instant the sandbox id is known
         // (onBootAck) so the counter appears immediately. The composing hold keeps
         // it alive; the reaper reclaims it if the user stops typing without sending.
         // The session is keyed to the SAME conversation the send will use, so
-        // /api/send reuses this exact box instead of forking a second one.
+        // /api/send reuses this exact sandbox instead of forking a second one.
         coldBooting.add(userId);
         const convId = String(body.conversationId ?? "conv-1");
         fsLog({ route: "activity", userId, note: "cold boot on type", conversationId: convId });
-        // ensureUserBox wakes/bills as part of provisioning (engine.wake inside).
-        void orch.ensureUserBox(userId, convId)
+        // ensureUserSandbox wakes/bills as part of provisioning (engine.wake inside).
+        void orch.ensureUserSandbox(userId, convId)
           .catch((e) => fsLog({ route: "activity", userId, note: "cold boot failed", message: String(e).slice(0, 140) }))
           .finally(() => coldBooting.delete(userId));
       }
@@ -666,27 +666,27 @@ async function handleFsRoute(pathname: string, body: any, res: http.ServerRespon
       // header counters reconcile within one ping of billing starting instead of
       // waiting out the 4s tree poll (which visibly raced short compose windows:
       // machine billing server-side, header stuck at 0.0s until send).
-      return json(200, { ok: true, state: box?.state ?? "none", live, runtime: await orch.userRuntimeStatus(userId), ...(coldBooting.has(userId) ? { booting: true } : {}) }), true;
+      return json(200, { ok: true, state: sandbox?.state ?? "none", live, runtime: await orch.userRuntimeStatus(userId), ...(coldBooting.has(userId) ? { booting: true } : {}) }), true;
     }
 
     // Remove a staged attachment the user deleted from the composer before
     // sending. ATTEMPT the live command regardless of the state string — it
-    // lags badly (a box woken by a staged upload can read "archiving" for many
+    // lags badly (a sandbox woken by a staged upload can read "archiving" for many
     // seconds while commands already execute). Only report off if the command
-    // itself fails; a parked box's snapshot is read-only and not worth a boot.
+    // itself fails; a parked sandbox's snapshot is read-only and not worth a boot.
     if (pathname === "/api/fs/delete") {
       if (!filePath) return json(400, { ok: false, message: "path required" }), true;
       if (!filePath.startsWith("attachments/")) return json(400, { ok: false, message: "only attachments/ files can be deleted here" }), true;
-      if (!box) return json(409, { ok: false, message: "no machine — nothing to delete" }), true;
+      if (!sandbox) return json(409, { ok: false, message: "no machine — nothing to delete" }), true;
       const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
       // Retry through boot-transition stalls (commands can return empty stdout
-      // for a while right after a wake) — same medicine as writeBoxFile.
+      // for a while right after a wake) — same medicine as writeSandboxFile.
       let removed = false;
       let lastErr = "";
       for (let attempt = 0; attempt < 4 && !removed; attempt++) {
         if (attempt > 0) await new Promise((r) => setTimeout(r, 2_000));
         try {
-          const out = await client.command(box.id, { command: `cd /home/user && rm -f ${q(filePath)} && test ! -e ${q(filePath)} && echo removed`, timeoutMs: 20_000 });
+          const out = await client.command(sandbox.id, { command: `cd /home/user && rm -f ${q(filePath)} && test ! -e ${q(filePath)} && echo removed`, timeoutMs: 20_000 });
           removed = out.stdout.includes("removed");
         } catch (e) {
           lastErr = e instanceof Error ? e.message : String(e);
@@ -763,7 +763,7 @@ const server = http.createServer(async (req, res) => {
         return void res.end(JSON.stringify({ ok: false, message: "path query param required" }));
       }
       const bytes = await readBinaryBody(req, 400_000_000);
-      const r = await fsWriteIntoBox(userId, filePath, bytes);
+      const r = await fsWriteIntoSandbox(userId, filePath, bytes);
       res.writeHead(r.status, { "content-type": "application/json" });
       return void res.end(JSON.stringify(r.payload));
     }
@@ -873,21 +873,21 @@ const server = http.createServer(async (req, res) => {
         JSON.stringify({
           harnesses: await harnessCatalog(unlocks),
           env: {
-            BOX_API_KEY: Boolean(serverBoxApiKey),
+            BOAT_API_KEY: Boolean(serverBoatApiKey),
             ANTHROPIC_API_KEY: unlocks.has("ANTHROPIC_API_KEY"),
             OPENAI_API_KEY: unlocks.has("OPENAI_API_KEY"),
             OPENROUTER_API_KEY: unlocks.has("OPENROUTER_API_KEY"),
           },
           serverKeysAllowed: allowServerKeys,
           credentialMode: allowServerKeys ? "server-or-byok" : "byok-required",
-          pricing: BOX_PRICING,
+          pricing: SANDBOX_PRICING,
         }),
       );
     }
 
     // ---------------------------------------------------------------------
     // The Agents panel: a user's own harness/model default and their own
-    // provider credentials, stored server-side and applied to THEIR box.
+    // provider credentials, stored server-side and applied to THEIR sandbox.
     // GET  /api/agents?userId=…  -> selection + which credentials are connected
     //                               (last 4 chars only; never a secret)
     // POST /api/agents           -> { userId, conversationId?, selection?,
@@ -939,7 +939,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---------------------------------------------------------------------
-    // Connecting a SUBSCRIPTION, the same way the Box dashboard does it.
+    // Connecting a SUBSCRIPTION, the same way the Boat dashboard does it.
     //   POST /api/agents/oauth/start     {userId, provider}
     //        -> claude: {sessionId, url}                (approve, copy the code)
     //        -> codex:  {sessionId, url, userCode, interval}
@@ -948,7 +948,7 @@ const server = http.createServer(async (req, res) => {
     //        -> {status:"pending"} until it is done, then the fresh Agents view
     //   GET  /api/agents/oauth/status?userId=&sessionId=   (the codex poll)
     //   POST /api/agents/oauth/disconnect{userId, provider}
-    // The credential lands on the user's box exactly like a typed key.
+    // The credential lands on the user's sandbox exactly like a typed key.
     // ---------------------------------------------------------------------
     if (url.pathname.startsWith("/api/agents/oauth/")) {
       const isGet = req.method === "GET";
@@ -992,7 +992,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Stop one running turn: drops its shared stream and interrupts only its
-    // Box conversation; parallel conversations on the same machine keep running.
+    // Sandbox conversation; parallel conversations on the same machine keep running.
     if (req.method === "POST" && url.pathname === "/api/interrupt") {
       const body = await readBody(req);
       const stopped = engine().interrupt(String(body.turnId ?? ""));
@@ -1032,9 +1032,9 @@ const server = http.createServer(async (req, res) => {
       activeStreams++;
       res.once("close", () => { activeStreams = Math.max(0, activeStreams - 1); });
       // Chat attachments ride the send body as base64 and are written into the
-      // box under attachments/ the instant it bills — see the billing.start
+      // sandbox under attachments/ the instant it bills — see the billing.start
       // branch below (before the agent runs, so the file is always there).
-      // Attachments already staged into the box while the user composed arrive
+      // Attachments already staged into the sandbox while the user composed arrive
       // as {name, alreadyUploaded:true} with no bytes — nothing to write.
       const attachments: Array<{ name: string; contentB64: string }> = Array.isArray(body.attachments)
         ? body.attachments.filter((a: any) => a && typeof a.name === "string" && typeof a.contentB64 === "string" && !a.alreadyUploaded)
@@ -1108,38 +1108,38 @@ const server = http.createServer(async (req, res) => {
           auditEvent(event as ConsumerTurnEvent, turnInput, requestId);
           const ev = event as ConsumerTurnEvent;
           if ((ev as any).turnId) journal(ev, (ev as any).turnId); // journal the verbatim render stream
-          const boxIdForDesktop = (ev as any).boxId;
-          // Two box-ready signals fire before the agent runs: billing.start (a
-          // COLD box's first bill) and the runtime.owner.selected trace (fires
-          // on EVERY box turn, incl. WARM reuse where billing.start is skipped).
+          const sandboxIdForDesktop = (ev as any).sandboxId;
+          // Two sandbox-ready signals fire before the agent runs: billing.start (a
+          // COLD sandbox's first bill) and the runtime.owner.selected trace (fires
+          // on EVERY sandbox turn, incl. WARM reuse where billing.start is skipped).
           // Upload attachments on whichever lands first, awaiting here so the
           // turn suspends and the file is present before the agent looks. Only
           // billing.start also (re)provisions the desktop.
-          const boxReady = typeof boxIdForDesktop === "string" &&
+          const sandboxReady = typeof sandboxIdForDesktop === "string" &&
             (ev.type === "billing.start" || (ev.type === "trace" && (ev as any).stage === "runtime.owner.selected"));
-          if (ev.type === "billing.start" && typeof boxIdForDesktop === "string") {
-            void fsBoxClient().desktopStreamUrl(boxIdForDesktop, { theme: "light", publicAccess: true }).catch(() => undefined);
+          if (ev.type === "billing.start" && typeof sandboxIdForDesktop === "string") {
+            void fsSandboxClient().desktopStreamUrl(sandboxIdForDesktop, { theme: "light", publicAccess: true }).catch(() => undefined);
           }
-          if (boxReady) {
+          if (sandboxReady) {
             send(ev);
             if (attachments.length && !attachmentsUploaded) {
               attachmentsUploaded = true;
-              const client = fsBoxClient();
-              const hold = orchestrator.holdUserBox(turnInput.userId, "upload", 300_000);
+              const client = fsSandboxClient();
+              const hold = orchestrator.holdUserSandbox(turnInput.userId, "upload", 300_000);
               try {
-                // The box may bill before its filesystem is mounted — a files-API
-                // PUT can 200 without persisting. A command BLOCKS until the box
+                // The sandbox may bill before its filesystem is mounted — a files-API
+                // PUT can 200 without persisting. A command BLOCKS until the sandbox
                 // truly executes, so use one as a readiness gate before any write.
                 for (let i = 0; i < 12; i++) {
                   try {
-                    const probe = await client.command(boxIdForDesktop, { command: "echo ready", timeoutMs: 30_000 });
+                    const probe = await client.command(sandboxIdForDesktop, { command: "echo ready", timeoutMs: 30_000 });
                     if ((probe.stdout || "").includes("ready")) break;
-                  } catch { /* box still booting; retry */ }
+                  } catch { /* sandbox still booting; retry */ }
                 }
                 for (const a of attachments) {
                   const dest = "attachments/" + a.name.replace(/[/\\]/g, "_");
                   try {
-                    await writeBoxFile(client, boxIdForDesktop, dest, Buffer.from(a.contentB64, "base64"));
+                    await writeSandboxFile(client, sandboxIdForDesktop, dest, Buffer.from(a.contentB64, "base64"));
                     send({ type: "trace", stage: "attachment.uploaded", message: `saved ${dest}` } as ConsumerTurnEvent);
                   } catch (err) {
                     send({ type: "trace", stage: "attachment.failed", message: `failed to save ${dest}: ${err instanceof Error ? err.message : String(err)}` } as ConsumerTurnEvent);
@@ -1165,9 +1165,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Stop hosting: close the exposed port (ufw) + kill the host process on the
-    // box and release the indefinite hosting hold, so the machine can idle-stop
+    // sandbox and release the indefinite hosting hold, so the machine can idle-stop
     // again. Triggered by the header "stop hosting" button.
-    // Full user reset: delete the user's boxes + snapshots and every row about
+    // Full user reset: delete the user's sandboxes + snapshots and every row about
     // them (billing ledger, transcripts, turns, holds, hosting, conversations).
     // Render journal for reopen-and-restore: the ordered events (verbatim) the
     // client replays through handle() to rebuild the chat + components. sinceSeq
@@ -1220,13 +1220,13 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const send = sse(res);
       try {
-        if (!serverBoxApiKey) {
-          send({ type: "error", message: "BOX_API_KEY is not configured on this preview." });
+        if (!serverBoatApiKey) {
+          send({ type: "error", message: "BOAT_API_KEY is not configured on this preview." });
           send({ type: "stream.end" });
           return void res.end();
         }
         const orchestrator = engine();
-        for await (const event of orchestrator.stopUserBox(
+        for await (const event of orchestrator.stopUserSandbox(
           String(body.userId ?? "user-a"),
           String(body.conversationId ?? "conv-1"),
         )) {

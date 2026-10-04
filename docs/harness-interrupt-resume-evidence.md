@@ -152,8 +152,8 @@ mirrors the external CLIs rather than faking a flag.
 ## Resulting uniform contract
 
 - **Interrupt:** SIGINT → (after a short grace) SIGKILL the harness process.
-  Shared infra: kill the local child. User Box: kill the captured PID via
-  `box.command`. Let the process fully die before resuming (session file flush).
+  Shared infra: kill the local child. User sandbox: kill the captured PID via
+  `sandbox.command`. Let the process fully die before resuming (session file flush).
 - **Resume / session bookkeeping (per conversation, per harness):**
   - claude: assign `--session-id <uuid>` (turn 1) → `-r <uuid>` (resume).
   - codex: capture `thread.started.thread_id` → `codex exec resume <id>` (sandbox via `-c`).
@@ -170,14 +170,14 @@ mirrors the external CLIs rather than faking a flag.
 The proven contract above is now wired through the framework (foundation layer):
 
 - **Types** (`src/types.ts`): `HarnessRunSpec`, `SharedContext`, and
-  `UserBoxContext` carry `sessionId?`, `onSessionId?(id)`, and `signal?`
+  `UserSandboxContext` carry `sessionId?`, `onSessionId?(id)`, and `signal?`
   (AbortSignal) so both surfaces can resume by id and be interrupted.
 - **Runtimes** (`src/capabilities.ts`):
   - `extractSessionId(j, mode)` + `noteSessionId` report the native id exactly
     once per run via `onSessionId` (claude `session_id`, codex
     `thread.started.thread_id`, opencode `sessionID`, pi header `id`).
   - Shared-infra `runHarness` honors `signal`: SIGINT then (2s grace) SIGKILL the
-    local child. User-Box `runHarness` kills the captured PID in-Box
+    local child. User-Sandbox `runHarness` kills the captured PID in-Sandbox
     (`kill -INT … ; sleep 0.2 ; kill -KILL …`).
 - **Adapter layer** (`examples/shared.ts`): `sessionStrategy` ("assign" mints a
   UUID up front; "capture" reads the CLI-emitted id) drives `buildArgv`’s
@@ -186,14 +186,14 @@ The proven contract above is now wired through the framework (foundation layer):
 - **Orchestrator** (`src/orchestrator.ts`): `harnessSessions` map keyed
   `${userId}:${conversationId}:${harness}:${surface}` persists/resumes each
   surface’s session id across turns; `sessionId`/`onSessionId` are threaded into
-  both `harness.shared(...)` and `harness.userBox(...)`.
+  both `harness.shared(...)` and `harness.userSandbox(...)`.
 - **Daemon** (`examples/codebase-daemon/agentDaemon.ts`): real transcript
   persistence — `--session-id`/`--resume <id>` load and append a JSONL transcript
   (`OPTIBOX_DAEMON_SESSION_DIR`), and a resume turn reports the prior-turn count.
   Verified: turn 2 with `--resume` reads turn 1’s persisted transcript.
 - **Part-A autostop fix** (`src/orchestrator.ts`): the idle-stop is no longer
-  armed while a private round is still owed (`activePrivateRound`) or a Box boot
-  is in flight (`userBoxStarts`), so a shared-only answer can’t stop a box that
+  armed while a private round is still owed (`activePrivateRound`) or a sandbox boot
+  is in flight (`userSandboxStarts`), so a shared-only answer can’t stop a sandbox that
   is still booting/owing a turn and force a re-boot next message.
 
 - **Part-B autostop fix — harness-loop settlement** (`src/types.ts`,
@@ -201,34 +201,34 @@ The proven contract above is now wired through the framework (foundation layer):
   auto-stop countdown is no longer armed from "no visible message arrived for a
   few seconds." Absence of user-visible output is NOT inactivity: a prompt can
   run for minutes or hours doing tool calls / computer-use before any final text.
-  The ONLY signals that may arm the countdown for a box turn are a DEFINITE
+  The ONLY signals that may arm the countdown for a sandbox turn are a DEFINITE
   harness-loop settlement for the current prompt:
   - `HarnessCompletion.reason === "completed"` — the one-shot CLI/SDK process
-    finished its agent loop and its native stream ended cleanly (the in-Box exit
+    finished its agent loop and its native stream ended cleanly (the in-Sandbox exit
     marker `__CBA_EXIT__:<code>` is observed by `runHarness`). This is the only
     reason that means "the prompt is fully answered."
   - `"timeout"` — a long safety backstop elapsed while the process was still
     running. `DEFAULT_HARNESS_TIMEOUT_MS = 6h` (was 240s). This is an
     hours-scale guard, never a short-inactivity stop.
-  - `"process-exited"` — the in-Box PID is gone (`kill -0` fails) with no exit
+  - `"process-exited"` — the in-Sandbox PID is gone (`kill -0` fails) with no exit
     marker (crash/kill); the loop is over but the answer may be incomplete.
   - `"aborted"` — the turn was interrupted (human "stop" / superseding turn).
     This is NOT a settlement: `settled = reason !== "aborted"`, so an aborted
     loop never arms the countdown.
 
-  Threading: `runHarness` (both shared-infra and user-box runtimes) tracks
+  Threading: `runHarness` (both shared-infra and user-sandbox runtimes) tracks
   `sawText` and fires `spec.onComplete(info)` exactly once at loop end with the
   reason above. `examples/shared.ts` forwards `ctx.onComplete` into
-  `runtime.runHarness`. The orchestrator's `continueInUserBox` captures the
-  completion, computes `settled`, emits a `box.runtime.unsettled` trace when the
+  `runtime.runHarness`. The orchestrator's `continueInUserSandbox` captures the
+  completion, computes `settled`, emits a `sandbox.runtime.unsettled` trace when the
   loop ended without settling, and carries `settled` on the `turn.done` event;
-  the epilogue only sets `boxAgentSettled` (which arms the idle countdown) when a
-  direct/bridge box `turn.done` has `settled === true`. Plain generator harnesses
+  the epilogue only sets `sandboxAgentSettled` (which arms the idle countdown) when a
+  direct/bridge sandbox `turn.done` has `settled === true`. Plain generator harnesses
   (no `onComplete`) default to `{ reason: "completed" }` — a returning generator
   means the loop finished.
 
 - **Tool-call visibility** (`src/orchestrator.ts`): `harness.tool` events are now
-  surfaced as `box.tool.use` / `box.tool.result` traces, so long tool-running
+  surfaced as `sandbox.tool.use` / `sandbox.tool.result` traces, so long tool-running
   prompts are visibly ACTIVE in the trace stream rather than appearing idle.
 
 Tests: `node --test` green (56/56). New coverage: native-marker-only settlement
@@ -238,5 +238,5 @@ coverage for per-mode `onSessionId` extraction, per-adapter resume argv, and
 shared-infra abort.
 
 **Not yet landed (deferred, needs per-case decisions):** the orchestrator
-queue→interrupt+coalesce policy inversion, and two live Box-side validations
-(codex tools-side `exec resume`; in-Box PID interrupt against a real Box).
+queue→interrupt+coalesce policy inversion, and two live Sandbox-side validations
+(codex tools-side `exec resume`; in-Sandbox PID interrupt against a real sandbox).

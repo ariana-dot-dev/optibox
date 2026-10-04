@@ -126,7 +126,7 @@ const DEFAULT_CATALOG = {
   pricing: { ratePerSecond: 0.001 },
   serverKeysAllowed: true,
   credentialMode: "server-or-byok",
-  env: { BOX_API_KEY: true },
+  env: { BOAT_API_KEY: true },
 };
 
 /**
@@ -149,11 +149,11 @@ function bootClient(opts: {
     return el;
   };
   for (const id of [
-    "composer", "msg", "send", "stopBox", "showTraces", "chat", "empty",
+    "composer", "msg", "send", "stopSandbox", "showTraces", "chat", "empty",
     "schematic", "routeStatus", "machineState", "totalSeconds", "totalCost", "autoStopTimer", "matrix",
     "settingsBackdrop", "settingsHarness", "settingsModel", "settingsReasoningRow", "settingsReasoning",
     "agentsSignin", "agentsCreds", "settingsStatus", "settingsSave", "settingsClose",
-    "agentsOpen", "agentsKeysBox", "agentsKeysToggle",
+    "agentsOpen", "agentsKeysSandbox", "agentsKeysToggle",
   ]) getElement(id);
 
   const sendRequests: any[] = [];
@@ -193,7 +193,7 @@ function bootClient(opts: {
         if (init?.method === "POST") {
           const body = JSON.parse(init.body);
           agentsSaves.push(body);
-          return { ok: true, json: async () => opts.onAgentsSave?.(body) ?? { ok: true, applied: "now", message: "applied to your box now", selection: body.selection, credentials: [], usingOwnKeys: true, envPending: false } };
+          return { ok: true, json: async () => opts.onAgentsSave?.(body) ?? { ok: true, applied: "now", message: "applied to your sandbox now", selection: body.selection, credentials: [], usingOwnKeys: true, envPending: false } };
         }
         return { ok: true, json: async () => agents };
       }
@@ -279,26 +279,26 @@ test("interactive demo client sends exactly one /api/send after page load", asyn
   assert.ok(sendRequests.every((r) => !("apiKeys" in r)), "the send body carries no credentials");
 });
 
-test("interactive demo client renders distinct Box assistant messages by native message id", async () => {
+test("interactive demo client renders distinct sandbox assistant messages by native message id", async () => {
   const { getElement } = bootClient({
     now: 2_000_000,
     uuid: () => "turn-ui-proof",
     sendEvents: [
-      { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-1", text: "Hel" },
-      { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-1", text: "lo" },
-      { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-2", text: "Sec" },
-      { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-2", text: "ond" },
+      { type: "user-sandbox.delta", turnId: "turn-1", messageId: "sandbox-msg-1", text: "Hel" },
+      { type: "user-sandbox.delta", turnId: "turn-1", messageId: "sandbox-msg-1", text: "lo" },
+      { type: "user-sandbox.delta", turnId: "turn-1", messageId: "sandbox-msg-2", text: "Sec" },
+      { type: "user-sandbox.delta", turnId: "turn-1", messageId: "sandbox-msg-2", text: "ond" },
       { type: "stream.end" },
     ],
   });
   await settle();
 
-  getElement("msg").value = "prove box messages";
+  getElement("msg").value = "prove sandbox messages";
   getElement("composer").dispatch("submit");
   await settle(2);
 
   const assistants = getElement("chat").children.filter((el) => el.className.includes("assistant"));
-  assert.equal(assistants.length, 2, "two native Box assistant messages should create two bubbles");
+  assert.equal(assistants.length, 2, "two native sandbox assistant messages should create two bubbles");
   assert.deepEqual(assistants.map((el) => el.textContent), ["Hello", "Second"]);
 });
 
@@ -311,7 +311,7 @@ test("interactive demo client groups consecutive tool calls into minimal chains"
       { type: "harness.tool", phase: "tool_use", toolName: "read", description: "read file xyz" },
       { type: "harness.tool", phase: "tool_result", stdout: "ok" },
       { type: "harness.tool", phase: "tool_result", stdout: "done" },
-      { type: "user-box.delta", turnId: "turn-1", messageId: "box-msg-1", text: "message between chains" },
+      { type: "user-sandbox.delta", turnId: "turn-1", messageId: "sandbox-msg-1", text: "message between chains" },
       { type: "harness.tool", phase: "tool_use", toolName: "bash", command: "sleep 10" },
       { type: "stream.end" },
     ],
@@ -355,13 +355,13 @@ test("the Agents panel is read top to bottom: your agent, sign in, API keys fold
   assert.doesNotMatch(html, /settingsGrid/, "the old two-column grid is gone");
 });
 
-test("one entry point: the Agents button lives in the prompt box, immediately left of attach", () => {
+test("one entry point: the Agents button lives in the prompt sandbox, immediately left of attach", () => {
   const html = readFileSync("scripts/assets/app.html", "utf8");
   const css = readFileSync("scripts/assets/app.css", "utf8");
   assert.ok(html.indexOf('id="msg"') < html.indexOf('id="agentsOpen"'), "it is inside the composer");
   assert.ok(html.indexOf('id="agentsOpen"') < html.indexOf('id="attach"'), "and comes just before the paperclip");
   assert.match(html, /id="agentsOpen"[^>]*aria-label="Agents"/);
-  assert.doesNotMatch(html, /agentPill/, "the pill above the box is gone");
+  assert.doesNotMatch(html, /agentPill/, "the pill above the sandbox is gone");
   assert.doesNotMatch(html, /settingsOpen/, "and so is the gear in the footer");
   // Size, colour and hover come from ONE declaration shared with its neighbours.
   assert.match(css, /#agentsOpen,#attach,#mic\{[^}]*width:26px;height:26px[^}]*color:var\(--ink3\)/);
@@ -369,7 +369,7 @@ test("one entry point: the Agents button lives in the prompt box, immediately le
   assert.match(css, /#agentsOpen\{right:calc\(85px \+ env\(safe-area-inset-right\)\)/, "same step again on the mobile safe-area offset");
 });
 
-test("the prompt box is twice as tall and reserves 3x insets on its right and bottom", () => {
+test("the prompt sandbox is twice as tall and reserves 3x insets on its right and bottom", () => {
   const css = readFileSync("scripts/assets/app.css", "utf8");
   const desktop = css.match(/(?:^|[\n},])textarea\{([^}]*)\}/)![1]!;
   assert.match(desktop, /min-height:116px/, "twice the old 58px");
@@ -377,7 +377,7 @@ test("the prompt box is twice as tall and reserves 3x insets on its right and bo
   const mobile = css.slice(css.indexOf("@media(max-width:900px)")).match(/textarea\{([^}]*)\}/)![1]!;
   assert.match(mobile, /min-height:104px/, "twice the old 52px");
   assert.match(mobile, /padding:12px 39px 36px 13px/);
-  // The icon row sits 9px (3x the old 3px) off the box's right and bottom edges
+  // The icon row sits 9px (3x the old 3px) off the sandbox's right and bottom edges
   // and is 26px tall, so the 39px bottom band clears it: text and buttons can
   // never overlap.
   assert.match(css, /#agentsOpen,#attach,#mic\{position:absolute;bottom:25px/);
@@ -461,13 +461,13 @@ test("the API keys disclosure is the same chevron, and the section animates open
   const { getElement } = bootClient({ now: 13_000_000, uuid: () => "turn-disclosure" });
   await settle(2);
 
-  const box = getElement("agentsKeysBox"), toggle = getElement("agentsKeysToggle");
-  assert.ok(!box.classList.names.has("open"), "folded by default");
+  const sandbox = getElement("agentsKeysSandbox"), toggle = getElement("agentsKeysToggle");
+  assert.ok(!sandbox.classList.names.has("open"), "folded by default");
   toggle.dispatch("click");
-  assert.ok(box.classList.names.has("open"));
+  assert.ok(sandbox.classList.names.has("open"));
   assert.equal(toggle.getAttribute("aria-expanded"), "true");
   toggle.dispatch("click");
-  assert.ok(!box.classList.names.has("open"));
+  assert.ok(!sandbox.classList.names.has("open"));
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
 
   const css = readFileSync("scripts/assets/app.css", "utf8");
@@ -513,7 +513,7 @@ test("Connect Claude subscription: the approval URL, then the pasted code, then 
   assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applied now");
 });
 
-test("Connect ChatGPT subscription: a user code to type, polled until the box has it", async () => {
+test("Connect ChatGPT subscription: a user code to type, polled until the sandbox has it", async () => {
   let polls = 0;
   const { getElement, oauthCalls } = bootClient({
     now: 8_000_000,
@@ -541,7 +541,7 @@ test("Connect ChatGPT subscription: a user code to type, polled until the box ha
   assert.equal(getElement("settingsStatus").textContent, "Runs on your subscription · applies at next start");
 });
 
-test("Connect Kimi subscription: the approval link carries the code, polled until the box has it", async () => {
+test("Connect Kimi subscription: the approval link carries the code, polled until the sandbox has it", async () => {
   let polls = 0;
   const { getElement, oauthCalls } = bootClient({
     now: 8_500_000,
@@ -661,7 +661,7 @@ test("the Agents button is the way in, and the status line carries the state the
 
   assert.ok(!getElement("settingsBackdrop").classList.names.has("open"), "nothing is blocking, so the panel stays shut");
   getElement("agentsOpen").dispatch("click");
-  assert.ok(getElement("settingsBackdrop").classList.names.has("open"), "the button in the prompt box opens it");
+  assert.ok(getElement("settingsBackdrop").classList.names.has("open"), "the button in the prompt sandbox opens it");
 
   // What the pill used to say now lives in the panel: the two pickers name the
   // agent, the one status line names whose credentials it runs on.
@@ -685,13 +685,13 @@ test("every message bubble is inset by the same amount on all four sides, collap
   for (const rule of [...css.matchAll(/(?:^|[},])\.msg\{([^}]*)\}/g)]) {
     assert.match(rule[1]!, /padding:12px(;|$)/, "the bubble's inset is one value on every side");
   }
-  // The global reset gives every button a 42px box; inside a bubble that box
+  // The global reset gives every button a 42px sandbox; inside a bubble that sandbox
   // would sit below the toggle as dead space a normal message does not have.
-  assert.match(css, /(^|\})button\{[^}]*min-height:42px/m, "the global button box is what the toggle must opt out of");
+  assert.match(css, /(^|\})button\{[^}]*min-height:42px/m, "the global button sandbox is what the toggle must opt out of");
   const toggle = css.match(/\.msgMore\{([^}]*)\}/);
   assert.ok(toggle, ".msgMore must be styled");
   assert.match(toggle![1]!, /min-height:0/, "the toggle takes no minimum control height");
-  assert.match(toggle![1]!, /padding:0(;|$)/, "the toggle adds no box of its own");
+  assert.match(toggle![1]!, /padding:0(;|$)/, "the toggle adds no sandbox of its own");
   assert.doesNotMatch(toggle![1]!, /margin-bottom/, "nothing extra below the toggle");
 });
 

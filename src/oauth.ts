@@ -2,10 +2,10 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { arch, hostname, release, type as osType, version as osVersion } from "node:os";
 
 /**
- * The three consumer sign-ins, ported from the Box product's own backend
+ * The three consumer sign-ins, ported from the Boat product's own backend
  * (backend/src/services/claude-oauth.service.ts, codex-oauth.service.ts,
  * kimi-oauth.service.ts) so optibox users connect a subscription exactly the
- * way the Box dashboard does.
+ * way the Boat dashboard does.
  *
  *   Claude Pro/Max  : PKCE. We build an authorize URL on claude.ai; the user
  *                     approves; Anthropic's callback page PRINTS a code; the
@@ -19,9 +19,9 @@ import { arch, hostname, release, type as osType, version as osVersion } from "n
  *                     we poll the token endpoint until it answers with tokens.
  *
  * All three mint an access token that expires and a refresh token. The refresh
- * token stays server-side and is spent just before the user's box comes up.
+ * token stays server-side and is spent just before the user's sandbox comes up.
  *
- * Everything here is pure transport: no database, no box. `fetch` and the
+ * Everything here is pure transport: no database, no sandbox. `fetch` and the
  * endpoint table are injectable so the suite can drive every flow against a
  * fake provider.
  */
@@ -105,7 +105,7 @@ export function chatGptAccountId(accessToken: string): string | undefined {
 /**
  * The exact shape `codex login` writes. The Codex CLI and app-server
  * authenticate from ~/.codex/auth.json ONLY: they never read a token from the
- * environment, so this file IS the ChatGPT subscription on the box.
+ * environment, so this file IS the ChatGPT subscription on the sandbox.
  */
 export function codexAuthJson(accessToken: string, accountId: string): string {
   return JSON.stringify({
@@ -211,7 +211,7 @@ export class OAuthClient {
   /**
    * Step 2, called on a timer: still pending until OpenAI hands back an
    * authorization code, which we immediately trade for tokens. Anything that
-   * is not a usable answer counts as pending, exactly like the Box backend.
+   * is not a usable answer counts as pending, exactly like the Boat backend.
    */
   async pollCodexDevice(deviceAuthId: string, userCode: string): Promise<DevicePoll> {
     let res: Response;

@@ -1,13 +1,13 @@
 import type { MachineState } from "./context.js";
-import type { BOX_PRICING } from "./context.js";
+import type { SANDBOX_PRICING } from "./context.js";
 
 export type Role = "user" | "assistant" | "system";
 
 /**
- * Which Box harness runs the private turn and on which model. `harness` is the
- * Box provider id (claude-code, codex, pi, opencode, prime-agent); `provider`
+ * Which sandbox harness runs the private turn and on which model. `harness` is the
+ * Boat provider id (claude-code, codex, pi, opencode, prime-agent); `provider`
  * is the key family the model bills to (anthropic, openai, openrouter) and only
- * drives the settings UI; `model` is a Box model id from GET /api/provider-models.
+ * drives the settings UI; `model` is a Boat model id from GET /api/provider-models.
  */
 export interface HarnessSelection {
   harness: string;
@@ -31,22 +31,22 @@ export interface ConsumerTurnInput {
 
 /** The event contract between engine and UI — unchanged, so the client renders identically. */
 export type ConsumerTurnEventBody =
-  | { type: "trace"; stage: string; message: string; harness?: string; model?: string; boxId?: string; data?: Record<string, unknown> }
-  | { type: "turn.blocked"; stage: string; message: string; retryable: boolean; harness?: string; model?: string; boxId?: string }
+  | { type: "trace"; stage: string; message: string; harness?: string; model?: string; sandboxId?: string; data?: Record<string, unknown> }
+  | { type: "turn.blocked"; stage: string; message: string; retryable: boolean; harness?: string; model?: string; sandboxId?: string }
   | { type: "shared.delta"; text: string; harness: string; final?: boolean }
-  | { type: "context.injected"; scope: "shared" | "user-box"; machine: MachineState; hidden: string }
-  | { type: "lifecycle"; state: string; boxId: string; note?: string }
-  | { type: "autostop.timer"; phase: "started" | "tick" | "canceled" | "stopping" | "held"; boxId?: string | undefined; remainingMs: number; deadlineEpochMs?: number; reason: "idle-after-response" | "new-user-message" | "disabled"; note: string }
-  | { type: "billing.start"; boxId: string; ratePerSecond: number; sinceEpochMs: number; pricing: typeof BOX_PRICING }
-  | { type: "billing.stop"; boxId: string; elapsedSeconds: number; costUsd: number; note: string }
-  | { type: "handoff.started"; recap: string; boxId: string; harness: string; model: string }
-  | { type: "exec"; kind: "command" | "harness"; argv?: string[]; command?: string; boxId: string }
-  | { type: "harness.tool"; phase: "tool_use" | "tool_result"; boxId: string; toolName?: string; command?: string; description?: string; stdout?: string; stderr?: string; isError?: boolean }
-  | { type: "user-box.delta"; text: string; boxId: string; harness: string; model: string; messageId?: string; messageIndex?: number }
-  | { type: "desktop.recording"; boxId: string; path: string; sizeKb: number }
+  | { type: "context.injected"; scope: "shared" | "user-sandbox"; machine: MachineState; hidden: string }
+  | { type: "lifecycle"; state: string; sandboxId: string; note?: string }
+  | { type: "autostop.timer"; phase: "started" | "tick" | "canceled" | "stopping" | "held"; sandboxId?: string | undefined; remainingMs: number; deadlineEpochMs?: number; reason: "idle-after-response" | "new-user-message" | "disabled"; note: string }
+  | { type: "billing.start"; sandboxId: string; ratePerSecond: number; sinceEpochMs: number; pricing: typeof SANDBOX_PRICING }
+  | { type: "billing.stop"; sandboxId: string; elapsedSeconds: number; costUsd: number; note: string }
+  | { type: "handoff.started"; recap: string; sandboxId: string; harness: string; model: string }
+  | { type: "exec"; kind: "command" | "harness"; argv?: string[]; command?: string; sandboxId: string }
+  | { type: "harness.tool"; phase: "tool_use" | "tool_result"; sandboxId: string; toolName?: string; command?: string; description?: string; stdout?: string; stderr?: string; isError?: boolean }
+  | { type: "user-sandbox.delta"; text: string; sandboxId: string; harness: string; model: string; messageId?: string; messageIndex?: number }
+  | { type: "desktop.recording"; sandboxId: string; path: string; sizeKb: number }
   | { type: "scenario.fork"; groupId: string; labels: string[] }
   | { type: "error"; message: string }
-  | { type: "turn.done"; boxId?: string; harness: string; model: string; route?: "shared" | "direct" | "bridge"; settled?: boolean };
+  | { type: "turn.done"; sandboxId?: string; harness: string; model: string; route?: "shared" | "direct" | "bridge"; settled?: boolean };
 
 export type ConsumerTurnEvent = ConsumerTurnEventBody & { turnId?: string; scenarioId?: string; scenarioLabel?: string };
 
@@ -54,12 +54,12 @@ export interface TranscriptMessage {
   role: Role;
   content: string;
   at?: string;
-  mode?: "shared" | "handoff" | "user-box";
+  mode?: "shared" | "handoff" | "user-sandbox";
   harness?: string;
   model?: string;
 }
 
-export interface BoxInfo {
+export interface SandboxInfo {
   id: string;
   state: "provisioning" | "provisioned" | "cloning" | "ready" | "idle" | "running" | "archiving" | "archived" | "error" | string;
   name?: string;
@@ -73,7 +73,7 @@ export interface CommandResult {
   stderr: string;
 }
 
-/** One queued prompt on a Box (POST /prompt, GET /prompts/{id}). */
+/** One queued prompt on a Boat (POST /prompt, GET /prompts/{id}). */
 export interface PromptRun {
   promptId: string;
   conversationId: string;
@@ -82,7 +82,7 @@ export interface PromptRun {
 }
 
 /** One entry of GET /events. `data` is extensible; the engine reads content/tools/is_streaming. */
-export interface BoxEvent {
+export interface SandboxEvent {
   id: string;
   type: string;
   timestamp: number;
@@ -92,30 +92,30 @@ export interface BoxEvent {
 }
 
 /**
- * Box as seen by the engine: machine lifecycle, the integrated agents
+ * Sandbox as seen by the engine: machine lifecycle, the integrated agents
  * (prompt / events / interrupt, conversations included), and a few commands for
  * the readiness probe, hosting takedown and the desktop recording.
  */
-export interface BoxClient {
+export interface SandboxClient {
   create(input: {
     name?: string;
     ttlSeconds?: number | null;
-    /** Withhold every owner secret from the box; `env` is then the ONLY environment it gets. */
+    /** Withhold every owner secret from the sandbox; `env` is then the ONLY environment it gets. */
     noEnv?: boolean;
-    /** Per-box environment: the provider keys the user's harnesses run on. */
+    /** Per-sandbox environment: the provider keys the user's harnesses run on. */
     env?: Record<string, string>;
-  }): Promise<BoxInfo>;
-  get(boxId: string): Promise<BoxInfo>;
-  update(boxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<BoxInfo>;
-  stop(boxId: string): Promise<BoxInfo | { ok: boolean }>;
-  /** `env` REPLACES the box's stored environment; omitted keeps whatever it has. */
-  resume(boxId: string, input?: { env?: Record<string, string> }): Promise<BoxInfo | { ok: boolean }>;
-  deleteBox?(boxId: string): Promise<void>;
-  command(boxId: string, input: { command: string; cwd?: string; timeoutMs?: number }): Promise<CommandResult>;
-  readFile(boxId: string, path: string): Promise<string>;
-  writeFile(boxId: string, path: string, content: string): Promise<void>;
-  prompt(boxId: string, input: { provider: string; model?: string; reasoningEffort?: string; fast?: boolean; prompt: string; new?: boolean; conversationId?: string }): Promise<PromptRun>;
-  promptRun(boxId: string, promptId: string): Promise<PromptRun>;
-  events(boxId: string, input: { conversationId?: string; cursor?: string; limit?: number }): Promise<{ events: BoxEvent[]; nextCursor?: string | null }>;
-  interrupt(boxId: string, conversationId?: string): Promise<void>;
+  }): Promise<SandboxInfo>;
+  get(sandboxId: string): Promise<SandboxInfo>;
+  update(sandboxId: string, input: { name?: string; ttlSeconds?: number | null }): Promise<SandboxInfo>;
+  stop(sandboxId: string): Promise<SandboxInfo | { ok: boolean }>;
+  /** `env` REPLACES the sandbox's stored environment; omitted keeps whatever it has. */
+  resume(sandboxId: string, input?: { env?: Record<string, string> }): Promise<SandboxInfo | { ok: boolean }>;
+  deleteSandbox?(sandboxId: string): Promise<void>;
+  command(sandboxId: string, input: { command: string; cwd?: string; timeoutMs?: number }): Promise<CommandResult>;
+  readFile(sandboxId: string, path: string): Promise<string>;
+  writeFile(sandboxId: string, path: string, content: string): Promise<void>;
+  prompt(sandboxId: string, input: { provider: string; model?: string; reasoningEffort?: string; fast?: boolean; prompt: string; new?: boolean; conversationId?: string }): Promise<PromptRun>;
+  promptRun(sandboxId: string, promptId: string): Promise<PromptRun>;
+  events(sandboxId: string, input: { conversationId?: string; cursor?: string; limit?: number }): Promise<{ events: SandboxEvent[]; nextCursor?: string | null }>;
+  interrupt(sandboxId: string, conversationId?: string): Promise<void>;
 }

@@ -1070,13 +1070,22 @@ export class Engine {
           m.flushed = flushTo;
         }
       };
+      // Boat streams a partial message under one id (data.is_streaming) and then sends the
+      // finished message under a NEW id with the same text. Keyed by id, the user saw the
+      // answer twice. A finished message therefore lands on the partial it completes.
+      let openStreamId: string | null = null;
       const consume = (events: BoxEvent[]) => {
         for (const e of events) {
           if (e.taskId && e.taskId !== run.promptId) continue;
           if (events.length) cursor = `${e.timestamp}:${e.id}`;
           const d = e.data ?? {};
           if (e.type === "response") {
-            if (typeof d.content === "string" && d.content) onText(String(e.id).replace(/-tools$/, ""), d.content);
+            if (typeof d.content === "string" && d.content) {
+              const id = String(e.id).replace(/-tools$/, "");
+              if (d.is_streaming) { openStreamId = id; onText(id, d.content); }
+              else if (openStreamId && !msgs.has(id)) { onText(openStreamId, d.content); openStreamId = null; }
+              else onText(id, d.content);
+            }
             if (Array.isArray(d.tools)) for (const t of d.tools) onTool(t as Parameters<typeof onTool>[0]);
           } else if (e.type === "prompt" && ["finished", "failed", "interrupted"].includes(String(d.status))) {
             // A failed run carries the harness's own reason (missing key, bad model): keep it for the user.

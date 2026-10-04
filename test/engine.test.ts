@@ -37,7 +37,7 @@ after(async () => {
 
 let nextBoxId = 1;
 /** Scripted answer of the fake harness: frames of full text per message id, or a thrower. */
-type Answer = { frames?: Array<{ id?: string; text: string; tools?: unknown[] }>; status?: "finished" | "failed"; hang?: boolean };
+type Answer = { frames?: Array<{ id?: string; text: string; tools?: unknown[]; stream?: boolean }>; status?: "finished" | "failed"; hang?: boolean };
 
 class FakeBoxClient implements BoxClient {
   boxes = new Map<string, BoxInfo>();
@@ -91,7 +91,7 @@ class FakeBoxClient implements BoxClient {
     const events: BoxEvent[] = [];
     let t = Date.now();
     for (const f of answer.frames ?? []) {
-      events.push({ id: f.id ?? "m1", type: "response", timestamp: t++, taskId: promptId, conversationId, data: { content: f.text, ...(f.tools ? { tools: f.tools } : {}), is_streaming: true } });
+      events.push({ id: f.id ?? "m1", type: "response", timestamp: t++, taskId: promptId, conversationId, data: { content: f.text, ...(f.tools ? { tools: f.tools } : {}), is_streaming: f.stream !== false } });
     }
     this.runs.set(promptId, { conversationId, answer, events, done: false });
     return { promptId, conversationId, status: "queued", done: false };
@@ -190,6 +190,19 @@ test("rule 5: direct route requires BOTH responsiveness and >=15s machine age", 
   assert.ok(events.some((e) => e.type === "trace" && e.stage === "route.direct"), "direct route chosen when warm");
   assert.ok(!events.some((e) => e.type === "shared.delta"), "no bridge text on a warm box");
   assert.ok(events.some((e) => e.type === "user-box.delta"), "box answered");
+  engine.dispose();
+});
+
+test("a finished message that Boat sends under a new id replaces its streaming partial (shown once)", async () => {
+  // Measured on Boat 2026-10-04 (pi): partial 5f20e973 (is_streaming) then the finished
+  // message f2de7eac with the same text; the user saw the answer twice.
+  const box = new FakeBoxClient({ frames: [
+    { id: "partial-1", text: "The first recording got cut" },
+    { id: "final-1", text: "The first recording got cut off, recording again.", stream: false },
+  ] });
+  const engine = makeEngine(box);
+  const events = await collect(engine, "udup", "cdup", "record it");
+  assert.equal(visibleText(events), "The first recording got cut off, recording again.");
   engine.dispose();
 });
 

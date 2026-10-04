@@ -480,7 +480,8 @@ function chooseDefaultModel(){
     const m=h&&h.models.find(x=>x.provider===w.provider&&x.model===w.model);
     if(h&&m&&modelUnlocked(m)){selectedHarness=h.name;selectedProvider=m.provider;selectedModel=m.model;selectedReasoning=w.reasoningEffort||'';return;}
   }
-  const preferred=H.find(h=>h.models.some(modelUnlocked))||H[0];
+  // pi is optibox's harness: the default whenever it has a model the user's keys unlock.
+  const preferred=H.find(h=>h.name==='pi'&&h.models.some(modelUnlocked))||H.find(h=>h.models.some(modelUnlocked))||H[0];
   if(!preferred){setState('No harnesses available');return;}
   const model=preferred.models.find(modelUnlocked)||preferred.models[0];
   selectedHarness=preferred.name;selectedProvider=model.provider;selectedModel=model.model;selectedReasoning='';
